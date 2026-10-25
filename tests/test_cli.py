@@ -5,7 +5,7 @@ import pytest
 from psycopg import sql
 
 from agents_matrix_connector import __version__
-from agents_matrix_connector.cli import EXIT_BAD_SETTINGS, SUBCOMMANDS, main
+from agents_matrix_connector.cli import EXIT_BAD_SETTINGS, SUBCOMMANDS, MigrateSettings, main
 
 
 def test_version(capsys):
@@ -85,6 +85,12 @@ def test_migrate_needs_only_the_database_url(clean_env, capsys):
     assert "MATRIX_DATABASE_URL" in err
     assert "ORCHESTRATOR" not in err
     assert "HOMESERVER" not in err
+
+
+def test_migrate_settings_hold_only_the_database_url(clean_env):
+    assert set(MigrateSettings.model_fields) == {"database_url", "log_level"}
+    clean_env.setenv("MATRIX_DATABASE_URL", "postgresql://u:p@db/x")
+    assert MigrateSettings().database_url.get_secret_value() == "postgresql://u:p@db/x"
 
 
 def test_migrate_applies_schema(clean_env, pg_url):

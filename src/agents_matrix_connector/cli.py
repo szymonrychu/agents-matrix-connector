@@ -10,9 +10,9 @@ from agents_common.db.migrate import run_migrations
 from agents_common.db.pool import open_pool
 from agents_common.orchestrator import OrchestratorClient
 from agents_common.runtime import run_service
-from agents_common.settings import BaseServiceSettings, SettingsError, load_settings
-from pydantic import model_validator
-from pydantic_settings import SettingsConfigDict
+from agents_common.settings import SettingsError, load_settings
+from pydantic import Field, SecretStr, ValidationError
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from agents_matrix_connector import __version__
 from agents_matrix_connector.api.app import create_api_app
@@ -30,24 +30,20 @@ SUBCOMMANDS = {
 log = logging.getLogger("agents_matrix_connector")
 
 
-class MigrateSettings(BaseServiceSettings):
-    """Only the database URL is required: migrate needs no orchestrator and no Matrix access."""
+class MigrateSettings(BaseSettings):
+    """Only the database URL: migrate needs no orchestrator and no Matrix access."""
 
     model_config = SettingsConfigDict(env_prefix="MATRIX_", extra="ignore")
 
-    orchestrator_url: str = ""
-
-    @model_validator(mode="after")
-    def _token_from_file(self):
-        return self
+    database_url: SecretStr = Field(repr=False)
+    log_level: str = "INFO"
 
 
 def _load_migrate() -> MigrateSettings:
     try:
-        return load_settings(MigrateSettings)
-    except SettingsError as exc:
-        problems = {k: v for k, v in exc.problems.items() if "ORCHESTRATOR" not in k}
-        raise SettingsError(problems) from None
+        return MigrateSettings()
+    except ValidationError:
+        raise SettingsError({"MATRIX_DATABASE_URL": "required"}) from None
 
 
 def _run(
