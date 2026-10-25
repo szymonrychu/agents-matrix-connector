@@ -57,3 +57,22 @@ def test_ingress_annotations_pass_through():
 def test_ingress_disabled():
     assert not by_kind(render(), "Ingress")
     assert not by_kind(render({"ingress": {"enabled": False}}), "Ingress")
+
+
+def test_deny_source_ranges_annotation():
+    key = "nginx.ingress.kubernetes.io/denylist-source-range"
+    ing = {
+        "ingress": {
+            **ING["ingress"],
+            "annotations": {"a": "b"},
+            "denySourceRanges": ["10.0.0.1/32", "10.0.0.2/32"],
+        }
+    }
+    (rendered,) = by_kind(render(ing), "Ingress").values()
+    assert rendered["metadata"]["annotations"] == {"a": "b", key: "10.0.0.1/32,10.0.0.2/32"}
+
+
+def test_deny_source_ranges_empty_has_no_annotation():
+    ing = {"ingress": {**ING["ingress"], "denySourceRanges": []}}
+    (rendered,) = by_kind(render(ing), "Ingress").values()
+    assert "annotations" not in rendered["metadata"]

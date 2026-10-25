@@ -91,6 +91,8 @@ ingress:
   className: nginx
   host: ""
   annotations: {}
+  # Source CIDRs the api Ingress refuses (ingress-nginx denylist; list the cluster node IPs).
+  denySourceRanges: []
   tls:
     secretName: ""
 

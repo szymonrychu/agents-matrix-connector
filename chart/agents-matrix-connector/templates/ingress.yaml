@@ -9,7 +9,11 @@ metadata:
   labels:
     {{- include "agents-matrix-connector.labels" . | nindent 4 }}
     app.kubernetes.io/component: api
-  {{- with $ing.annotations }}
+  {{- $ann := merge dict ($ing.annotations | default dict) }}
+  {{- with $ing.denySourceRanges }}
+  {{- $_ := set $ann "nginx.ingress.kubernetes.io/denylist-source-range" (join "," .) }}
+  {{- end }}
+  {{- with $ann }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
