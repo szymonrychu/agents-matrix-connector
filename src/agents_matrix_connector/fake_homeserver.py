@@ -3,9 +3,9 @@
 `FakeHomeserver(user_id, token).app` is an ASGI app implementing the client-server calls
 `MatrixClient` makes, with Matrix-shaped JSON and errors, for one bot user and its token.
 Drive it through `httpx.ASGITransport(app=fake.app)` or serve it with uvicorn; the helpers
-(`add_room`, `invite`, `post`, `set_state`, `set_member`, `encrypt`, `limit_timeline`,
-`fail_next`, `revoke_token`) change its state and `sent` / `typing_state` read back what the
-bot did.
+(`add_room`, `add_alias`, `invite`, `post`, `set_state`, `set_member`, `encrypt`,
+`limit_timeline`, `fail_next`, `revoke_token`) change its state and `sent` /
+`typing_state` read back what the bot did.
 
 Sync tokens are `s<n>` and pagination tokens `t<n>`, both meaning "after the n-th event";
 `/messages` accepts either. A sync timeline holding more events than its limit (the
@@ -39,6 +39,7 @@ ROUTES = (
     "room_messages",
     "send_text",
     "typing",
+    "resolve_alias",
 )
 DEFAULT_ERRCODES = {
     400: "M_UNKNOWN",
@@ -103,6 +104,7 @@ class FakeHomeserver:
         self._pos = 0
         self._changed = asyncio.Event()
         self._rooms: dict[str, _Room] = {}
+        self._aliases: dict[str, str] = {}
         self._filters: dict[str, dict] = {}
         self._txns: dict[tuple[str, str, str, str], str] = {}
         self._sent: dict[str, list[dict]] = {}
@@ -119,6 +121,7 @@ class FakeHomeserver:
             ("GET", ("rooms", None, "messages"), "room_messages", self._messages),
             ("PUT", ("rooms", None, "send", None, None), "send_text", self._send),
             ("PUT", ("rooms", None, "typing", None), "typing", self._typing_route),
+            ("GET", ("directory", "room", None), "resolve_alias", self._resolve_alias),
         ]
         self.app = _AsgiApp(self._asgi)
 
@@ -152,6 +155,11 @@ class FakeHomeserver:
                 event.get("content", {}),
                 event.get("state_key", ""),
             )
+
+    def add_alias(self, alias: str, room_id: str) -> None:
+        """Point `alias` at `room_id` in the room directory, replacing an earlier entry; the
+        room's `m.room.canonical_alias` state is set separately (`set_state`)."""
+        self._aliases[alias] = room_id
 
     def invite(self, room_id: str, inviter: str) -> None:
         self._member_event(self._room(room_id), self.user_id, "invite", sender=inviter)
@@ -551,6 +559,13 @@ class FakeHomeserver:
         self._txns[key] = event["event_id"]
         self._sent.setdefault(room_id, []).append(copy.deepcopy(content))
         return JSONResponse({"event_id": event["event_id"]})
+
+    async def _resolve_alias(self, request: Request, params: list[str]) -> Response:
+        [alias] = params
+        room_id = self._aliases.get(alias)
+        if room_id is None:
+            return matrix_error(404, "M_NOT_FOUND", f"Room alias {alias} not found")
+        return JSONResponse({"room_id": room_id, "servers": [self.server_name]})
 
     async def _typing_route(self, request: Request, params: list[str]) -> Response:
         room_id, user_id = params

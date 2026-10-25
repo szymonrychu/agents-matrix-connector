@@ -10,12 +10,12 @@ from agents_matrix_connector.db import directory
 from agents_matrix_connector.discovery import RoomInfo, facebook_id
 
 PACKAGE = "agents_matrix_connector"
-FB = re.compile(r"^@facebook_(?P<id>\d+):example\.org$")
+FB = re.compile(r"^@facebook_(?P<id>\d+):")
 T0 = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
 
 
 def fb(user_id: str) -> str | None:
-    return facebook_id(user_id, FB)
+    return facebook_id(user_id, FB, "example.org")
 
 
 def info(**kw) -> RoomInfo:

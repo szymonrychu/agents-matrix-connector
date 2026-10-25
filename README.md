@@ -33,7 +33,7 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_DEVICE_ID` | agents-matrix-connector | bot | Matrix device id |
 | `MATRIX_SELF_IDENTITIES` | empty | bot | extra Matrix user ids of the bot, comma separated |
 | `MATRIX_BRIDGE_BOTS` | @facebookbot:szymonrichert.pl | bot | bridge bot user ids, comma separated |
-| `MATRIX_PUPPET_PATTERN` | ^@facebook_(?P<id>[0-9]+): | bot | regex for bridged puppet user ids, needs a named group `id` |
+| `MATRIX_PUPPET_PATTERN` | ^@facebook_(?P<id>[0-9]+): | bot | regex for bridged puppet user ids, needs a named group `id`; matched in full against the `@localpart:` of ids on the server of `MATRIX_USER_ID` |
 | `MATRIX_DEFAULT_POLICY` | deny | bot | `deny` or `allow` for chats with no rule |
 | `MATRIX_GROUP_TRIGGER` | mention | bot | `mention` or `all` in group chats |
 | `MATRIX_MAX_NEW_SESSIONS` | 3 | bot | max new sessions started at once (>= 1) |
@@ -250,6 +250,11 @@ Never run both at once.
 - Deny wins: a matching deny rule overrides every allow rule.
 - Rules match identifiers only (Matrix user id, Facebook id, room id, alias). Display names
   never grant access; a `display_name` rule exists only in the deny list.
+- A sender has a Facebook id only when its whole `@localpart:` matches
+  `MATRIX_PUPPET_PATTERN` and it lives on the server of `MATRIX_USER_ID`, where the bridge
+  ghosts live: `@facebook_<id>:other.server` never matches a `facebook` rule.
+- A room's alias is stored, and matches `alias` rules, only after the room directory
+  resolves its canonical alias to that room; an alias claimed by another room is ignored.
 - No message body is stored for an explicit deny rule (`denied: <kind>`), an encrypted room,
   an infrastructure room or unsupported content. A chat that is only not yet allowed (default
   deny, reason `not_allowed`) keeps its truncated body so the operator can judge it.

@@ -13,6 +13,7 @@ from agents_matrix_connector.discovery import (
     parse_message,
     truncate,
 )
+from agents_matrix_connector.policy import Rule, Subject, evaluate
 
 SELF = frozenset({"@me:hs.test"})
 BOTS = ("@facebookbot:hs.test",)
@@ -96,9 +97,38 @@ def test_latest_bridge_event_wins():
 
 def test_facebook_id():
     pattern = re.compile("^@facebook_(?P<id>[0-9]+):")
-    assert facebook_id(GHOST, pattern) == "100000241356957"
-    assert facebook_id("@alice:hs.test", pattern) is None
-    assert facebook_id(BOTS[0], pattern) is None
+    assert facebook_id(GHOST, pattern, "hs.test") == "100000241356957"
+    assert facebook_id("@alice:hs.test", pattern, "hs.test") is None
+    assert facebook_id(BOTS[0], pattern, "hs.test") is None
+    assert facebook_id("@facebook_1", pattern, "hs.test") is None
+
+
+def test_facebook_id_only_on_bridge_server():
+    pattern = re.compile("^@facebook_(?P<id>[0-9]+):")
+    foreign = "@facebook_100000241356957:evil.example"
+    assert facebook_id(GHOST, pattern, "hs.test") == "100000241356957"
+    assert facebook_id(foreign, pattern, "hs.test") is None
+    assert facebook_id("@facebook_1:hs.test.evil.example", pattern, "hs.test") is None
+    # The pattern must cover the whole `@localpart:`; a prefix match is not enough.
+    loose = re.compile("@facebook_(?P<id>[0-9]+)")
+    assert facebook_id("@facebook_1x:hs.test", loose, "hs.test") is None
+
+    allow = [Rule(1, "allow", "facebook", "100000241356957")]
+
+    def decide(sender: str) -> bool:
+        subject = Subject(
+            room_id="!r:hs.test",
+            room_alias=None,
+            room_kind="dm",
+            encrypted=False,
+            sender_id=sender,
+            sender_facebook_id=facebook_id(sender, pattern, "hs.test"),
+            sender_name="Alice",
+        )
+        return evaluate(subject, allow, "deny").allowed
+
+    assert decide(GHOST) is True
+    assert decide(foreign) is False
 
 
 def msg(sender="@alice:hs.test", content=None, type_="m.room.message"):

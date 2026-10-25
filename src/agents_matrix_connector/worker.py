@@ -110,6 +110,7 @@ class Worker:
         self._now = now
         self._store = _RoomRunStore(pool)
         self._puppet = re.compile(settings.puppet_pattern)
+        self._bridge_server = settings.user_id.split(":", 1)[1]
         self._unavailable_logged: dict[str, datetime] = {}
 
     async def tick(self) -> None:
@@ -285,7 +286,7 @@ class Worker:
         )
 
     def _facebook_id(self, user_id: str) -> str | None:
-        return discovery.facebook_id(user_id, self._puppet)
+        return discovery.facebook_id(user_id, self._puppet, self._bridge_server)
 
     @staticmethod
     def _marker(batch: _Batch) -> str:

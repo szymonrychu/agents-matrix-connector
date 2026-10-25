@@ -87,8 +87,14 @@ def classify(
     )
 
 
-def facebook_id(user_id: str, pattern: re.Pattern[str]) -> str | None:
-    match = pattern.match(user_id)
+def facebook_id(user_id: str, pattern: re.Pattern[str], bridge_server: str) -> str | None:
+    """The Facebook id of a bridge ghost: `pattern` matches the whole `@localpart:` of a user
+    id on `bridge_server` (mautrix-meta ghosts live on the bot's own homeserver). A ghost-like
+    id on any other server has none, so a `facebook` rule never matches it."""
+    localpart, separator, server = user_id.partition(":")
+    if not separator or server != bridge_server:
+        return None
+    match = pattern.fullmatch(f"{localpart}:")
     return match.group("id") if match else None
 
 

@@ -455,3 +455,61 @@ async def test_limited_sync_prev_batch(fake, client):
     assert [e["event_id"] for e in capped["events"]] == [last]
     whole = (await client.sync(since, 0, None))["rooms"]["join"][ROOM]["timeline"]
     assert whole["limited"] is False and len(whole["events"]) == 2
+
+
+async def test_resolve_alias(fake, recorder, client, monkeypatch, caplog):
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(matrix, "_sleep", fake_sleep)
+    caplog.set_level(logging.DEBUG)
+    fake.add_room(ROOM, [], {ALICE: "Alice"})
+    fake.add_alias("#chat:hs", ROOM)
+
+    assert await client.resolve_alias("#chat:hs") == ROOM
+    assert await client.resolve_alias("#missing:hs") is None
+    assert recorder.calls() == [
+        ("GET", f"{API}/directory/room/%23chat%3Ahs"),
+        ("GET", f"{API}/directory/room/%23missing%3Ahs"),
+    ]
+    for request in recorder.requests:
+        assert request.headers["authorization"] == f"Bearer {TOKEN}"
+
+    fake.fail_next("resolve_alias", 429, retry_after_ms=1500)
+    assert await client.resolve_alias("#chat:hs") == ROOM
+    assert slept == [1.5]
+
+    errors: list[MatrixError] = []
+    fake.fail_next("resolve_alias", 403)
+    with pytest.raises(MatrixForbidden) as forbidden:
+        await client.resolve_alias("#chat:hs")
+    errors.append(forbidden.value)
+    fake.fail_next("resolve_alias", 502)
+    with pytest.raises(MatrixUnavailable) as unavailable:
+        await client.resolve_alias("#chat:hs")
+    errors.append(unavailable.value)
+
+    def echo_token(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"errcode": "M_UNKNOWN", "error": f"bad {TOKEN}"})
+
+    def leak_in_transport(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"refused with {TOKEN}", request=request)
+
+    for handler in (echo_token, leak_in_transport):
+        async with MatrixClient(BASE, TOKEN, transport=httpx.MockTransport(handler)) as other:
+            with pytest.raises(MatrixUnavailable) as exc:
+                await other.resolve_alias("#chat:hs")
+            errors.append(exc.value)
+
+    fake.revoke_token()
+    with pytest.raises(MatrixAuthError) as revoked:
+        await client.resolve_alias("#chat:hs")
+    errors.append(revoked.value)
+
+    for error in errors:
+        assert TOKEN not in str(error)
+        assert TOKEN not in repr(error)
+        assert TOKEN not in "".join(traceback.format_exception(error))
+    assert TOKEN not in caplog.text

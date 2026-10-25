@@ -1,4 +1,4 @@
-"""Thin async client for the nine Matrix client-server calls the connector makes."""
+"""Thin async client for the ten Matrix client-server calls the connector makes."""
 
 import asyncio
 import json
@@ -135,6 +135,15 @@ class MatrixClient:
         if filter is not None:
             params["filter"] = json.dumps(filter, separators=(",", ":"))
         return await self._request("GET", _path("rooms", room_id, "messages"), params=params)
+
+    async def resolve_alias(self, alias: str) -> str | None:
+        """The room id `alias` points to in the room directory, or None when it is unknown."""
+        try:
+            body = await self._request("GET", _path("directory", "room", alias))
+        except MatrixNotFound:
+            return None
+        room_id = body.get("room_id") if isinstance(body, dict) else None
+        return room_id if isinstance(room_id, str) else None
 
     async def joined_members(self, room_id: str) -> dict[str, str | None]:
         body = await self._request("GET", _path("rooms", room_id, "joined_members"))

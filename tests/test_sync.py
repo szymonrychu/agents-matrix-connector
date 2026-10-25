@@ -668,3 +668,84 @@ async def test_backfill_cap(fake, client, pool, monkeypatch, caplog):
     assert DM in warning.getMessage()
     assert " 5 " in warning.getMessage()
     assert "secret body" not in caplog.text
+
+
+async def test_foreign_ghost_cannot_use_facebook_rule(fake, client, pool):
+    foreign = "@facebook_1:evil.example"
+    loop = await joined_and_synced(fake, client, pool)
+    fake.set_member(DM, foreign, "join", "Alice")
+    await rules.add_rule(pool, "allow", "facebook", "1", None)
+
+    fake.post(DM, foreign, text("from another server"))
+    fake.post(DM, ALICE, text("from the bridge"))
+    await loop.run_once()
+
+    assert await inbound_rows(pool) == [
+        (foreign, "ignored", "not_allowed", "from another server", False),
+        (ALICE, "new", None, "from the bridge", False),
+    ]
+    assert await fetch(
+        pool,
+        "SELECT user_id, facebook_id FROM users WHERE user_id = ANY(%s) ORDER BY user_id",
+        [foreign, ALICE],
+    ) == [(foreign, None), (ALICE, "1")]
+
+
+ALIAS = "#alice:hs"
+UNVERIFIED = "unverified"
+
+
+async def room_alias(pool) -> str | None:
+    return (await fetch(pool, "SELECT alias FROM rooms WHERE room_id = %s", DM))[0][0]
+
+
+async def test_canonical_alias_verified(fake, client, pool, caplog):
+    canonical = {"type": "m.room.canonical_alias", "state_key": "", "content": {"alias": ALIAS}}
+    add_dm(fake, state=[bridge_state("dm", "Alice"), canonical])
+    await rules.add_rule(pool, "allow", "alias", ALIAS, None)
+    loop = make_loop(client, pool)
+
+    # Not in the room directory (404): not stored, logged as unverified.
+    with caplog.at_level(logging.WARNING, logger="agents_matrix_connector.sync"):
+        await loop.run_once()
+        assert await room_alias(pool) is None
+        fake.post(DM, ALICE, text("one"))
+        await loop.run_once()
+
+        # Resolving to another room: still not stored, and not logged a second time.
+        fake.add_alias(ALIAS, GROUP)
+        fake.set_state(DM, "m.room.canonical_alias", "", {"alias": ALIAS})
+        fake.post(DM, ALICE, text("two"))
+        await loop.run_once()
+    assert await room_alias(pool) is None
+    unverified = [r.getMessage() for r in caplog.records if UNVERIFIED in r.getMessage()]
+    assert len(unverified) == 1
+    assert DM in unverified[0] and ALIAS in unverified[0]
+
+    # Resolving to this room: stored, and the alias rule admits the room.
+    fake.add_alias(ALIAS, DM)
+    fake.set_state(DM, "m.room.canonical_alias", "", {"alias": ALIAS})
+    fake.post(DM, ALICE, text("three"))
+    await loop.run_once()
+    assert await room_alias(pool) == ALIAS
+
+    # A transport error keeps the stored alias; the check runs again on the next sync.
+    fake.fail_next("resolve_alias", 502)
+    fake.set_state(DM, "m.room.name", "", {"name": "Renamed"})
+    fake.post(DM, ALICE, text("four"))
+    await loop.run_once()
+    assert await room_alias(pool) == ALIAS
+    assert await fetch(pool, "SELECT name FROM rooms WHERE room_id = %s", DM) == [("Renamed",)]
+
+    fake.add_alias(ALIAS, GROUP)
+    fake.post(DM, ALICE, text("five"))
+    await loop.run_once()
+    assert await room_alias(pool) is None
+
+    assert await fetch(pool, "SELECT body, status, reason FROM inbound ORDER BY id") == [
+        ("one", "ignored", "not_allowed"),
+        ("two", "ignored", "not_allowed"),
+        ("three", "new", None),
+        ("four", "new", None),
+        ("five", "ignored", "not_allowed"),
+    ]

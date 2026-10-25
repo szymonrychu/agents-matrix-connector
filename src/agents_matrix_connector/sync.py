@@ -10,6 +10,10 @@ filter's limit since the last sync, for example after downtime) is backfilled: i
 is paged backwards from `prev_batch` until an event already in `inbound`, the bot's own
 join, or `MATRIX_BACKFILL_MAX_EVENTS` events, and the recovered messages go through intake
 oldest first, ahead of the timeline, in that sync's transaction.
+
+A room's canonical alias is stored only once the room directory resolves it to that room, so
+a room cannot claim another room's alias and match its `alias` rule. A transport error keeps
+the stored alias and the check runs again with the room's next state read, on its next sync.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ import logging
 import re
 from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 import psycopg
@@ -163,6 +167,16 @@ def _messages_oldest_first(newest_first: list[dict]) -> list[dict]:
 
 
 @dataclass(frozen=True)
+class _FetchedState:
+    """A joined room's full state read outside the transaction, classified, with its alias
+    verified; `alias_pending` means the check failed in transit and the stored alias stays."""
+
+    events: list[dict]
+    info: discovery.RoomInfo
+    alias_pending: bool
+
+
+@dataclass(frozen=True)
 class _RoomContext:
     """What intake needs about a room, read once per room per response."""
 
@@ -190,6 +204,9 @@ class SyncLoop:
         self._self_ids = settings.self_ids()
         self._bridge_bots = tuple(settings.bridge_bots)
         self._puppet = re.compile(settings.puppet_pattern)
+        self._bridge_server = settings.user_id.split(":", 1)[1]
+        self._alias_pending: set[str] = set()
+        self._unverified_logged: set[tuple[str, str]] = set()
         self._filter_id: str | None = None
         self.last_sync_at: datetime | None = None
 
@@ -265,26 +282,61 @@ class SyncLoop:
             filter_id=self._filter_id,
         )
 
-    async def _fetch_state(self, joined: Mapping[str, dict]) -> dict[str, list[dict]]:
-        """Full state of each joined room not yet classified or whose room info changed."""
+    async def _fetch_state(self, joined: Mapping[str, dict]) -> dict[str, _FetchedState]:
+        """Full state of each joined room not yet classified, whose room info changed or
+        whose alias check is pending."""
         async with self._pool.connection() as conn:
             cur = await conn.execute(
                 "SELECT room_id FROM rooms WHERE kind IS NOT NULL AND room_id = ANY(%s)",
                 (list(joined),),
             )
             classified = {row[0] for row in await cur.fetchall()}
-        fetched: dict[str, list[dict]] = {}
+        fetched: dict[str, _FetchedState] = {}
         for room_id, room in joined.items():
             changed = any(e.get("type") in ROOM_INFO_TYPES for e in _state_events(room))
-            if room_id in classified and not changed:
+            if room_id in classified and not changed and room_id not in self._alias_pending:
                 continue
             try:
-                fetched[room_id] = await self._matrix.room_state(room_id)
+                events = await self._matrix.room_state(room_id)
             except (MatrixAuthError, MatrixUnavailable):
                 raise
             except MatrixError as exc:
                 log.warning("cannot read the state of room %s, not classified: %s", room_id, exc)
+                continue
+            info = discovery.classify(events, self._self_ids, self._bridge_bots)
+            alias = await self._verified_alias(room_id, info.alias)
+            fetched[room_id] = _FetchedState(
+                events, replace(info, alias=alias), room_id in self._alias_pending
+            )
         return fetched
+
+    async def _verified_alias(self, room_id: str, alias: str | None) -> str | None:
+        """`alias` when the room directory resolves it to `room_id`, else None. A transport
+        error marks the room's alias check pending (the stored alias stays)."""
+        self._alias_pending.discard(room_id)
+        if alias is None:
+            return None
+        try:
+            resolved = await self._matrix.resolve_alias(alias)
+        except MatrixAuthError:
+            raise
+        except MatrixUnavailable as exc:
+            log.warning(
+                "cannot resolve alias %s of room %s, keeping the stored alias: %s",
+                alias,
+                room_id,
+                exc,
+            )
+            self._alias_pending.add(room_id)
+            return None
+        except MatrixError:
+            resolved = None
+        if resolved == room_id:
+            return alias
+        if (room_id, alias) not in self._unverified_logged:
+            self._unverified_logged.add((room_id, alias))
+            log.warning("room %s has an unverified canonical alias %s, not stored", room_id, alias)
+        return None
 
     async def _backfill(self, joined: Mapping[str, dict]) -> dict[str, list[dict]]:
         """The missed messages of each joined room whose timeline is limited, oldest first."""
@@ -378,26 +430,30 @@ class SyncLoop:
         return None
 
     def _facebook_id(self, user_id: str) -> str | None:
-        return discovery.facebook_id(user_id, self._puppet)
+        return discovery.facebook_id(user_id, self._puppet, self._bridge_server)
 
     async def _apply_joined(
         self,
         conn: psycopg.AsyncConnection,
         room_id: str,
         room: dict,
-        state: list[dict] | None,
+        fetched: _FetchedState | None,
         recovered: list[dict],
         rule_list: list[policy.Rule],
         process_messages: bool,
         at: datetime,
     ) -> None:
-        cur = await conn.execute("SELECT membership FROM rooms WHERE room_id = %s", (room_id,))
+        cur = await conn.execute(
+            "SELECT membership, alias FROM rooms WHERE room_id = %s", (room_id,)
+        )
         before = await cur.fetchone()
         newly_joined = before is None or before[0] != "join"
-        if state is not None:
-            info = discovery.classify(state, self._self_ids, self._bridge_bots)
+        if fetched is not None:
+            info = fetched.info
+            if fetched.alias_pending:
+                info = replace(info, alias=before[1] if before else None)
             await directory.upsert_room(conn, room_id, membership="join", info=info, at=at)
-            members = _memberships(state)
+            members = _memberships(fetched.events)
         else:
             await directory.upsert_room(conn, room_id, membership="join", at=at)
             members = _memberships(_state_events(room))
