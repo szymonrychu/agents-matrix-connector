@@ -113,13 +113,13 @@ Bot user, homeserver, default policy, group trigger, rule kinds per list and syn
 
 Discovered rooms. Query: `kind` (`dm`, `group`, `matrix`, `infrastructure`), `access`
 (`allowed`, `denied`, `default`). 200 list of rooms with `access`, `preset_id`, `trigger`,
-`effective_trigger`, `session` and `queued`; 422 `invalid_request`.
+`effective_trigger`, `session` (`id`, `slug`, `status`, or null) and `queued` (messages waiting); 422 `invalid_request`.
 
     curl -s 'http://localhost:8000/matrix/api/v1/rooms?kind=dm&access=allowed'
 
 ### `GET /matrix/api/v1/rooms/{room_id}`
 
-One room with its `members` and each member's access. 200; 404 `not_found`.
+One room with its `members` (`user_id`, `display_name`, `facebook_id`, `membership`, `access`). 200; 404 `not_found`.
 
     curl -s 'http://localhost:8000/matrix/api/v1/rooms/!abc:server'
 

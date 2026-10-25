@@ -37,6 +37,14 @@ from agents_matrix_connector.settings import BotSettings
 
 log = logging.getLogger(__name__)
 
+SESSION_GONE = "session_gone"
+TURN_FAILED = "turn_failed"
+TIMEOUT = "timeout"
+EMPTY_REPLY = "empty_reply"
+FORBIDDEN = "forbidden"
+MESSAGE_FAILED = "message_failed"
+MESSAGE_CANCELLED = "message_cancelled"
+_MESSAGE_REASONS = {"failed": MESSAGE_FAILED, "cancelled": MESSAGE_CANCELLED}
 NOTICE = "Sorry, the agent could not answer that message."
 TYPING_TIMEOUT_MS = 30000
 PRUNE_INTERVAL = timedelta(days=1)
@@ -58,7 +66,7 @@ class _Outcome:
     requeue: bool = False
 
 
-_SESSION_GONE = _Outcome("failed", "session_gone", requeue=True)
+_SESSION_GONE = _Outcome("failed", SESSION_GONE, requeue=True)
 
 
 def _failed(reason: str) -> _Outcome:
@@ -105,7 +113,7 @@ class Tracker:
         try:
             message = await self._orchestrator.get_message(int(run.message_id))
         except NotFound:
-            return _SESSION_GONE if run.kind == "follow" else _failed("message_failed")
+            return _SESSION_GONE if run.kind == "follow" else _failed(MESSAGE_FAILED)
         except OrchestratorUnavailable as exc:
             log.warning("orchestrator unavailable polling run %s: %s", run.id, exc)
             return self._timed_out(run)
@@ -116,18 +124,18 @@ class Tracker:
         turn = message.turn
         if turn is not None and turn.status == "completed":
             chunks = split(turn.final_text or "", self._settings.reply_chunk_chars)
-            return _Outcome("handled", None if chunks else "empty_reply", chunks=chunks)
+            return _Outcome("handled", None if chunks else EMPTY_REPLY, chunks=chunks)
         if turn is not None and turn.status == "failed":
-            return _failed("turn_failed")
+            return _failed(TURN_FAILED)
         if message.status in ("failed", "cancelled"):
             if turn is None and run.kind == "follow":
                 return _SESSION_GONE
-            return _failed(f"message_{message.status}")
+            return _failed(_MESSAGE_REASONS[message.status])
         return self._timed_out(run)
 
     def _timed_out(self, run: runs.RunRow) -> _Outcome | None:
         if self._now() - run.started_at > self._timeout:
-            return _failed("timeout")
+            return _failed(TIMEOUT)
         return None
 
     async def _finish(self, run: runs.RunRow, outcome: _Outcome) -> bool:
@@ -169,7 +177,7 @@ class Tracker:
                 return
             except MatrixForbidden as exc:
                 log.warning("matrix refused %s in %s: %s", row.txn_id, row.room_id, exc)
-                await self._mark_failed(row.id, "forbidden")
+                await self._mark_failed(row.id, FORBIDDEN)
             except MatrixAuthError:
                 raise
             except MatrixError as exc:

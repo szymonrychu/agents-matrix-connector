@@ -48,6 +48,8 @@ from agents_matrix_connector.settings import BotSettings
 log = logging.getLogger(__name__)
 
 RUN_KIND = "matrix"
+NO_PRESET = "no_preset"
+SESSION_GONE = "session_gone"
 TYPING_TIMEOUT_MS = 30000
 UNAVAILABLE_LOG_INTERVAL = timedelta(minutes=1)
 
@@ -124,7 +126,7 @@ class Worker:
         async with self._pool.connection() as conn:
             preset_id = await self._preset(conn, room_id)
             if preset_id is None:
-                ignored = await inbound.ignore_new(conn, room_id, "no_preset")
+                ignored = await inbound.ignore_new(conn, room_id, NO_PRESET)
                 log.info("room %s has no preset: %s messages ignored", room_id, ignored)
                 return
             latest = await runs.latest_session(conn, room_id)
@@ -252,7 +254,7 @@ class Worker:
 
     async def _session_gone(self, batch: _Batch) -> None:
         async with self._pool.connection() as conn, conn.transaction():
-            if not await runs.finish(conn, int(batch.ref.id), "failed", "session_gone"):
+            if not await runs.finish(conn, int(batch.ref.id), "failed", SESSION_GONE):
                 return
             requeued = await inbound.requeue_run_rows(conn, int(batch.ref.id))
         log.info(

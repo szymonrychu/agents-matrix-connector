@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import re
 from pathlib import Path
 
@@ -16,19 +15,7 @@ from agents_matrix_connector.api.app import PREFIX, create_api_app
 ROOT = Path(__file__).resolve().parent.parent
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 
-# worker and tracker record these as literals in their own modules (and `preset_not_found` in
-# agents_common.runs); the test also checks the literal is still used where it is recorded.
-WORKER_REASONS = ("no_preset", "session_gone")
-TRACKER_REASONS = (
-    "session_gone",
-    "message_failed",
-    "message_cancelled",
-    "turn_failed",
-    "timeout",
-    "empty_reply",
-    "forbidden",
-)
-COMMON_REASONS = ("preset_not_found",)
+PRESET_NOT_FOUND = "preset_not_found"  # recorded by agents_common.runs.dispatch
 
 
 def section(title: str) -> str:
@@ -89,15 +76,17 @@ def test_readme_lists_every_reason() -> None:
         sync.UNSUPPORTED_CONTENT,
         sync.NOT_MENTIONED,
         sync.QUEUE_FULL,
-        *WORKER_REASONS,
-        *TRACKER_REASONS,
-        *COMMON_REASONS,
+        worker.NO_PRESET,
+        worker.SESSION_GONE,
+        tracker.SESSION_GONE,
+        tracker.TURN_FAILED,
+        tracker.TIMEOUT,
+        tracker.EMPTY_REPLY,
+        tracker.FORBIDDEN,
+        tracker.MESSAGE_FAILED,
+        tracker.MESSAGE_CANCELLED,
+        PRESET_NOT_FOUND,
     }
-    for module, names in ((worker, WORKER_REASONS), (tracker, TRACKER_REASONS)):
-        source = inspect.getsource(module)
-        for name in names:
-            built = name.startswith("message_") and 'f"message_{' in source
-            assert name in source or built, f"{name} gone from {module}"
     assert policy.denied("<kind>") in README
     for reason in sorted(reasons):
         assert f"`{reason}`" in README, f"README does not name reason {reason}"
