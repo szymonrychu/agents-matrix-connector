@@ -38,6 +38,7 @@ class ConnectorSettings(BaseServiceSettings):
     poll_seconds: float = Field(3, gt=0)
     sync_timeout_seconds: int = Field(30, ge=1, le=120)
     retention_days: int = Field(30, ge=1)
+    backfill_max_events: int = Field(500, ge=1)
     api_allowed_cidrs: CsvList = ["127.0.0.1/32"]
 
     @field_validator("homeserver_url")

@@ -3,8 +3,14 @@
 `FakeHomeserver(user_id, token).app` is an ASGI app implementing the client-server calls
 `MatrixClient` makes, with Matrix-shaped JSON and errors, for one bot user and its token.
 Drive it through `httpx.ASGITransport(app=fake.app)` or serve it with uvicorn; the helpers
-(`add_room`, `invite`, `post`, `set_state`, `set_member`, `encrypt`, `fail_next`,
-`revoke_token`) change its state and `sent` / `typing_state` read back what the bot did.
+(`add_room`, `invite`, `post`, `set_state`, `set_member`, `encrypt`, `limit_timeline`,
+`fail_next`, `revoke_token`) change its state and `sent` / `typing_state` read back what the
+bot did.
+
+Sync tokens are `s<n>` and pagination tokens `t<n>`, both meaning "after the n-th event";
+`/messages` accepts either. A sync timeline holding more events than its limit (the
+filter's `room.timeline.limit`, or the `limit_timeline` override) keeps the newest ones and
+arrives `limited` with a `prev_batch` to page back from.
 
 Routing works on the raw path, segment by segment, so percent-encoded `/` in a room id or
 transaction id stays inside its segment as it does on Synapse.
@@ -30,6 +36,7 @@ ROUTES = (
     "join",
     "room_state",
     "joined_members",
+    "room_messages",
     "send_text",
     "typing",
 )
@@ -100,6 +107,7 @@ class FakeHomeserver:
         self._txns: dict[tuple[str, str, str, str], str] = {}
         self._sent: dict[str, list[dict]] = {}
         self._typing: dict[str, bool] = {}
+        self._timeline_limit: int | None = None
         self._failures: dict[str, list[_Failure]] = {route: [] for route in ROUTES}
         self._table: list[tuple[str, tuple[str | None, ...], str, Handler]] = [
             ("GET", ("account", "whoami"), "whoami", self._whoami),
@@ -108,6 +116,7 @@ class FakeHomeserver:
             ("POST", ("join", None), "join", self._join),
             ("GET", ("rooms", None, "state"), "room_state", self._room_state),
             ("GET", ("rooms", None, "joined_members"), "joined_members", self._joined_members),
+            ("GET", ("rooms", None, "messages"), "room_messages", self._messages),
             ("PUT", ("rooms", None, "send", None, None), "send_text", self._send),
             ("PUT", ("rooms", None, "typing", None), "typing", self._typing_route),
         ]
@@ -166,6 +175,13 @@ class FakeHomeserver:
     def encrypt(self, room_id: str) -> None:
         self.set_state(room_id, "m.room.encryption", "", {"algorithm": ENCRYPTION_ALGORITHM})
 
+    def limit_timeline(self, limit: int | None) -> None:
+        """Cap every following sync timeline at `limit` events per room, overriding the
+        filter's limit; None restores the filter's limit."""
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be at least 1")
+        self._timeline_limit = limit
+
     def sent(self, room_id: str) -> list[dict]:
         """Contents the bot sent into the room, in order, one per distinct transaction."""
         return copy.deepcopy(self._sent.get(room_id, []))
@@ -216,6 +232,10 @@ class FakeHomeserver:
         }
         if state_key is not None:
             event["state_key"] = state_key
+            previous = room.state.get((event_type, state_key))
+            if previous is not None:
+                event["unsigned"]["prev_content"] = copy.deepcopy(previous[1]["content"])
+                event["unsigned"]["replaces_state"] = previous[1]["event_id"]
             room.state[(event_type, state_key)] = (self._pos, event)
         room.timeline.append((self._pos, event))
         self._changed.set()
@@ -359,7 +379,9 @@ class FakeHomeserver:
 
     def _sync_rooms(self, since: int | None, full_state: bool, definition: dict) -> dict[str, dict]:
         room_filter = definition.get("room", {})
-        timeline_types = room_filter.get("timeline", {}).get("types")
+        timeline_filter = room_filter.get("timeline", {})
+        timeline_types = timeline_filter.get("types")
+        limit = self._timeline_limit or timeline_filter.get("limit")
         state_types = room_filter.get("state", {}).get("types")
         invite: dict[str, dict] = {}
         join: dict[str, dict] = {}
@@ -374,27 +396,44 @@ class FakeHomeserver:
                 invite[room.room_id] = {"invite_state": {"events": self._stripped_state(room)}}
             elif state == "join":
                 timeline = [
-                    _client_event(e)
+                    (pos, e)
                     for pos, e in room.timeline
                     if (since is None or pos > since) and _wanted(e, timeline_types)
                 ]
+                timeline, limited = _newest(timeline, limit)
                 state_events = []
                 if full_state or changed:
-                    state_events = [
-                        _client_event(e)
-                        for _, e in sorted(room.state.values(), key=lambda item: item[0])
-                        if _wanted(e, state_types)
-                    ]
+                    state_events = self._current_state(room, state_types)
+                elif limited:
+                    start = timeline[0][0] if timeline else self._pos + 1
+                    state_events = self._current_state(room, state_types, since, start)
                 if timeline or state_events:
-                    join[room.room_id] = _room_body(state_events, timeline)
+                    join[room.room_id] = _room_body(state_events, timeline, limited)
             elif state in ("leave", "ban") and since is not None and changed:
                 timeline = [
-                    _client_event(e)
+                    (pos, e)
                     for pos, e in room.timeline
                     if since < pos <= member_pos and _wanted(e, timeline_types)
                 ]
-                leave[room.room_id] = _room_body([], timeline)
+                leave[room.room_id] = _room_body([], *_newest(timeline, limit))
         return {"invite": invite, "join": join, "leave": leave}
+
+    def _current_state(
+        self,
+        room: _Room,
+        types: list[str] | None,
+        after: int | None = None,
+        before: int | None = None,
+    ) -> list[dict]:
+        """The room's current state events, optionally only those set between `after` and
+        `before` (exclusive), in the order they were set."""
+        return [
+            _client_event(e)
+            for pos, e in sorted(room.state.values(), key=lambda item: item[0])
+            if _wanted(e, types)
+            and (after is None or pos > after)
+            and (before is None or pos < before)
+        ]
 
     def _stripped_state(self, room: _Room) -> list[dict]:
         events = [
@@ -454,6 +493,49 @@ class FakeHomeserver:
         }
         return JSONResponse({"joined": joined})
 
+    async def _messages(self, request: Request, params: list[str]) -> Response:
+        room = self._joined_room(params[0])
+        if isinstance(room, Response):
+            return room
+        query = request.query_params
+        direction = query.get("dir", "b")
+        if direction not in ("b", "f"):
+            return matrix_error(400, "M_INVALID_PARAM", "Unknown dir")
+        backwards = direction == "b"
+        try:
+            limit = int(query.get("limit", "10"))
+        except ValueError:
+            return matrix_error(400, "M_INVALID_PARAM", "Invalid limit")
+        if limit < 0:
+            return matrix_error(400, "M_INVALID_PARAM", "Invalid limit")
+        start = query.get("from")
+        if start is None:
+            position = self._pos if backwards else 0
+        else:
+            parsed = _position(start)
+            if parsed is None:
+                return matrix_error(400, "M_INVALID_PARAM", "Invalid from token")
+            position = parsed
+        try:
+            definition = json.loads(query.get("filter", "{}"))
+        except ValueError:
+            return matrix_error(400, "M_NOT_JSON", "Filter is not JSON")
+        types = definition.get("types") if isinstance(definition, dict) else None
+        if backwards:
+            candidates = [(p, e) for p, e in reversed(room.timeline) if p <= position]
+        else:
+            candidates = [(p, e) for p, e in room.timeline if p > position]
+        candidates = [(p, e) for p, e in candidates if _wanted(e, types)]
+        chunk = candidates[:limit]
+        body: dict[str, Any] = {
+            "start": start if start is not None else f"t{position}",
+            "chunk": [copy.deepcopy(e) for _, e in chunk],
+        }
+        if len(candidates) > len(chunk) and chunk:
+            last = chunk[-1][0]
+            body["end"] = f"t{last - 1}" if backwards else f"t{last}"
+        return JSONResponse(body)
+
     async def _send(self, request: Request, params: list[str]) -> Response:
         room_id, event_type, txn_id = params
         room = self._joined_room(room_id)
@@ -493,11 +575,26 @@ def _client_event(event: dict) -> dict:
     return {k: copy.deepcopy(v) for k, v in event.items() if k != "room_id"}
 
 
-def _room_body(state: list[dict], timeline: list[dict]) -> dict:
-    return {
-        "state": {"events": state},
-        "timeline": {"events": timeline, "limited": False},
-    }
+def _newest(
+    events: list[tuple[int, dict]], limit: int | None
+) -> tuple[list[tuple[int, dict]], bool]:
+    """The newest `limit` events and whether older ones were left out."""
+    if limit is None or len(events) <= limit:
+        return events, False
+    return events[len(events) - limit :], True
+
+
+def _position(token: str) -> int | None:
+    if token[:1] in ("s", "t") and token[1:].isdigit():
+        return int(token[1:])
+    return None
+
+
+def _room_body(state: list[dict], timeline: list[tuple[int, dict]], limited: bool) -> dict:
+    block: dict[str, Any] = {"events": [_client_event(e) for _, e in timeline], "limited": limited}
+    if timeline:
+        block["prev_batch"] = f"t{timeline[0][0] - 1}"
+    return {"state": {"events": state}, "timeline": block}
 
 
 def _failure_response(failure: _Failure) -> JSONResponse:

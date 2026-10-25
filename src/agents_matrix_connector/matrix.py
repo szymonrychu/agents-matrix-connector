@@ -1,6 +1,7 @@
-"""Thin async client for the eight Matrix client-server calls the connector makes."""
+"""Thin async client for the nine Matrix client-server calls the connector makes."""
 
 import asyncio
+import json
 import logging
 from types import TracebackType
 from typing import Any, Self
@@ -118,6 +119,22 @@ class MatrixClient:
 
     async def room_state(self, room_id: str) -> list[dict]:
         return await self._request("GET", _path("rooms", room_id, "state"))
+
+    async def room_messages(
+        self,
+        room_id: str,
+        from_token: str,
+        *,
+        direction: str = "b",
+        limit: int = 100,
+        filter: dict | None = None,
+    ) -> dict:
+        """One page of a room's timeline from `from_token`: `chunk` (newest first when
+        paging backwards), `start` and, while more events exist, `end`."""
+        params = {"from": from_token, "dir": direction, "limit": str(limit)}
+        if filter is not None:
+            params["filter"] = json.dumps(filter, separators=(",", ":"))
+        return await self._request("GET", _path("rooms", room_id, "messages"), params=params)
 
     async def joined_members(self, room_id: str) -> dict[str, str | None]:
         body = await self._request("GET", _path("rooms", room_id, "joined_members"))

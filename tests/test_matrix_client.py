@@ -348,3 +348,110 @@ def test_fake_app_is_asgi3_for_uvicorn(fake):
     config = uvicorn.Config(fake.app, lifespan="on")
     config.load()
     assert config.interface == "asgi3"
+
+
+async def test_room_messages(fake, recorder, client, monkeypatch):
+    fake.add_room(ROOM, [], {BOT: "Bot", ALICE: "Alice"})
+    ids = [fake.post(ROOM, ALICE, {"msgtype": "m.text", "body": f"m{n}"}) for n in range(5)]
+    head = (await client.sync(None, 0, None))["next_batch"]
+
+    page = await client.room_messages(ROOM, head, limit=2)
+    request = recorder.requests[-1]
+    assert recorder.calls()[-1] == ("GET", f"{API}/rooms/%21a%3Ahs/messages")
+    assert dict(request.url.params) == {"from": head, "dir": "b", "limit": "2"}
+    assert request.headers["authorization"] == f"Bearer {TOKEN}"
+    assert page["start"] == head
+    assert [e["event_id"] for e in page["chunk"]] == [ids[4], ids[3]]
+    assert page["chunk"][0]["content"] == {"msgtype": "m.text", "body": "m4"}
+
+    only_messages = {"types": ["m.room.message"]}
+    rest = await client.room_messages(ROOM, page["end"], filter=only_messages)
+    params = recorder.requests[-1].url.params
+    assert params["limit"] == "100" and params["dir"] == "b"
+    assert json.loads(params["filter"]) == only_messages
+    assert [e["event_id"] for e in rest["chunk"]] == [ids[2], ids[1], ids[0]]
+    assert "end" not in rest
+
+    forward = await client.room_messages(ROOM, page["end"], direction="f", filter=only_messages)
+    assert recorder.requests[-1].url.params["dir"] == "f"
+    assert [e["event_id"] for e in forward["chunk"]] == [ids[3], ids[4]]
+
+    for status, cls in (
+        (401, MatrixAuthError),
+        (403, MatrixForbidden),
+        (404, MatrixNotFound),
+        (500, MatrixUnavailable),
+    ):
+        fake.fail_next("room_messages", status)
+        with pytest.raises(cls):
+            await client.room_messages(ROOM, head)
+    with pytest.raises(MatrixNotFound):
+        await client.room_messages("!nowhere:hs", head)
+    fake.add_room("!other:hs", [], {ALICE: "Alice"})
+    with pytest.raises(MatrixForbidden):
+        await client.room_messages("!other:hs", head)
+    with pytest.raises(MatrixError) as invalid:
+        await client.room_messages(ROOM, "not-a-token")
+    assert (invalid.value.status, invalid.value.errcode) == (400, "M_INVALID_PARAM")
+
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(matrix, "_sleep", fake_sleep)
+    fake.fail_next("room_messages", 429, retry_after_ms=250)
+    assert len((await client.room_messages(ROOM, head, limit=1))["chunk"]) == 1
+    assert slept == [0.25]
+
+    def echo_token(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, json={"errcode": "M_UNKNOWN", "error": f"bad {TOKEN}"})
+
+    async with MatrixClient(BASE, TOKEN, transport=httpx.MockTransport(echo_token)) as other:
+        with pytest.raises(MatrixUnavailable) as leaked:
+            await other.room_messages(ROOM, head)
+    assert TOKEN not in str(leaked.value)
+    assert TOKEN not in "".join(traceback.format_exception(leaked.value))
+
+
+async def test_limited_sync_prev_batch(fake, client):
+    fake.add_room(ROOM, [name_event("Chat")], {BOT: "Bot", ALICE: "Alice"})
+    first = await client.sync(None, 0, None)
+    assert first["rooms"]["join"][ROOM]["timeline"]["limited"] is False
+
+    ids = [fake.post(ROOM, ALICE, {"msgtype": "m.text", "body": f"m{n}"}) for n in range(5)]
+    fake.limit_timeline(2)
+    later = await client.sync(first["next_batch"], 0, None)
+    timeline = later["rooms"]["join"][ROOM]["timeline"]
+    assert timeline["limited"] is True
+    assert [e["event_id"] for e in timeline["events"]] == ids[3:]
+    older = await client.room_messages(
+        ROOM, timeline["prev_batch"], filter={"types": ["m.room.message"]}
+    )
+    assert [e["event_id"] for e in older["chunk"]] == [ids[2], ids[1], ids[0]]
+
+    # State changed inside the gap arrives in the state block of a limited sync.
+    fake.set_state(ROOM, "m.room.name", "", {"name": "Renamed"})
+    fake.set_member(ROOM, BOT, "join", "Bot renamed")
+    for n in range(3):
+        fake.post(ROOM, ALICE, {"msgtype": "m.text", "body": f"gap {n}"})
+    gap = (await client.sync(later["next_batch"], 0, None))["rooms"]["join"][ROOM]
+    assert gap["timeline"]["limited"] is True
+    state = {(e["type"], e["state_key"]): e for e in gap["state"]["events"]}
+    assert state[("m.room.name", "")]["content"] == {"name": "Renamed"}
+    rename = state[("m.room.member", BOT)]
+    assert rename["unsigned"]["prev_content"] == {"membership": "join", "displayname": "Bot"}
+    create = next(e for e in await client.room_state(ROOM) if e["type"] == "m.room.create")
+    assert "prev_content" not in create["unsigned"]
+
+    # Without the override the filter's own timeline limit applies.
+    fake.limit_timeline(None)
+    filter_id = await client.create_filter(BOT, {"room": {"timeline": {"limit": 1}}})
+    since = (await client.sync(None, 0, None))["next_batch"]
+    fake.post(ROOM, ALICE, {"msgtype": "m.text", "body": "a"})
+    last = fake.post(ROOM, ALICE, {"msgtype": "m.text", "body": "b"})
+    capped = (await client.sync(since, 0, filter_id))["rooms"]["join"][ROOM]["timeline"]
+    assert capped["limited"] is True
+    assert [e["event_id"] for e in capped["events"]] == [last]
+    whole = (await client.sync(since, 0, None))["rooms"]["join"][ROOM]["timeline"]
+    assert whole["limited"] is False and len(whole["events"]) == 2

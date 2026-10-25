@@ -516,3 +516,155 @@ async def test_lost_filter_recreated(fake, client, pool, monkeypatch):
     await restarted.run_once()
     assert created == ["1"]
     assert len(await inbound_rows(pool)) == 2
+
+
+LATE = "!late:hs"
+FRESH = "!fresh:hs"
+
+
+def spy_messages(monkeypatch, client) -> list[tuple]:
+    """Record (room_id, from_token, limit, chunk length) of every room_messages call."""
+    calls: list[tuple] = []
+    real = client.room_messages
+
+    async def spy(room_id, from_token, **kwargs):
+        page = await real(room_id, from_token, **kwargs)
+        calls.append((room_id, from_token, kwargs.get("limit"), len(page.get("chunk", []))))
+        return page
+
+    monkeypatch.setattr(client, "room_messages", spy)
+    return calls
+
+
+async def bodies(pool) -> list[str]:
+    return [row[3] for row in await inbound_rows(pool)]
+
+
+async def test_limited_timeline_backfill(fake, client, pool, monkeypatch):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    fake.post(DM, ALICE, text("before downtime"))
+    await loop.run_once()
+    before = await sync_state(pool)
+
+    monkeypatch.setattr(sync_module, "BACKFILL_PAGE", 2)
+    responses: list[dict] = []
+    real_sync = client.sync
+
+    async def keep_response(*args, **kwargs):
+        responses.append(await real_sync(*args, **kwargs))
+        return responses[-1]
+
+    monkeypatch.setattr(client, "sync", keep_response)
+    calls = spy_messages(monkeypatch, client)
+    fake.limit_timeline(2)
+    fake.post(DM, BOT, text("bot reply"))
+    for n in range(5):
+        fake.post(DM, ALICE, text(f"missed {n}"))
+
+    real_insert = inbound.insert
+    inserted: list[str] = []
+    crash = {"armed": True}
+
+    async def recording_insert(*args, **kwargs):
+        if crash["armed"] and inserted:
+            raise RuntimeError("crash before commit")
+        inserted.append(kwargs["event_id"])
+        return await real_insert(*args, **kwargs)
+
+    monkeypatch.setattr(inbound, "insert", recording_insert)
+    with pytest.raises(RuntimeError, match="crash before commit"):
+        await loop.run_once()
+    assert await bodies(pool) == ["before downtime"]
+    assert await sync_state(pool) == before
+
+    crash["armed"] = False
+    inserted.clear()
+    calls.clear()
+    await loop.run_once()
+    assert await bodies(pool) == ["before downtime"] + [f"missed {n}" for n in range(5)]
+    assert len(inserted) == len(set(inserted)) == 5
+    [_, response] = responses
+    timeline = response["rooms"]["join"][DM]["timeline"]
+    assert timeline["limited"] is True
+    assert [c[:3] for c in calls[:1]] == [(DM, timeline["prev_batch"], 2)]
+    assert [c[2] for c in calls] == [2, 2, 2]
+    assert (await sync_state(pool))[0] == response["next_batch"]
+
+    # A sync that is not limited reads no history.
+    fake.limit_timeline(None)
+    calls.clear()
+    fake.post(DM, ALICE, text("live"))
+    await loop.run_once()
+    assert calls == []
+    assert (await bodies(pool))[-1] == "live"
+    assert len(await inbound_rows(pool)) == 7
+
+
+async def test_backfill_respects_no_replay(fake, client, pool, monkeypatch):
+    calls = spy_messages(monkeypatch, client)
+    fake.limit_timeline(2)
+    add_dm(fake)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    for n in range(4):
+        fake.post(DM, ALICE, text(f"history {n}"))
+    loop = make_loop(client, pool)
+    await loop.run_once()
+    assert await inbound_rows(pool) == []
+    assert calls == []
+
+    # Rooms joined while the bot was away: history before the bot's own join stays unread.
+    for room_id in (LATE, FRESH):
+        add_dm(fake, joined=False, room_id=room_id)
+        await rules.add_rule(pool, "allow", "room", room_id, None)
+        fake.post(room_id, ALICE, text(f"{room_id} before invite"))
+        fake.invite(room_id, BRIDGE)
+        fake.post(room_id, ALICE, text(f"{room_id} while invited"))
+        fake.post(room_id, ALICE, text(f"{room_id} while invited again"))
+        await client.join(room_id)
+    for n in range(4):
+        fake.post(LATE, ALICE, text(f"after join {n}"))
+    fake.post(FRESH, ALICE, text("fresh after join"))
+    await loop.run_once()
+    assert sorted(await bodies(pool)) == sorted(
+        ["fresh after join"] + [f"after join {n}" for n in range(4)]
+    )
+    late = await fetch(pool, "SELECT body FROM inbound WHERE room_id = %s ORDER BY id", LATE)
+    assert [row[0] for row in late] == [f"after join {n}" for n in range(4)]
+    # FRESH's limited timeline starts with the join itself, so there is nothing to backfill.
+    assert [c[0] for c in calls] == [LATE]
+
+    # A later profile change of the bot is not its join: backfill reads past it.
+    calls.clear()
+    fake.post(LATE, ALICE, text("before rename"))
+    fake.set_member(LATE, BOT, "join", "hermes renamed")
+    fake.post(LATE, ALICE, text("after rename 0"))
+    fake.post(LATE, ALICE, text("after rename 1"))
+    await loop.run_once()
+    late = await fetch(pool, "SELECT body FROM inbound WHERE room_id = %s ORDER BY id", LATE)
+    assert [row[0] for row in late][4:] == ["before rename", "after rename 0", "after rename 1"]
+    assert [c[0] for c in calls] == [LATE]
+
+
+async def test_backfill_cap(fake, client, pool, monkeypatch, caplog):
+    assert make_settings().backfill_max_events == 500
+    loop = await joined_and_synced(fake, client, pool, backfill_max_events=5)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    fake.post(DM, ALICE, text("recorded"))
+    await loop.run_once()
+
+    monkeypatch.setattr(sync_module, "BACKFILL_PAGE", 2)
+    calls = spy_messages(monkeypatch, client)
+    fake.limit_timeline(2)
+    for n in range(10):
+        fake.post(DM, ALICE, text(f"secret body {n}"))
+    with caplog.at_level(logging.WARNING, logger="agents_matrix_connector.sync"):
+        await loop.run_once()
+
+    assert await bodies(pool) == ["recorded"] + [f"secret body {n}" for n in range(3, 10)]
+    assert [c[2] for c in calls] == [2, 2, 1]
+    assert sum(c[3] for c in calls) == 5
+    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert DM in warning.getMessage()
+    assert " 5 " in warning.getMessage()
+    assert "secret body" not in caplog.text

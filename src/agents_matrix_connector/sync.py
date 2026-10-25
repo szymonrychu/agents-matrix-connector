@@ -2,8 +2,14 @@
 
 Each `/sync` response is applied in one transaction together with its `next_batch`, so a
 crash before the commit replays the same response; inbound rows are keyed by event id and
-the replay inserts nothing twice. Matrix calls (room state, joins) happen outside the
-transaction so a slow homeserver never holds it open.
+the replay inserts nothing twice. Matrix calls (room state, history, joins) happen outside
+the transaction so a slow homeserver never holds it open.
+
+A joined room whose timeline arrives `limited` in an incremental sync (more events than the
+filter's limit since the last sync, for example after downtime) is backfilled: its history
+is paged backwards from `prev_batch` until an event already in `inbound`, the bot's own
+join, or `MATRIX_BACKFILL_MAX_EVENTS` events, and the recovered messages go through intake
+oldest first, ahead of the timeline, in that sync's transaction.
 """
 
 from __future__ import annotations
@@ -59,6 +65,9 @@ UNSUPPORTED_CONTENT = "unsupported_content"
 NOT_MENTIONED = "not_mentioned"
 QUEUE_FULL = "queue_full"
 _BODYLESS = frozenset({policy.ROOM_ENCRYPTED, policy.ROOM_INFRASTRUCTURE, UNSUPPORTED_CONTENT})
+
+BACKFILL_PAGE = 100
+BACKFILL_FILTER = {"types": ["m.room.message", "m.room.member"]}
 
 BACKOFF_INITIAL_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 60.0
@@ -119,6 +128,15 @@ def _is_join_of(event: Mapping, user_id: str) -> bool:
     )
 
 
+def _is_own_join(event: Mapping, user_id: str) -> bool:
+    """`user_id` joining the room, as opposed to changing its profile while joined."""
+    if not _is_join_of(event, user_id):
+        return False
+    unsigned = event.get("unsigned")
+    previous = unsigned.get("prev_content") if isinstance(unsigned, dict) else None
+    return not isinstance(previous, dict) or previous.get("membership") != "join"
+
+
 def _after_join(room: Mapping, timeline: list[dict], user_id: str) -> list[dict]:
     """The timeline events after `user_id`'s join: by timeline order when the join is in the
     timeline, else by origin_server_ts against the join in the state block (design D5, no
@@ -138,6 +156,10 @@ def _timestamp(event: Mapping) -> datetime | None:
     if isinstance(ms, int) and not isinstance(ms, bool) and ms > 0:
         return datetime.fromtimestamp(ms / 1000, UTC)
     return None
+
+
+def _messages_oldest_first(newest_first: list[dict]) -> list[dict]:
+    return [e for e in reversed(newest_first) if e.get("type") == "m.room.message"]
 
 
 @dataclass(frozen=True)
@@ -200,6 +222,7 @@ class SyncLoop:
         rooms = response.get("rooms") or {}
         joined: dict[str, dict] = rooms.get("join") or {}
         fetched = await self._fetch_state(joined)
+        recovered = await self._backfill(joined) if since is not None else {}
         at = self._now()
         async with self._pool.connection() as conn, conn.transaction():
             rule_list = await rules.list_rules(conn)
@@ -213,7 +236,14 @@ class SyncLoop:
                 )
             for room_id, room in joined.items():
                 await self._apply_joined(
-                    conn, room_id, room, fetched.get(room_id), rule_list, since is not None, at
+                    conn,
+                    room_id,
+                    room,
+                    fetched.get(room_id),
+                    recovered.get(room_id, []),
+                    rule_list,
+                    since is not None,
+                    at,
                 )
             for room_id in rooms.get("leave") or {}:
                 await directory.set_membership(conn, room_id, "leave", at)
@@ -256,6 +286,69 @@ class SyncLoop:
                 log.warning("cannot read the state of room %s, not classified: %s", room_id, exc)
         return fetched
 
+    async def _backfill(self, joined: Mapping[str, dict]) -> dict[str, list[dict]]:
+        """The missed messages of each joined room whose timeline is limited, oldest first."""
+        recovered: dict[str, list[dict]] = {}
+        for room_id, room in joined.items():
+            block = room.get("timeline")
+            if not isinstance(block, dict) or block.get("limited") is not True:
+                continue
+            prev_batch = block.get("prev_batch")
+            if not isinstance(prev_batch, str):
+                log.warning(
+                    "limited timeline of room %s has no prev_batch, not backfilled", room_id
+                )
+                continue
+            if any(_is_own_join(e, self._settings.user_id) for e in _events(room, "timeline")):
+                continue
+            try:
+                recovered[room_id] = await self._backfill_room(room_id, prev_batch)
+            except (MatrixAuthError, MatrixUnavailable):
+                raise
+            except MatrixError as exc:
+                log.warning("cannot read the history of room %s, not backfilled: %s", room_id, exc)
+        return recovered
+
+    async def _backfill_room(self, room_id: str, token: str) -> list[dict]:
+        cap = self._settings.backfill_max_events
+        read: list[dict] = []
+        count = 0
+        while count < cap:
+            page = await self._matrix.room_messages(
+                room_id,
+                token,
+                direction="b",
+                limit=min(BACKFILL_PAGE, cap - count),
+                filter=BACKFILL_FILTER,
+            )
+            chunk = page.get("chunk")
+            events = [e for e in chunk if isinstance(e, dict)] if isinstance(chunk, list) else []
+            count += len(events)
+            recorded = await self._recorded([e.get("event_id") for e in events])
+            for event in events:
+                if event.get("event_id") in recorded or _is_own_join(event, self._settings.user_id):
+                    return _messages_oldest_first(read)
+                read.append(event)
+            end = page.get("end")
+            if not events or not isinstance(end, str):
+                return _messages_oldest_first(read)
+            token = end
+        log.warning(
+            "backfill of room %s stopped at MATRIX_BACKFILL_MAX_EVENTS after %d events,"
+            " older messages are not processed",
+            room_id,
+            count,
+        )
+        return _messages_oldest_first(read)
+
+    async def _recorded(self, event_ids: list) -> set[str]:
+        ids = [event_id for event_id in event_ids if isinstance(event_id, str)]
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT event_id FROM inbound WHERE event_id = ANY(%s)", (ids,)
+            )
+            return {row[0] for row in await cur.fetchall()}
+
     async def _join_invites(self) -> None:
         """Join every pending invite; a failed join stays pending and is retried next sync."""
         async with self._pool.connection() as conn:
@@ -293,6 +386,7 @@ class SyncLoop:
         room_id: str,
         room: dict,
         state: list[dict] | None,
+        recovered: list[dict],
         rule_list: list[policy.Rule],
         process_messages: bool,
         at: datetime,
@@ -319,7 +413,7 @@ class SyncLoop:
         if newly_joined:
             timeline = _after_join(room, timeline, self._settings.user_id)
         context: _RoomContext | None = None
-        for event in timeline:
+        for event in recovered + timeline:
             parsed = discovery.parse_message(room_id, event, self._self_ids, self._bridge_bots)
             if isinstance(parsed, discovery.Skip):
                 continue
