@@ -77,7 +77,6 @@ def test_readme_lists_every_reason() -> None:
         sync.NOT_MENTIONED,
         sync.QUEUE_FULL,
         worker.NO_PRESET,
-        worker.SESSION_GONE,
         tracker.SESSION_GONE,
         tracker.TURN_FAILED,
         tracker.TIMEOUT,

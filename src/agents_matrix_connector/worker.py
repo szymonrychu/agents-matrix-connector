@@ -44,12 +44,12 @@ from agents_matrix_connector.db import directory, inbound, rules, runs
 from agents_matrix_connector.db.inbound import InboundRow
 from agents_matrix_connector.matrix import MatrixClient, MatrixError
 from agents_matrix_connector.settings import BotSettings
+from agents_matrix_connector.tracker import SESSION_GONE
 
 log = logging.getLogger(__name__)
 
 RUN_KIND = "matrix"
 NO_PRESET = "no_preset"
-SESSION_GONE = "session_gone"
 TYPING_TIMEOUT_MS = 30000
 UNAVAILABLE_LOG_INTERVAL = timedelta(minutes=1)
 
