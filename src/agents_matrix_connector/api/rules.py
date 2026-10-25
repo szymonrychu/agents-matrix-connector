@@ -5,6 +5,7 @@ Rule values are personal identifiers: they are never logged, only returned to th
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 from agents_common.orchestrator import NotFound, OrchestratorError, OrchestratorUnavailable
@@ -22,6 +23,8 @@ from agents_matrix_connector.api.schemas import (
     SettingsView,
 )
 from agents_matrix_connector.db import inbound, rules
+
+log = logging.getLogger(__name__)
 
 
 def _rule_view(row: rules.RuleRow) -> RuleView:
@@ -83,7 +86,8 @@ def build_rules_router(pool: AsyncConnectionPool, orchestrator) -> APIRouter:
             except OrchestratorUnavailable:
                 raise ApiError(503, "unavailable", "orchestrator unavailable") from None
             except OrchestratorError as exc:
-                raise ApiError(502, "orchestrator_error", str(exc)) from None
+                log.warning("orchestrator get_preset failed: %s", exc)
+                raise ApiError(502, "orchestrator_error", "orchestrator request failed") from None
         await rules.set_default_preset(pool, body.default_preset_id)
         return SettingsView(default_preset_id=body.default_preset_id)
 

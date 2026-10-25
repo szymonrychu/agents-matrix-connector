@@ -30,6 +30,7 @@ import psycopg
 from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector import discovery, policy
+from agents_matrix_connector.clock import utcnow
 from agents_matrix_connector.db import directory, inbound, rules
 from agents_matrix_connector.matrix import (
     MatrixAuthError,
@@ -77,10 +78,6 @@ BACKOFF_INITIAL_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 60.0
 
 Members = dict[str, tuple[str | None, str]]
-
-
-def utcnow() -> datetime:
-    return datetime.now(UTC)
 
 
 async def _pause(stop: asyncio.Event, seconds: float) -> None:

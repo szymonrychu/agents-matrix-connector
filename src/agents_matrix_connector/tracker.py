@@ -14,7 +14,7 @@ import logging
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 from agents_common.orchestrator import (
     NotFound,
@@ -25,6 +25,7 @@ from agents_common.orchestrator import (
 from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector.chunks import split
+from agents_matrix_connector.clock import utcnow
 from agents_matrix_connector.db import inbound, runs
 from agents_matrix_connector.matrix import (
     MatrixAuthError,
@@ -48,10 +49,6 @@ _MESSAGE_REASONS = {"failed": MESSAGE_FAILED, "cancelled": MESSAGE_CANCELLED}
 NOTICE = "Sorry, the agent could not answer that message."
 TYPING_TIMEOUT_MS = 30000
 PRUNE_INTERVAL = timedelta(days=1)
-
-
-def utcnow() -> datetime:
-    return datetime.now(UTC)
 
 
 @dataclass(frozen=True)

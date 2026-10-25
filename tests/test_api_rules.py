@@ -121,3 +121,14 @@ async def test_global_messages(api, conn):
     assert bad.status_code == 422 and bad.json()["error"]["code"] == "invalid_request"
     assert (await api.get("/messages", params={"limit": 0})).status_code == 422
     assert (await api.get("/messages", params={"status": "bogus"})).status_code == 422
+
+
+async def test_orchestrator_error_message_is_generic(api, fake):
+    preset = fake.add_preset("chat")
+    fake.fail_next("get_preset", 400)
+    res = await api.put("/settings", json={"default_preset_id": str(preset.id)})
+    assert res.status_code == 502
+    error = res.json()["error"]
+    assert error["code"] == "orchestrator_error"
+    assert error["message"] == "orchestrator request failed"
+    assert "injected" not in res.text

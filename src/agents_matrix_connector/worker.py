@@ -26,7 +26,7 @@ import re
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 import psycopg
 from agents_common import runs as agent_runs
@@ -40,6 +40,7 @@ from agents_common.orchestrator import (
 from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector import discovery, prompt
+from agents_matrix_connector.clock import utcnow
 from agents_matrix_connector.db import directory, inbound, rules, runs
 from agents_matrix_connector.db.inbound import InboundRow
 from agents_matrix_connector.matrix import MatrixClient, MatrixError
@@ -52,10 +53,6 @@ RUN_KIND = "matrix"
 NO_PRESET = "no_preset"
 TYPING_TIMEOUT_MS = 30000
 UNAVAILABLE_LOG_INTERVAL = timedelta(minutes=1)
-
-
-def utcnow() -> datetime:
-    return datetime.now(UTC)
 
 
 class _RoomRunStore:

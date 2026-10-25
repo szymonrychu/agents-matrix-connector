@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -26,6 +27,8 @@ from agents_matrix_connector.api.schemas import (
 )
 from agents_matrix_connector.db import directory, inbound, rules, runs
 from agents_matrix_connector.settings import ApiSettings
+
+log = logging.getLogger(__name__)
 
 RoomKind = Literal["dm", "group", "matrix", "infrastructure"]
 AccessState = Literal["allowed", "denied", "default"]
@@ -181,7 +184,8 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
             except OrchestratorUnavailable:
                 raise ApiError(503, "unavailable", "orchestrator unavailable") from None
             except OrchestratorError as exc:
-                raise ApiError(502, "orchestrator_error", str(exc)) from None
+                log.warning("orchestrator get_preset failed: %s", exc)
+                raise ApiError(502, "orchestrator_error", "orchestrator request failed") from None
         await rules.set_room_settings(pool, room_id, preset_id=body.preset_id, trigger=body.trigger)
         return await detail(await require_room(room_id), await rules.list_rules(pool))
 

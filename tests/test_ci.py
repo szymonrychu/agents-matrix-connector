@@ -69,3 +69,20 @@ def test_dockerfile_user_and_entrypoint():
     assert "USER 1000" in lines
     assert 'ENTRYPOINT ["agents-matrix-connector"]' in lines
     assert not any(line.startswith("CMD") for line in lines)
+
+
+def test_images_pinned():
+    lines = (ROOT / "Dockerfile").read_text().splitlines()
+    froms = [line for line in lines if line.startswith("FROM ")]
+    copies = [line for line in lines if line.startswith("COPY --from=")]
+    refs = [line.split()[1] for line in froms] + [
+        line.split()[1].removeprefix("--from=") for line in copies
+    ]
+    assert len(refs) == 2
+    for ref in refs:
+        tag = ref.split(":", 1)[1]
+        assert tag != "latest" and "latest" not in tag, ref
+    assert re.fullmatch(r"python:\d+\.\d+\.\d+-slim-bookworm", froms[0].split()[1])
+    assert re.fullmatch(
+        r"ghcr\.io/astral-sh/uv:\d+\.\d+\.\d+", copies[0].split()[1].removeprefix("--from=")
+    )
