@@ -1,141 +1,24 @@
 import uuid
 from datetime import UTC, datetime, timedelta
-from urllib.parse import quote
 
 import httpx
-import psycopg
-import pytest
-from agents_common.db.pool import open_pool
-from agents_common.fake_orchestrator import FakeOrchestrator
-from agents_common.orchestrator import OrchestratorClient
+from api_helpers import (
+    ALICE,
+    BOB,
+    BOT,
+    DM,
+    ENC,
+    GRP,
+    INFRA,
+    PREFIX,
+    add_inbound,
+    add_outbound,
+    make_settings,
+    room_path,
+    seed,
+)
 
 from agents_matrix_connector.api.app import create_api_app
-from agents_matrix_connector.settings import ConnectorSettings
-
-PACKAGE = "agents_matrix_connector"
-PREFIX = "/matrix/api/v1"
-T0 = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
-
-DM = "!dm:x"
-GRP = "!grp:x"
-ENC = "!enc:x"
-INFRA = "!infra:x"
-ALICE = "@facebook_111:x"
-BOB = "@facebook_222:x"
-BOT = "@agents:x"
-
-
-def make_settings(**extra) -> ConnectorSettings:
-    return ConnectorSettings(
-        database_url="postgresql://u:p@db/x",
-        orchestrator_url="http://orch",
-        orchestrator_token="tok",
-        homeserver_url="http://hs:8008",
-        user_id=BOT,
-        sync_timeout_seconds=30,
-        **extra,
-    )
-
-
-@pytest.fixture
-def url(migrated_db):
-    return migrated_db(PACKAGE)
-
-
-@pytest.fixture
-async def conn(url):
-    async with await psycopg.AsyncConnection.connect(url, autocommit=True) as c:
-        yield c
-
-
-@pytest.fixture
-async def pool(url):
-    p = await open_pool(url)
-    yield p
-    await p.close()
-
-
-@pytest.fixture
-def fake():
-    return FakeOrchestrator()
-
-
-@pytest.fixture
-async def orchestrator(fake):
-    transport = httpx.ASGITransport(app=fake.app)
-    async with OrchestratorClient("http://orch", fake.token, transport=transport) as c:
-        yield c
-
-
-@pytest.fixture
-async def api(pool, orchestrator):
-    app = create_api_app(pool, orchestrator, make_settings())
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://api" + PREFIX
-    ) as c:
-        yield c
-
-
-async def seed(conn):
-    for room_id, kind, name, alias, encrypted, members, last in [
-        (DM, "dm", "Alice", None, False, 2, T0 + timedelta(minutes=3)),
-        (GRP, "group", "Team", "#team:x", False, 3, T0 + timedelta(minutes=2)),
-        (ENC, "group", "Secret", None, True, 3, T0 + timedelta(minutes=1)),
-        (INFRA, "infrastructure", "Space", None, False, 1, None),
-    ]:
-        await conn.execute(
-            "INSERT INTO rooms (room_id, kind, name, alias, encrypted, membership, member_count,"
-            " last_event_at) VALUES (%s, %s, %s, %s, %s, 'join', %s, %s)",
-            (room_id, kind, name, alias, encrypted, members, last),
-        )
-    for user_id, name, fb in [
-        (ALICE, "Alice A", "111"),
-        (BOB, "Bob B", "222"),
-        (BOT, "Agents", None),
-    ]:
-        await conn.execute(
-            "INSERT INTO users (user_id, display_name, facebook_id) VALUES (%s, %s, %s)",
-            (user_id, name, fb),
-        )
-    for room_id, user_id in [(DM, ALICE), (DM, BOB), (GRP, ALICE), (GRP, BOT)]:
-        await conn.execute(
-            "INSERT INTO room_members (room_id, user_id, membership) VALUES (%s, %s, 'join')",
-            (room_id, user_id),
-        )
-    await conn.execute(
-        "INSERT INTO access_rules (list, kind, value) VALUES ('deny', 'user', %s)", (BOB,)
-    )
-    await conn.execute(
-        "INSERT INTO access_rules (list, kind, value) VALUES ('allow', 'room', %s)", (DM,)
-    )
-
-
-async def add_inbound(conn, n, room=DM, status="handled", run_id=None, at=None):
-    await conn.execute(
-        "INSERT INTO inbound (event_id, room_id, sender, sender_name, body, status, run_id,"
-        " received_at) VALUES (%s, %s, %s, 'Alice A', %s, %s, %s, %s)",
-        (
-            f"$e{n}{room}",
-            room,
-            ALICE,
-            f"hello {n}",
-            status,
-            run_id,
-            at or T0 + timedelta(seconds=n),
-        ),
-    )
-
-
-async def add_outbound(conn, n, room=DM, run_id=None, at=None):
-    await conn.execute(
-        "INSERT INTO outbound (room_id, run_id, kind, body, txn_id, status, created_at)"
-        " VALUES (%s, %s, 'reply', %s, %s, 'sent', %s)",
-        (room, run_id, f"answer {n}", f"txn-{n}", at or T0 + timedelta(seconds=n)),
-    )
-
-
-def room_path(room_id: str, suffix: str = "") -> str:
-    return f"/rooms/{quote(room_id, safe='')}{suffix}"
 
 
 async def test_meta(api, conn):
