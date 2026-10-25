@@ -80,6 +80,20 @@ components:
       requests: {cpu: 50m, memory: 128Mi}
       limits: {memory: 384Mi}
 
+# The api Service (ClusterIP). The bot has no Service.
+service:
+  port: 8000
+
+# One Ingress routing only /matrix/api (Prefix) to the api Service. No cert-manager annotation
+# is added; put one in annotations if wanted.
+ingress:
+  enabled: false
+  className: nginx
+  host: ""
+  annotations: {}
+  tls:
+    secretName: ""
+
 podLabels: {}
 terminationGracePeriodSeconds: 30
 
