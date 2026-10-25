@@ -6,12 +6,12 @@ import inspect
 import re
 from pathlib import Path
 
+from api_helpers import make_settings
 from fastapi.routing import APIRoute
 
 from agents_matrix_connector import policy, sync, tracker, worker
 from agents_matrix_connector.api import openapi
 from agents_matrix_connector.api.app import PREFIX, create_api_app
-from api_helpers import make_settings
 
 ROOT = Path(__file__).resolve().parent.parent
 README = (ROOT / "README.md").read_text(encoding="utf-8")
