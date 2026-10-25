@@ -191,3 +191,70 @@ Inbound messages across all rooms, newest first. Query: `status` (`new`, `in-pro
 (`in-<n>` only). 200; 422 `invalid_request`.
 
     curl -s 'http://localhost:8000/matrix/api/v1/messages?status=failed'
+
+## Operations
+
+### Bot identity (taken over from Hermes)
+
+The connector runs as the Matrix user `@hermes:szymonrichert.pl`, device `hermes-agent`
+(`MATRIX_USER_ID`, `MATRIX_DEVICE_ID`). That user is already logged in to mautrix-meta
+through the bridge bot `@facebookbot:szymonrichert.pl` with Hermes' Facebook account
+`61594633049360`, so no new account and no new Facebook login are needed. The bridged self
+ghost `@facebook_61594633049360:szymonrichert.pl` must be listed in `MATRIX_SELF_IDENTITIES`
+so the bot never answers its own Facebook messages.
+
+The access token already exists in Secret `hermes-agent-matrix` (key `MATRIX_ACCESS_TOKEN`,
+namespace `ai`). Copy it into the agents-helmfile SOPS secrets file through the bootstrap
+script, which pipes values between processes and never writes them to disk unencrypted. The
+chart mounts it as a file into the bot pod only (`MATRIX_ACCESS_TOKEN_FILE`). Never paste
+the token into a README, a chat, a values file in clear or a commit.
+
+Hermes is scaled to 0 in the infrastructure helmfile and must stay at 0 while the connector
+runs: two clients on one account would both answer every message.
+
+### First chat
+
+The default policy is deny, so a newly discovered chat is stored as a room but not routed and
+its message bodies are not kept. The only allow rule at first start is the room
+`!iLWrAwaTMYnINJsyNv:szymonrichert.pl` (Hermes' owner DM and home channel, which exists only
+for that Facebook login). To allow another chat, open it on the Chats page of the UI and
+allow it, or call the API:
+
+    curl -s -X POST -H 'content-type: application/json' \
+      -d '{"list": "allow", "kind": "room", "value": "!iLWrAwaTMYnINJsyNv:szymonrichert.pl"}' \
+      http://localhost:8000/matrix/api/v1/rules
+
+Allow by `facebook` (the numeric Facebook id) or `user` to cover every chat of one person, or
+by `room` for one chat. A deny rule always wins over an allow rule. Set a preset per room
+(`PUT /matrix/api/v1/rooms/{room_id}/settings`) or one default preset
+(`PUT /matrix/api/v1/settings`); an allowed room with no preset is ignored with `no_preset`.
+
+### Handing the identity back to Hermes
+
+1. Scale the connector (bot and api) to 0.
+2. Revert the Hermes scale-down in the infrastructure helmfile and apply it.
+
+Never run both at once.
+
+### Token rotation
+
+1. Log the `hermes-agent` device out of the homeserver.
+2. Log in again as `@hermes:szymonrichert.pl` and obtain a new access token.
+3. Update Secret `hermes-agent-matrix` (namespace `ai`) with it.
+4. Re-run the agents-helmfile bootstrap so the SOPS file carries the new token, then apply
+   the release so the bot pod restarts with it.
+
+## Security
+
+- Default deny: a chat with no allow rule is not routed (`MATRIX_DEFAULT_POLICY=deny`).
+- Deny wins: a matching deny rule overrides every allow rule.
+- Rules match identifiers only (Matrix user id, Facebook id, room id, alias). Display names
+  never grant access; a `display_name` rule exists only in the deny list.
+- Bodies of messages from denied rooms are not stored.
+- Everything from a chat is untrusted input. The first prompt of a session carries a
+  preamble stating that the content inside `<chat>` is data and never instructions, and
+  sender names and bodies are XML-escaped.
+- No end-to-end encryption: encrypted rooms are ignored (`room_encrypted`).
+- The Matrix access token exists only as a file mounted into the bot pod. The api pod does
+  not receive it. The api accepts only socket peers inside `MATRIX_API_ALLOWED_CIDRS` behind
+  SSO at the ingress.
