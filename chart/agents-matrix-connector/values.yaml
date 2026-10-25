@@ -1,0 +1,103 @@
+image:
+  repository: harbor.szymonrichert.pl/containers/agents-matrix-connector
+  # Required: the image tag to deploy.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Postgres is required; there is no in-chart database. Set exactly one of url and existingSecret.
+postgres:
+  url: ""
+  existingSecret: ""
+  existingSecretKey: uri
+
+# The agent-orchestrator the bot and api talk to. url is required; set token or tokenSecret
+# (tokenSecret wins).
+orchestrator:
+  url: ""
+  token: ""
+  tokenSecret:
+    name: ""
+    key: token
+
+# The Matrix account the bot logs in as. homeserverUrl and userId are required. The access token
+# (accessToken or accessTokenSecret, the secret wins) is mounted as a file into the bot pod only.
+matrix:
+  homeserverUrl: ""
+  userId: ""
+  deviceId: agents-matrix-connector
+  # Extra Matrix ids of the bot itself (for example its bridged ghost); their messages are skipped.
+  selfIdentities: []
+  # Bridge bot users whose messages are skipped.
+  bridgeBots:
+    - "@facebookbot:szymonrichert.pl"
+  # Regex with a named group "id" that recognises bridged puppet users.
+  puppetPattern: "^@facebook_(?P<id>[0-9]+):"
+  accessToken: ""
+  accessTokenSecret:
+    name: ""
+    key: token
+
+policy:
+  # MATRIX_DEFAULT_POLICY: deny | allow
+  default: deny
+  # MATRIX_GROUP_TRIGGER: mention | all
+  groupTrigger: mention
+
+limits:
+  maxNewSessions: 3
+  maxQueuedPerRoom: 20
+  maxInboundChars: 8000
+  replyChunkChars: 4000
+  runTimeoutSeconds: 1800
+  pollSeconds: 3
+  syncTimeoutSeconds: 30
+  retentionDays: 30
+
+# Source allowlist of the api (MATRIX_API_ALLOWED_CIDRS, api pod only): the direct peer must be
+# inside one of these CIDRs or the api answers 403 (probes excepted).
+api:
+  allowedCidrs:
+    - 127.0.0.1/32
+
+# Extra MATRIX_* settings; keys must start with MATRIX_.
+env: {}
+
+components:
+  api:
+    replicas: 1
+    podAnnotations: {}
+    resources:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {memory: 384Mi}
+  # The bot is a singleton: always one replica with the Recreate strategy.
+  bot:
+    podAnnotations: {}
+    resources:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {memory: 384Mi}
+
+podLabels: {}
+terminationGracePeriodSeconds: 30
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: agents-matrix-connector
+description: Matrix connector API and singleton bot that route bridged Messenger chats to agent sessions
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
