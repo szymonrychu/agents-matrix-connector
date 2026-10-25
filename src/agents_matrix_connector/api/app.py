@@ -17,6 +17,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from agents_matrix_connector.api.rooms import build_rooms_router
+from agents_matrix_connector.api.rules import build_rules_router
 from agents_matrix_connector.api.schemas import ApiError
 from agents_matrix_connector.settings import ApiSettings
 
@@ -70,6 +71,7 @@ def create_api_app(
         redoc_url=None,
     )
     app.include_router(build_rooms_router(pool, orchestrator, settings), prefix=PREFIX)
+    app.include_router(build_rules_router(pool, orchestrator), prefix=PREFIX)
     app.add_middleware(SourceAllowlist, networks=settings.api_networks())
 
     @app.exception_handler(ApiError)

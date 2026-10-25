@@ -98,3 +98,32 @@ class MetaView(BaseModel):
     group_trigger: Literal["all", "mention"]
     rule_kinds: dict[str, list[str]]
     sync: SyncView
+
+
+class RuleIn(BaseModel):
+    list: str
+    kind: str
+    value: str
+    note: str | None = None
+
+
+class RuleView(BaseModel):
+    id: int
+    list: str
+    kind: str
+    value: str
+    note: str | None
+    created_at: datetime
+
+
+class RulesView(BaseModel):
+    allow: list[RuleView]
+    deny: list[RuleView]
+
+
+class SettingsIn(BaseModel):
+    default_preset_id: uuid.UUID | None
+
+
+class SettingsView(BaseModel):
+    default_preset_id: uuid.UUID | None
