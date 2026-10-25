@@ -37,7 +37,6 @@ from agents_common.orchestrator import (
     OrchestratorError,
     OrchestratorUnavailable,
 )
-from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector import discovery, prompt
@@ -51,11 +50,6 @@ log = logging.getLogger(__name__)
 RUN_KIND = "matrix"
 TYPING_TIMEOUT_MS = 30000
 UNAVAILABLE_LOG_INTERVAL = timedelta(minutes=1)
-
-_ROW_COLUMNS = (
-    "id, event_id, room_id, sender, sender_name, body, mentioned, origin_ts, received_at,"
-    " status, reason, run_id"
-)
 
 
 def utcnow() -> datetime:
@@ -197,13 +191,8 @@ class Worker:
 
     async def _resume(self, run: runs.RunRow) -> None:
         """Retry a run whose prompt is not posted yet, with its stored ids."""
-        async with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                f"SELECT {_ROW_COLUMNS} FROM inbound"
-                " WHERE run_id = %s AND status = 'in-progress' ORDER BY id",
-                (run.id,),
-            )
-            rows = [InboundRow(**row) for row in await cur.fetchall()]
+        async with self._pool.connection() as conn:
+            rows = await inbound.run_rows(conn, run.id)
         ref = agent_runs.RunRef(
             id=run.id,
             slug=run.slug or f"mx-{run.id}",

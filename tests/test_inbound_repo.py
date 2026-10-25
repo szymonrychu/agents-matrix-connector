@@ -98,6 +98,22 @@ async def test_claim_room(conn):
     assert await inbound.claim_room(conn, "!a:x", run) == []
 
 
+async def test_run_rows(conn):
+    await put(conn, "$1")
+    await put(conn, "$o", room="!o:x")
+    await put(conn, "$2")
+    run, other = await new_run(conn), await new_run(conn, "!o:x")
+    await inbound.claim_room(conn, "!a:x", run)
+    await inbound.claim_room(conn, "!o:x", other)
+    await put(conn, "$3")
+    rows = await inbound.run_rows(conn, run)
+    assert [r.event_id for r in rows] == ["$1", "$2"]
+    assert all(r.status == "in-progress" and r.run_id == run for r in rows)
+    assert rows[0].body == "body $1" and rows[0].origin_ts == T0
+    await inbound.finish_run_rows(conn, other, "handled")
+    assert await inbound.run_rows(conn, other) == []
+
+
 async def test_guarded_transitions(conn):
     await put(conn, "$1")
     await put(conn, "$2")

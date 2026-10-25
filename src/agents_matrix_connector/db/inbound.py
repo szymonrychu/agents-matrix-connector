@@ -103,6 +103,17 @@ async def claim_room(conn: psycopg.AsyncConnection, room_id: str, run_id: int) -
         return [InboundRow(**row) for row in await cur.fetchall()]
 
 
+async def run_rows(conn: psycopg.AsyncConnection, run_id: int) -> list[InboundRow]:
+    """The run's in-progress rows, oldest first."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            f"SELECT {_COLUMNS} FROM inbound"
+            " WHERE run_id = %s AND status = 'in-progress' ORDER BY id",
+            (run_id,),
+        )
+        return [InboundRow(**row) for row in await cur.fetchall()]
+
+
 async def finish_run_rows(
     conn: psycopg.AsyncConnection, run_id: int, status: str, reason: str | None = None
 ) -> int:
