@@ -133,7 +133,8 @@ async def test_list_rooms_counts_and_session(conn, pool):
     await directory.touch_room(conn, "!new:x", T0 + timedelta(1))
     for i, status in enumerate(["new", "new", "handled"]):
         await conn.execute(
-            "INSERT INTO inbound (event_id, room_id, sender, status) VALUES (%s, '!new:x', '@s:x', %s)",
+            "INSERT INTO inbound (event_id, room_id, sender, status)"
+            " VALUES (%s, '!new:x', '@s:x', %s)",
             (f"$e{i}", status),
         )
     s1, s2 = uuid.uuid4(), uuid.uuid4()
