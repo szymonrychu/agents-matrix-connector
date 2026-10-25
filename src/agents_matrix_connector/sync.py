@@ -25,6 +25,7 @@ from agents_matrix_connector.matrix import (
     MatrixAuthError,
     MatrixClient,
     MatrixError,
+    MatrixNotFound,
     MatrixUnavailable,
 )
 from agents_matrix_connector.settings import BotSettings
@@ -108,6 +109,30 @@ def _memberships(events: list[dict]) -> Members:
     return members
 
 
+def _is_join_of(event: Mapping, user_id: str) -> bool:
+    content = event.get("content")
+    return (
+        event.get("type") == "m.room.member"
+        and event.get("state_key") == user_id
+        and isinstance(content, dict)
+        and content.get("membership") == "join"
+    )
+
+
+def _after_join(room: Mapping, timeline: list[dict], user_id: str) -> list[dict]:
+    """The timeline events after `user_id`'s join: by timeline order when the join is in the
+    timeline, else by origin_server_ts against the join in the state block (design D5, no
+    replay of pre-join history)."""
+    for index in range(len(timeline) - 1, -1, -1):
+        if _is_join_of(timeline[index], user_id):
+            return timeline[index + 1 :]
+    joins = [_timestamp(e) for e in _events(room, "state") if _is_join_of(e, user_id)]
+    joined_at = max((ts for ts in joins if ts is not None), default=None)
+    if joined_at is None:
+        return timeline
+    return [e for e in timeline if (ts := _timestamp(e)) is None or ts >= joined_at]
+
+
 def _timestamp(event: Mapping) -> datetime | None:
     ms = event.get("origin_server_ts")
     if isinstance(ms, int) and not isinstance(ms, bool) and ms > 0:
@@ -163,14 +188,15 @@ class SyncLoop:
     async def run_once(self) -> None:
         async with self._pool.connection() as conn:
             since, stored_filter = await directory.get_sync_state(conn)
-        self._filter_id = stored_filter or self._filter_id
+        self._filter_id = self._filter_id or stored_filter
         if self._filter_id is None:
-            self._filter_id = await self._matrix.create_filter(self._settings.user_id, SYNC_FILTER)
-        response = await self._matrix.sync(
-            since=since,
-            timeout_ms=self._settings.sync_timeout_seconds * 1000,
-            filter_id=self._filter_id,
-        )
+            self._filter_id = await self._create_filter()
+        try:
+            response = await self._sync(since)
+        except MatrixNotFound as exc:
+            log.warning("sync filter %s is gone (%s), creating a new one", self._filter_id, exc)
+            self._filter_id = await self._create_filter()
+            response = await self._sync(since)
         rooms = response.get("rooms") or {}
         joined: dict[str, dict] = rooms.get("join") or {}
         fetched = await self._fetch_state(joined)
@@ -198,6 +224,16 @@ class SyncLoop:
         await self._join_invites()
 
     # Matrix calls outside the transaction.
+
+    async def _create_filter(self) -> str:
+        return await self._matrix.create_filter(self._settings.user_id, SYNC_FILTER)
+
+    async def _sync(self, since: str | None) -> dict:
+        return await self._matrix.sync(
+            since=since,
+            timeout_ms=self._settings.sync_timeout_seconds * 1000,
+            filter_id=self._filter_id,
+        )
 
     async def _fetch_state(self, joined: Mapping[str, dict]) -> dict[str, list[dict]]:
         """Full state of each joined room not yet classified or whose room info changed."""
@@ -261,6 +297,9 @@ class SyncLoop:
         process_messages: bool,
         at: datetime,
     ) -> None:
+        cur = await conn.execute("SELECT membership FROM rooms WHERE room_id = %s", (room_id,))
+        before = await cur.fetchone()
+        newly_joined = before is None or before[0] != "join"
         if state is not None:
             info = discovery.classify(state, self._self_ids, self._bridge_bots)
             await directory.upsert_room(conn, room_id, membership="join", info=info, at=at)
@@ -277,6 +316,8 @@ class SyncLoop:
         await directory.touch_room(conn, room_id, max(stamps, default=at))
         if not process_messages:
             return
+        if newly_joined:
+            timeline = _after_join(room, timeline, self._settings.user_id)
         context: _RoomContext | None = None
         for event in timeline:
             parsed = discovery.parse_message(room_id, event, self._self_ids, self._bridge_bots)

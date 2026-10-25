@@ -415,3 +415,104 @@ async def test_backoff_and_auth_error(fake, client, pool, monkeypatch):
         monkeypatch.setattr(other, "sync", stopping)
         await asyncio.wait_for(make_loop(other, pool).run(stop), 30)
     assert calls["n"] == 1
+
+
+async def test_pre_join_history_skipped(fake, client, pool):
+    loop = make_loop(client, pool)
+    await loop.run_once()
+    add_dm(fake, joined=False)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    fake.post(DM, ALICE, text("before invite"))
+    fake.invite(DM, BRIDGE)
+    fake.post(DM, ALICE, text("while invited"))
+    await client.join(DM)
+    fake.post(DM, ALICE, text("after join"))
+
+    await loop.run_once()
+    assert await inbound_rows(pool) == [(ALICE, "new", None, "after join", False)]
+
+    # Once joined, a later profile change of the bot does not hide messages before it.
+    fake.post(DM, ALICE, text("before rename"))
+    fake.set_member(DM, BOT, "join", "hermes renamed")
+    await loop.run_once()
+    assert [r[3] for r in await inbound_rows(pool)] == ["after join", "before rename"]
+
+
+async def test_pre_join_history_by_timestamp(fake, client, pool, monkeypatch):
+    add_dm(fake)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE sync_state SET next_batch = 's0'")
+    join_ts = 1_800_000_000_000
+
+    def message(event_id: str, ts: int, body: str) -> dict:
+        return {
+            "event_id": event_id,
+            "type": "m.room.message",
+            "sender": ALICE,
+            "origin_server_ts": ts,
+            "content": text(body),
+        }
+
+    response = {
+        "next_batch": "s100",
+        "rooms": {
+            "join": {
+                DM: {
+                    "state": {
+                        "events": [
+                            {
+                                "event_id": "$join",
+                                "type": "m.room.member",
+                                "state_key": BOT,
+                                "sender": BOT,
+                                "origin_server_ts": join_ts,
+                                "content": {"membership": "join"},
+                            }
+                        ]
+                    },
+                    "timeline": {
+                        "events": [
+                            message("$old", join_ts - 1, "history"),
+                            message("$new", join_ts + 1, "fresh"),
+                        ],
+                        "limited": True,
+                    },
+                }
+            }
+        },
+    }
+
+    async def handcrafted(*args, **kwargs):
+        return response
+
+    monkeypatch.setattr(client, "sync", handcrafted)
+    await make_loop(client, pool).run_once()
+    assert await inbound_rows(pool) == [(ALICE, "new", None, "fresh", False)]
+
+
+async def test_lost_filter_recreated(fake, client, pool, monkeypatch):
+    await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE sync_state SET filter_id = 'lost'")
+    created: list[str] = []
+    real_create = client.create_filter
+
+    async def spy_create(user_id, definition):
+        created.append(await real_create(user_id, definition))
+        return created[-1]
+
+    monkeypatch.setattr(client, "create_filter", spy_create)
+    fake.post(DM, ALICE, text("after the filter was lost"))
+
+    restarted = make_loop(client, pool)
+    await restarted.run_once()
+    assert created == ["1"]
+    assert (await sync_state(pool))[1] == "1"
+    assert await inbound_rows(pool) == [(ALICE, "new", None, "after the filter was lost", False)]
+
+    fake.post(DM, ALICE, text("next"))
+    await restarted.run_once()
+    assert created == ["1"]
+    assert len(await inbound_rows(pool)) == 2
