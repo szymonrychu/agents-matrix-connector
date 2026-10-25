@@ -16,7 +16,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from agents_common.orchestrator import NotFound, OrchestratorClient, OrchestratorUnavailable
+from agents_common.orchestrator import (
+    NotFound,
+    OrchestratorClient,
+    OrchestratorError,
+    OrchestratorUnavailable,
+)
 from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector.chunks import split
@@ -104,6 +109,10 @@ class Tracker:
         except OrchestratorUnavailable as exc:
             log.warning("orchestrator unavailable polling run %s: %s", run.id, exc)
             return self._timed_out(run)
+        except OrchestratorError as exc:
+            # Status and code only: the message text may echo request content.
+            log.warning("orchestrator error polling run %s: %s %s", run.id, exc.status, exc.code)
+            return self._timed_out(run)
         turn = message.turn
         if turn is not None and turn.status == "completed":
             chunks = split(turn.final_text or "", self._settings.reply_chunk_chars)
@@ -144,7 +153,9 @@ class Tracker:
 
     async def _send_pending(self) -> None:
         """Send pending rows oldest first; an unavailable homeserver stops the pass so later
-        chunks never overtake earlier ones. Typing ends once a run has no pending row left."""
+        chunks never overtake earlier ones, any other refusal fails that row (reason
+        `forbidden`, else the errcode) and a lost token propagates. Typing ends once a run
+        has no pending row left."""
         async with self._pool.connection() as conn:
             pending = await runs.pending(conn)
         left = Counter(row.run_id for row in pending)
@@ -158,14 +169,22 @@ class Tracker:
                 return
             except MatrixForbidden as exc:
                 log.warning("matrix refused %s in %s: %s", row.txn_id, row.room_id, exc)
-                async with self._pool.connection() as conn:
-                    await runs.mark_failed(conn, row.id, "forbidden")
+                await self._mark_failed(row.id, "forbidden")
+            except MatrixAuthError:
+                raise
+            except MatrixError as exc:
+                log.warning("matrix rejected %s in %s: %s", row.txn_id, row.room_id, exc)
+                await self._mark_failed(row.id, exc.errcode or "send_failed")
             else:
                 async with self._pool.connection() as conn:
                     await runs.mark_sent(conn, row.id, event_id)
             left[row.run_id] -= 1
             if row.run_id is not None and left[row.run_id] == 0:
                 await self._typing(row.room_id, False)
+
+    async def _mark_failed(self, outbound_id: int, reason: str) -> None:
+        async with self._pool.connection() as conn:
+            await runs.mark_failed(conn, outbound_id, reason)
 
     async def _typing(self, room_id: str, typing: bool) -> None:
         """Typing is cosmetic: a failure is logged, except a lost token, which is fatal."""

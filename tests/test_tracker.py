@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -10,7 +11,7 @@ from agents_common.orchestrator import OrchestratorClient
 from agents_matrix_connector.chunks import split
 from agents_matrix_connector.db import inbound, runs
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
-from agents_matrix_connector.matrix import MatrixClient
+from agents_matrix_connector.matrix import MatrixAuthError, MatrixClient
 from agents_matrix_connector.settings import BotSettings
 from agents_matrix_connector.tracker import NOTICE, Tracker
 
@@ -363,6 +364,60 @@ async def test_send_errors(tracker, pool, orch, orch_client, hs):
     assert hs.typing_state("!b:hs") is False
     await tracker.tick()
     assert bodies(hs, "!b:hs") == []
+
+
+async def test_orchestrator_error_isolated_to_its_run(
+    tracker, pool, orch, orch_client, hs, clock, caplog
+):
+    poisoned, _, _ = await seed(pool, orch, orch_client)
+    healthy, healthy_message, _ = await seed(pool, orch, orch_client, room="!b:hs")
+    orch.complete_turn(healthy_message, "Hello")
+    orch.fail_next("get_message", 422)
+    caplog.set_level(logging.WARNING, logger="agents_matrix_connector.tracker")
+    await tracker.tick()
+    assert await run_state(pool, poisoned) == ("in-progress", None)
+    assert await run_state(pool, healthy) == ("handled", None)
+    assert bodies(hs, "!b:hs") == ["Hello"]
+    assert f"run {poisoned}" in caplog.text and "422" in caplog.text
+    assert "injected" not in caplog.text and orch.token not in caplog.text
+
+    orch.fail_next("get_message", 401)
+    clock.at = T0 + timedelta(seconds=601)
+    await tracker.tick()
+    assert await run_state(pool, poisoned) == ("failed", "timeout")
+    assert bodies(hs) == [NOTICE]
+
+
+async def test_send_error_fails_row_and_continues(tracker, pool, orch, orch_client, hs):
+    too_large, too_large_message, _ = await seed(pool, orch, orch_client)
+    gone_room, gone_message, _ = await seed(pool, orch, orch_client, room="!b:hs")
+    fine, fine_message, _ = await seed(pool, orch, orch_client, room="!c:hs")
+    await tracker.tick()
+    for message_id in (too_large_message, gone_message, fine_message):
+        orch.complete_turn(message_id, "Hello")
+    hs.fail_next("send_text", 400, "M_TOO_LARGE")
+    hs.fail_next("send_text", 404)
+    await tracker.tick()
+    assert await outbound_rows(pool) == [
+        ("reply", "Hello", f"mxc-{too_large}-1", "failed", "M_TOO_LARGE", False)
+    ]
+    assert await outbound_rows(pool, "!b:hs") == [
+        ("reply", "Hello", f"mxc-{gone_room}-1", "failed", "M_NOT_FOUND", False)
+    ]
+    assert await outbound_rows(pool, "!c:hs") == [
+        ("reply", "Hello", f"mxc-{fine}-1", "sent", None, True)
+    ]
+    assert bodies(hs) == [] and bodies(hs, "!c:hs") == ["Hello"]
+    assert not any(hs.typing_state(room) for room in (ROOM, "!b:hs", "!c:hs"))
+
+    revoked, revoked_message, _ = await seed(pool, orch, orch_client, room="!d:hs")
+    orch.complete_turn(revoked_message, "Hello")
+    hs.fail_next("send_text", 401)
+    with pytest.raises(MatrixAuthError):
+        await tracker.tick()
+    assert await outbound_rows(pool, "!d:hs") == [
+        ("reply", "Hello", f"mxc-{revoked}-1", "pending", None, False)
+    ]
 
 
 async def test_typing_refreshed(tracker, pool, orch, orch_client, hs, matrix):
