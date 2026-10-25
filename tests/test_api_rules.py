@@ -1,3 +1,4 @@
+# ruff: noqa: F811
 import uuid
 
 from test_api_rooms import (
