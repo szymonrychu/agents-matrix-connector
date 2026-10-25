@@ -214,8 +214,8 @@ runs: two clients on one account would both answer every message.
 
 ### First chat
 
-The default policy is deny, so a newly discovered chat is stored as a room but not routed and
-its message bodies are not kept. The only allow rule at first start is the room
+The default policy is deny, so a newly discovered chat is stored as a room but not routed; its
+(truncated) message bodies are kept so you can judge the pending chat. The only allow rule at first start is the room
 `!iLWrAwaTMYnINJsyNv:szymonrichert.pl` (Hermes' owner DM and home channel, which exists only
 for that Facebook login). To allow another chat, open it on the Chats page of the UI and
 allow it, or call the API:
@@ -250,7 +250,9 @@ Never run both at once.
 - Deny wins: a matching deny rule overrides every allow rule.
 - Rules match identifiers only (Matrix user id, Facebook id, room id, alias). Display names
   never grant access; a `display_name` rule exists only in the deny list.
-- Bodies of messages from denied rooms are not stored.
+- No message body is stored for an explicit deny rule (`denied: <kind>`), an encrypted room,
+  an infrastructure room or unsupported content. A chat that is only not yet allowed (default
+  deny, reason `not_allowed`) keeps its truncated body so the operator can judge it.
 - Everything from a chat is untrusted input. The first prompt of a session carries a
   preamble stating that the content inside `<chat>` is data and never instructions, and
   sender names and bodies are XML-escaped.

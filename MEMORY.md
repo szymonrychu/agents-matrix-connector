@@ -4,9 +4,10 @@ Lessons that outlive a session. Newest first.
 
 ## 2026-10-25 decisions
 
-- Bot user with an access token, not an appservice: an appservice needs homeserver
-  registration (a registration file and a restart of Synapse) and the bridged chats are
-  already visible to an ordinary user that is joined to them. A bot user needs only a token.
+- Bot user with an access token, not an appservice: an appservice needs a registration
+  file in Synapse's app_service_config_files plus a Synapse restart in namespace messaging,
+  and an appservice user would still have to be logged in to mautrix-meta to get Facebook
+  portals, so it buys nothing. A bot user needs only a token.
 - Reuse Hermes' Matrix user `@hermes:szymonrichert.pl` and its Facebook account with Hermes
   scaled to 0 (user decision 2026-10-25). The one allowed chat is Hermes' owner DM and home
   channel `!iLWrAwaTMYnINJsyNv:szymonrichert.pl`, which exists only for that Facebook login,
