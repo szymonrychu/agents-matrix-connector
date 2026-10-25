@@ -1,0 +1,12 @@
+{{- /* Validates Secret inputs even when no Deployment includes the env. */ -}}
+{{- $_ := include "agents-matrix-connector.databaseSecretName" . }}
+{{- $_ := include "agents-matrix-connector.tokenSecretName" . }}
+{{- $_ := include "agents-matrix-connector.matrixSecretName" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "agents-matrix-connector.fullname" . }}-settings
+  labels:
+    {{- include "agents-matrix-connector.labels" . | nindent 4 }}
+data:
+  {{- include "agents-matrix-connector.config" . | nindent 2 }}

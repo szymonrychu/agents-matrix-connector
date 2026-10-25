@@ -1,0 +1,11 @@
+image:
+  tag: "0.1.0"
+postgres:
+  url: postgresql://db:5432/matrix
+orchestrator:
+  url: http://agent-orchestrator.agents.svc
+  token: lint-token
+matrix:
+  homeserverUrl: http://synapse.messaging.svc:8008
+  userId: "@bot:example.test"
+  accessToken: lint-matrix-token

@@ -1,0 +1,48 @@
+[project]
+name = "agents-matrix-connector"
+version = "0.1.0"
+description = "Matrix connector service for the agents platform"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "agents-common @ git+https://github.com/szymonrychu/agents-common@v0.3.0",
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+]
+
+[project.scripts]
+agents-matrix-connector = "agents_matrix_connector.cli:main"
+
+[dependency-groups]
+dev = [
+    "agents-common[testing] @ git+https://github.com/szymonrychu/agents-common@v0.3.0",
+    "ruff",
+    "pytest",
+    "pytest-asyncio",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agents_matrix_connector"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+asyncio_mode = "auto"
+addopts = "-q -p no:agents_common"
+markers = [
+    "e2e: end to end against the real api and bot processes, Postgres and the fakes",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
