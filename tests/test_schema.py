@@ -35,7 +35,7 @@ def test_migration_idempotent(db):
     from agents_common.db.migrate import run_migrations
 
     with psycopg.connect(db) as conn:
-        assert TABLES <= _tables(conn)
+        assert _tables(conn) >= TABLES
         before = conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
     assert run_migrations(db, PACKAGE) == []
     with psycopg.connect(db) as conn:
@@ -63,9 +63,11 @@ def test_writer_comments(db):
 
 
 def _rejects(db, sql, params=()):
-    with psycopg.connect(db, autocommit=True) as conn:
-        with pytest.raises(psycopg.errors.CheckViolation):
-            conn.execute(sql, params)
+    with (
+        psycopg.connect(db, autocommit=True) as conn,
+        pytest.raises(psycopg.errors.CheckViolation),
+    ):
+        conn.execute(sql, params)
 
 
 def test_check_constraints(db):
