@@ -36,6 +36,9 @@ packages = ["src/agents_matrix_connector"]
 pythonpath = ["src", "tests"]
 asyncio_mode = "auto"
 addopts = "-q -p no:agents_common"
+markers = [
+    "e2e: end to end against the real api and bot processes, Postgres and the fakes",
+]
 
 [tool.ruff]
 line-length = 100
