@@ -454,6 +454,15 @@ async def test_handoff_sends_read_receipt(conn, hs, matrix, preset, make_worker)
     assert matrix.receipts == [(DM, newest), (DM, follow_newest)]
     assert matrix.typings == [(BOT, DM, True, 30000)] * 2
 
+    # Equal timestamps, and all-NULL timestamps: the greatest row id wins.
+    for ts in (T0 + timedelta(seconds=30), None):
+        runs_now = await room_runs(conn, DM)
+        await finish_handled(conn, runs_now[-1][0])
+        await queue_at(conn, DM, "x", ts)
+        last = await queue_at(conn, DM, "y", ts)
+        await worker.tick()
+        assert hs.receipts(DM)[-1] == last
+
 
 async def test_receipt_failure_does_not_fail_run(conn, hs, matrix, preset, make_worker, caplog):
     caplog.set_level(logging.WARNING, logger="agents_matrix_connector.worker")
