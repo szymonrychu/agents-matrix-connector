@@ -2,6 +2,13 @@
 
 Lessons that outlive a session. Newest first.
 
+## 2026-10-26 decisions
+
+- Read receipts (user decision 2026-10-26, "On handoff"): the bot sends one public `m.read`
+  receipt for the newest event of a batch in `Worker._delivered`, next to the typing
+  indicator, so "seen" means the agent has the message. Best-effort like typing, and only for
+  handed-off rows, so a denied stranger never sees "seen" from the bot's Facebook account.
+
 ## 2026-10-25 decisions
 
 - Bot user with an access token, not an appservice: an appservice needs a registration

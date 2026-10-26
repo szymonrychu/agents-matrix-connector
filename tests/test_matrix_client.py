@@ -513,3 +513,28 @@ async def test_resolve_alias(fake, recorder, client, monkeypatch, caplog):
         assert TOKEN not in repr(error)
         assert TOKEN not in "".join(traceback.format_exception(error))
     assert TOKEN not in caplog.text
+
+
+async def test_send_receipt(fake, recorder, client):
+    fake.add_room(ROOM, [], {ALICE: "Alice Smith"})
+    fake.invite(ROOM, ALICE)
+    await client.join(ROOM)
+    recorder.requests.clear()
+
+    await client.send_receipt(ROOM, "$ev/1:hs")
+
+    [request] = recorder.requests
+    assert request.method == "POST"
+    assert request.url.raw_path.decode() == f"{API}/rooms/%21a%3Ahs/receipt/m.read/%24ev%2F1%3Ahs"
+    assert json.loads(request.content) == {}
+    assert fake.receipts(ROOM) == ["$ev/1:hs"]
+
+    fake.fail_next("receipt", 403, "M_FORBIDDEN")
+    with pytest.raises(MatrixForbidden) as exc:
+        await client.send_receipt(ROOM, "$ev2:hs")
+    assert (exc.value.status, exc.value.errcode) == (403, "M_FORBIDDEN")
+    assert TOKEN not in str(exc.value) and TOKEN not in repr(exc.value)
+    assert fake.receipts(ROOM) == ["$ev/1:hs"]
+
+    with pytest.raises(MatrixNotFound):
+        await client.send_receipt("!nope:hs", "$ev3:hs")
