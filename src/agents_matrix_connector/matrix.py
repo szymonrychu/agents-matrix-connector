@@ -1,4 +1,4 @@
-"""Thin async client for the ten Matrix client-server calls the connector makes."""
+"""Thin async client for the eleven Matrix client-server calls the connector makes."""
 
 import asyncio
 import json
@@ -166,6 +166,10 @@ class MatrixClient:
         content: dict[str, Any] = {"typing": True, "timeout": timeout_ms} if typing else {}
         content.setdefault("typing", False)
         await self._request("PUT", _path("rooms", room_id, "typing", user_id), json=content)
+
+    async def send_receipt(self, room_id: str, event_id: str) -> None:
+        """Mark the room read up to `event_id` with a public `m.read` receipt."""
+        await self._request("POST", _path("rooms", room_id, "receipt", "m.read", event_id), json={})
 
     def _redact(self, text: str) -> str:
         return text.replace(self._token, REDACTED) if self._token else text

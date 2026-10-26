@@ -229,6 +229,14 @@ by `room` for one chat. A deny rule always wins over an allow rule. Set a preset
 (`PUT /matrix/api/v1/rooms/{room_id}/settings`) or one default preset
 (`PUT /matrix/api/v1/settings`); an allowed room with no preset is ignored with `no_preset`.
 
+### Read receipts
+
+The bot marks a message read (a public Matrix `m.read` receipt on the newest message of the
+batch, which mautrix-meta bridges to Messenger as "seen") when it hands it to the agent, in the
+same step that starts the typing indicator. It never sends a receipt in chats it does not
+route: denied chats, chats without a preset, and messages that were ignored or refused. A
+failed receipt is logged and never costs the agent its reply.
+
 ### Handing the identity back to Hermes
 
 1. Scale the connector (bot and api) to 0.

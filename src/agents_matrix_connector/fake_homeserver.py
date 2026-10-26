@@ -5,7 +5,7 @@
 Drive it through `httpx.ASGITransport(app=fake.app)` or serve it with uvicorn; the helpers
 (`add_room`, `add_alias`, `invite`, `post`, `set_state`, `set_member`, `encrypt`,
 `limit_timeline`, `fail_next`, `revoke_token`) change its state and `sent` /
-`typing_state` read back what the bot did.
+`typing_state` / `receipts` read back what the bot did.
 
 Sync tokens are `s<n>` and pagination tokens `t<n>`, both meaning "after the n-th event";
 `/messages` accepts either. A sync timeline holding more events than its limit (the
@@ -39,6 +39,7 @@ ROUTES = (
     "room_messages",
     "send_text",
     "typing",
+    "receipt",
     "resolve_alias",
 )
 DEFAULT_ERRCODES = {
@@ -109,6 +110,7 @@ class FakeHomeserver:
         self._txns: dict[tuple[str, str, str, str], str] = {}
         self._sent: dict[str, list[dict]] = {}
         self._typing: dict[str, bool] = {}
+        self._receipts: list[tuple[str, str, str]] = []
         self._timeline_limit: int | None = None
         self._failures: dict[str, list[_Failure]] = {route: [] for route in ROUTES}
         self._table: list[tuple[str, tuple[str | None, ...], str, Handler]] = [
@@ -121,6 +123,12 @@ class FakeHomeserver:
             ("GET", ("rooms", None, "messages"), "room_messages", self._messages),
             ("PUT", ("rooms", None, "send", None, None), "send_text", self._send),
             ("PUT", ("rooms", None, "typing", None), "typing", self._typing_route),
+            (
+                "POST",
+                ("rooms", None, "receipt", None, None),
+                "receipt",
+                self._receipt_route,
+            ),
             ("GET", ("directory", "room", None), "resolve_alias", self._resolve_alias),
         ]
         self.app = _AsgiApp(self._asgi)
@@ -196,6 +204,10 @@ class FakeHomeserver:
 
     def typing_state(self, room_id: str) -> bool:
         return self._typing.get(room_id, False)
+
+    def receipts(self, room_id: str) -> list[str]:
+        """Event ids the bot sent receipts for in the room, in order."""
+        return [event for room, _, event in self._receipts if room == room_id]
 
     def fail_next(
         self,
@@ -578,6 +590,14 @@ class FakeHomeserver:
         if not isinstance(body, dict) or not isinstance(body.get("typing"), bool):
             return matrix_error(400, "M_BAD_JSON", "Missing typing key")
         self._typing[room_id] = body["typing"]
+        return JSONResponse({})
+
+    async def _receipt_route(self, request: Request, params: list[str]) -> Response:
+        room_id, receipt_type, event_id = params
+        room = self._joined_room(room_id)
+        if isinstance(room, Response):
+            return room
+        self._receipts.append((room_id, receipt_type, event_id))
         return JSONResponse({})
 
 

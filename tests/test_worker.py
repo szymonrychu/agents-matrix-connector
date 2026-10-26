@@ -36,12 +36,17 @@ class SpyMatrix:
     def __init__(self, client: MatrixClient):
         self._client = client
         self.typings: list[tuple[str, str, bool, int]] = []
+        self.receipts: list[tuple[str, str]] = []
 
     async def typing(
         self, user_id: str, room_id: str, typing: bool, timeout_ms: int = 30000
     ) -> None:
         self.typings.append((user_id, room_id, typing, timeout_ms))
         await self._client.typing(user_id, room_id, typing, timeout_ms)
+
+    async def send_receipt(self, room_id: str, event_id: str) -> None:
+        self.receipts.append((room_id, event_id))
+        await self._client.send_receipt(room_id, event_id)
 
 
 class DiscardAfterCheck:
@@ -123,11 +128,13 @@ async def add_room(conn, room_id: str, name: str = "Alice", kind: str = "dm") ->
     )
 
 
-async def queue(conn, room_id: str, *bodies: str) -> None:
+async def queue(conn, room_id: str, *bodies: str) -> list[str]:
+    event_ids = []
     for body in bodies:
+        event_ids.append(f"${uuid.uuid4().hex}")
         await inbound.insert(
             conn,
-            event_id=f"${uuid.uuid4().hex}",
+            event_id=event_ids[-1],
             room_id=room_id,
             sender=ALICE,
             sender_name="Alice A",
@@ -137,6 +144,24 @@ async def queue(conn, room_id: str, *bodies: str) -> None:
             status="new",
             reason=None,
         )
+    return event_ids
+
+
+async def queue_at(conn, room_id: str, body: str, origin_ts: datetime | None) -> str:
+    event_id = f"${uuid.uuid4().hex}"
+    await inbound.insert(
+        conn,
+        event_id=event_id,
+        room_id=room_id,
+        sender=ALICE,
+        sender_name="Alice A",
+        body=body,
+        mentioned=False,
+        origin_ts=origin_ts,
+        status="new",
+        reason=None,
+    )
+    return event_id
 
 
 async def fetch(conn, query: str, *args) -> list[tuple]:
@@ -397,6 +422,74 @@ async def test_typing_on_after_dispatch(conn, hs, matrix, preset, make_worker):
     [(_, _, _, _, message_id, status, *_)] = await room_runs(conn, OTHER)
     assert message_id is not None and status == "in-progress"
     assert hs.typing_state(OTHER) is False
+
+
+async def test_handoff_sends_read_receipt(conn, hs, matrix, preset, make_worker):
+    await preset()
+    await add_room(conn, DM)
+    worker = make_worker()
+    # The newest event is not the last one inserted; a NULL timestamp sorts lowest.
+    await queue_at(conn, DM, "a", T0 + timedelta(seconds=5))
+    newest = await queue_at(conn, DM, "b", T0 + timedelta(seconds=9))
+    await queue_at(conn, DM, "c", T0 + timedelta(seconds=1))
+    await queue_at(conn, DM, "d", None)
+
+    await worker.tick()
+
+    assert matrix.receipts == [(DM, newest)]
+    assert hs.receipts(DM) == [newest]
+    assert matrix.typings == [(BOT, DM, True, 30000)]
+
+    # A delivery into the running session marks the newest event of its batch.
+    [(run_id, *_)] = await room_runs(conn, DM)
+    await finish_handled(conn, run_id)
+    await queue_at(conn, DM, "e", T0 + timedelta(seconds=20))
+    tie_a = await queue_at(conn, DM, "f", None)
+    tie_b = await queue_at(conn, DM, "g", None)
+    assert tie_a != tie_b
+    await worker.tick()
+
+    follow_newest = (await fetch(conn, "SELECT event_id FROM inbound WHERE body = 'e'"))[0][0]
+    assert hs.receipts(DM) == [newest, follow_newest]
+    assert matrix.receipts == [(DM, newest), (DM, follow_newest)]
+    assert matrix.typings == [(BOT, DM, True, 30000)] * 2
+
+
+async def test_receipt_failure_does_not_fail_run(conn, hs, matrix, preset, make_worker, caplog):
+    caplog.set_level(logging.WARNING, logger="agents_matrix_connector.worker")
+    await preset()
+    await add_room(conn, DM)
+    await queue(conn, DM, "one")
+    hs.fail_next("receipt", 403, "M_FORBIDDEN")
+
+    await make_worker().tick()
+
+    [(_, _, _, _, message_id, status, *_)] = await room_runs(conn, DM)
+    assert message_id is not None and status == "in-progress"
+    assert hs.receipts(DM) == []
+    assert matrix.typings == [(BOT, DM, True, 30000)]
+    assert hs.typing_state(DM) is True
+    warnings = [r.getMessage() for r in caplog.records if "receipt" in r.getMessage()]
+    assert len(warnings) == 1 and DM in warnings[0] and "403" in warnings[0]
+    assert TOKEN not in warnings[0]
+
+
+async def test_no_receipt_without_handoff(conn, hs, matrix, fake, make_worker):
+    for room in (DM, OTHER):
+        await add_room(conn, room)
+    unknown = uuid.uuid4()
+    await conn.execute(
+        "INSERT INTO room_settings (room_id, preset_id) VALUES (%s, %s)", (OTHER, unknown)
+    )
+    await queue(conn, DM, "no preset")
+    await queue(conn, OTHER, "refused")
+
+    await make_worker().tick()
+
+    assert [r[1] for r in await room_rows(conn, DM)] == ["ignored"]
+    assert [r[1] for r in await room_rows(conn, OTHER)] == ["failed"]
+    assert matrix.receipts == []
+    assert hs.receipts(DM) == [] and hs.receipts(OTHER) == []
 
 
 async def test_orchestrator_unavailable_retries_with_stored_ids(

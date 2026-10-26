@@ -26,7 +26,7 @@ import re
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import psycopg
 from agents_common import runs as agent_runs
@@ -271,6 +271,13 @@ class Worker:
             )
         except MatrixError as exc:
             log.warning("matrix typing in %s failed: %s", batch.room_id, exc)
+        newest = max(
+            batch.rows, key=lambda row: (row.origin_ts or datetime.min.replace(tzinfo=UTC), row.id)
+        )
+        try:
+            await self._matrix.send_receipt(batch.room_id, newest.event_id)
+        except MatrixError as exc:
+            log.warning("matrix read receipt in %s failed: %s", batch.room_id, exc.status)
 
     async def _render(self, batch: _Batch, *, first: bool) -> str:
         room = await directory.get_room(self._pool, batch.room_id)
