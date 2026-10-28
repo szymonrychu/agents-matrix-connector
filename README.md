@@ -254,6 +254,14 @@ The answer shows `agents_may_initiate` true and the room's `binding`. Send
 `{"agents_may_initiate": false}` the same way to turn it off; turning it off does not release a
 binding.
 
+A room is policy-allowed for agent sends through the same rules as inbound chats, read for
+a message with no sender: a room or alias allow rule allows it, or one current member that the
+rules allow does (a `facebook` or `user` allow rule, or the default `allow` policy). Any denied
+current member denies the room, as does a room or alias deny rule; an infrastructure or
+encrypted room is never allowed. Current members are those who have joined, leaving out the bot
+user, its self identities and the bridge bots. A room with no such member and no room or alias
+allow rule is `not_allowed`.
+
 ### Read receipts
 
 The bot marks a message read (a public Matrix `m.read` receipt on the newest message of the

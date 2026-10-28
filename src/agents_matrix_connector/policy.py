@@ -139,3 +139,48 @@ def evaluate(subject: Subject, rules: Sequence[Rule], default_policy: str) -> De
     if default_policy == "allow":
         return Decision(True, None, None, "default")
     return Decision(False, NOT_ALLOWED, None, "default")
+
+
+_MEMBER_DENY_KINDS = ("user", "facebook", "display_name")
+
+
+def evaluate_agent_room(
+    room: Subject,
+    members: Sequence[Subject],
+    rules: Sequence[Rule],
+    default_policy: str,
+) -> Decision:
+    """Decide whether agents may post to a room (design D4).
+
+    Agent sends carry no sender, so the room subject alone would default-deny a
+    room allowed only by user or facebook rules and ignore deny rules on its
+    members. In order: an infrastructure or encrypted room is refused; a room or
+    alias deny rule denies; a deny rule matching any member denies (the lowest
+    rule id answers); a room or alias allow rule allows; one member that
+    `evaluate` allows makes the room allowed; else not_allowed. `members` are the
+    current non-bot members, each as a subject carrying that member as sender.
+    """
+    if default_policy not in DEFAULT_POLICIES:
+        raise ValueError(f"default_policy: must be one of {', '.join(DEFAULT_POLICIES)}")
+    if room.room_kind == "infrastructure":
+        return Decision(False, ROOM_INFRASTRUCTURE, None, "room")
+    if room.encrypted:
+        return Decision(False, ROOM_ENCRYPTED, None, "room")
+    ordered = sorted(rules, key=lambda rule: rule.id)
+    deny = _first(ordered, "deny", _ROOM_KINDS, room)
+    if deny is None:
+        member_denies = [_first(ordered, "deny", _MEMBER_DENY_KINDS, member) for member in members]
+        deny = min(
+            (rule for rule in member_denies if rule is not None),
+            key=lambda rule: rule.id,
+            default=None,
+        )
+    if deny is not None:
+        return Decision(False, denied(deny.kind), deny.id, "rule")
+    allow = _first(ordered, "allow", _ROOM_KINDS, room)
+    if allow is not None:
+        return Decision(True, None, allow.id, "rule")
+    allowed = [d for d in (evaluate(m, ordered, default_policy) for m in members) if d.allowed]
+    if allowed:
+        return min(allowed, key=lambda d: (d.rule_id is None, d.rule_id or 0))
+    return Decision(False, NOT_ALLOWED, None, "default")

@@ -27,7 +27,7 @@ from agents_matrix_connector.api.schemas import (
     UserView,
 )
 from agents_matrix_connector.db import directory, inbound, rules, runs
-from agents_matrix_connector.settings import ApiSettings
+from agents_matrix_connector.settings import ApiSettings, ConnectorSettings
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +59,25 @@ def _member_subject(room: directory.RoomRow, member: directory.MemberRow) -> pol
         member.user_id,
         member.facebook_id,
         member.display_name,
+    )
+
+
+def agent_room_decision(
+    room: directory.RoomRow, rule_list: list[policy.Rule], settings: ConnectorSettings
+) -> policy.Decision:
+    """Whether agents may post to the room under the user's rules (design D4).
+
+    Only current non-bot members count: membership `join`, and neither the bot
+    user, a self identity nor a bridge bot.
+    """
+    excluded = settings.self_ids() | set(settings.bridge_bots)
+    members = [
+        _member_subject(room, m)
+        for m in room.members
+        if m.membership == "join" and m.user_id not in excluded
+    ]
+    return policy.evaluate_agent_room(
+        _room_subject(room), members, rule_list, settings.default_policy
     )
 
 

@@ -1,7 +1,11 @@
 import dataclasses
+from datetime import UTC, datetime
 
 import pytest
+from api_helpers import make_settings
 
+from agents_matrix_connector.api.rooms import agent_room_decision
+from agents_matrix_connector.db import directory
 from agents_matrix_connector.policy import (
     KINDS,
     NOT_ALLOWED,
@@ -12,6 +16,7 @@ from agents_matrix_connector.policy import (
     Subject,
     denied,
     evaluate,
+    evaluate_agent_room,
     validate_rule,
 )
 
@@ -301,3 +306,164 @@ def test_room_level_decision():
     assert evaluate(stray, [*sender_denies, Rule(8, "allow", "room", ROOM)], "deny") == Decision(
         True, None, 8, "rule"
     )
+
+
+def room_only(**overrides) -> Subject:
+    return subject(sender_id=None, sender_facebook_id=None, sender_name=None, **overrides)
+
+
+def member(user_id=SENDER, facebook_id=FACEBOOK, name=NAME, **overrides) -> Subject:
+    return subject(sender_id=user_id, sender_facebook_id=facebook_id, sender_name=name, **overrides)
+
+
+def test_agent_room_allowed_by_room_rule():
+    for rule in (Rule(1, "allow", "room", ROOM), Rule(2, "allow", "alias", ALIAS)):
+        expected = Decision(True, None, rule.id, "rule")
+        assert evaluate_agent_room(room_only(), [], [rule], "deny") == expected
+        assert evaluate_agent_room(room_only(), [member()], [rule], "deny") == expected
+    # A room rule for another room does not allow this one.
+    other = Rule(3, "allow", "room", "!other:hs")
+    assert evaluate_agent_room(room_only(), [], [other], "deny") == Decision(
+        False, NOT_ALLOWED, None, "default"
+    )
+
+
+def test_agent_room_allowed_via_member_rule():
+    room = room_only(room_kind="group")
+    for rule in (Rule(5, "allow", "facebook", FACEBOOK), Rule(6, "allow", "user", SENDER)):
+        # The room subject alone is default-denied: it has no sender.
+        assert evaluate(room, [rule], "deny") == Decision(False, NOT_ALLOWED, None, "default")
+        other = member("@facebook_2:hs", "2", "Bob")
+        decision = evaluate_agent_room(room, [other, member()], [rule], "deny")
+        assert decision == Decision(True, None, rule.id, "rule")
+    # A member who matches no allow rule leaves the room not allowed.
+    assert evaluate_agent_room(
+        room,
+        [member("@facebook_2:hs", "2", "Bob")],
+        [Rule(5, "allow", "facebook", FACEBOOK)],
+        "deny",
+    ) == Decision(False, NOT_ALLOWED, None, "default")
+    # Under default allow an unruled member allows the room.
+    assert evaluate_agent_room(room, [member()], [], "allow") == Decision(
+        True, None, None, "default"
+    )
+
+
+def test_agent_room_denied_member_denies():
+    room = room_only(room_kind="group")
+    friend = member("@facebook_2:hs", "2", "Bob")
+    for rule in (
+        Rule(7, "deny", "user", SENDER),
+        Rule(8, "deny", "facebook", FACEBOOK),
+        Rule(9, "deny", "display_name", NAME.upper()),
+    ):
+        expected = Decision(False, denied(rule.kind), rule.id, "rule")
+        assert evaluate_agent_room(room, [friend, member()], [rule], "allow") == expected
+        with_room_allow = [Rule(1, "allow", "room", ROOM), rule]
+        assert evaluate_agent_room(room, [friend, member()], with_room_allow, "deny") == expected
+        member_allow = [Rule(2, "allow", "facebook", "2"), rule]
+        assert evaluate_agent_room(room, [friend, member()], member_allow, "deny") == expected
+    # Several denied members: the lowest rule id answers.
+    both = [Rule(9, "deny", "user", SENDER), Rule(4, "deny", "facebook", "2")]
+    assert evaluate_agent_room(room, [member(), friend], both, "allow") == Decision(
+        False, "denied: facebook", 4, "rule"
+    )
+
+
+def test_agent_room_not_allowed():
+    room = room_only(room_kind="group")
+    unrelated = [Rule(1, "allow", "facebook", "999"), Rule(2, "deny", "facebook", "998")]
+    assert evaluate_agent_room(room, [member()], unrelated, "deny") == Decision(
+        False, NOT_ALLOWED, None, "default"
+    )
+    assert evaluate_agent_room(room, [], [], "deny") == Decision(
+        False, NOT_ALLOWED, None, "default"
+    )
+    # Default allow does not make a room with nobody to talk to reachable.
+    assert evaluate_agent_room(room, [], [], "allow") == Decision(
+        False, NOT_ALLOWED, None, "default"
+    )
+    assert evaluate_agent_room(room, [], [Rule(3, "allow", "user", SENDER)], "allow") == Decision(
+        False, NOT_ALLOWED, None, "default"
+    )
+    with pytest.raises(ValueError, match="default_policy"):
+        evaluate_agent_room(room, [member()], [], "maybe")
+
+
+def test_agent_room_room_level_refusals():
+    allowed_member = [member()]
+    rules = [Rule(1, "allow", "facebook", FACEBOOK), Rule(2, "allow", "room", ROOM)]
+    assert evaluate_agent_room(
+        room_only(room_kind="infrastructure"), allowed_member, rules, "allow"
+    ) == Decision(False, ROOM_INFRASTRUCTURE, None, "room")
+    assert evaluate_agent_room(
+        room_only(encrypted=True), allowed_member, rules, "allow"
+    ) == Decision(False, ROOM_ENCRYPTED, None, "room")
+    # A room or alias deny rule wins over an allowed member and a room allow rule.
+    for deny in (Rule(3, "deny", "room", ROOM), Rule(4, "deny", "alias", ALIAS)):
+        assert evaluate_agent_room(
+            room_only(), allowed_member, [*rules, deny], "allow"
+        ) == Decision(False, denied(deny.kind), deny.id, "rule")
+
+
+JOINED = "@facebook_1:x"
+LEFT = "@facebook_2:x"
+SELF_ID = "@hermes2:x"
+BRIDGE = "@facebookbot:szymonrichert.pl"
+
+
+def room_row(*members: directory.MemberRow, **overrides) -> directory.RoomRow:
+    values = {
+        "room_id": ROOM,
+        "kind": "group",
+        "name": "Team",
+        "alias": ALIAS,
+        "encrypted": False,
+        "message_request": False,
+        "membership": "join",
+        "inviter": None,
+        "member_count": len(members),
+        "discovered_at": datetime(2026, 10, 28, tzinfo=UTC),
+        "last_event_at": None,
+        "queued": 0,
+        "session": None,
+        "members": list(members),
+    }
+    values.update(overrides)
+    return directory.RoomRow(**values)
+
+
+def test_agent_room_decision_member_filter():
+    settings = make_settings(self_identities=SELF_ID, bridge_bots=BRIDGE)
+    bot = settings.user_id
+    joined = directory.MemberRow(JOINED, "Alice", "1", "join")
+    left = directory.MemberRow(LEFT, "Bob", "2", "leave")
+    invited = directory.MemberRow("@facebook_4:x", "Dan", "4", "invite")
+    self_identity = directory.MemberRow(SELF_ID, "Me", "3", "join")
+    bridge = directory.MemberRow(BRIDGE, "Bridge", None, "join")
+    bot_member = directory.MemberRow(bot, "Agents", None, "join")
+    noise = [left, invited, self_identity, bridge, bot_member]
+    deny_noise = [
+        Rule(10, "deny", "user", LEFT),
+        Rule(11, "deny", "user", SELF_ID),
+        Rule(12, "deny", "user", BRIDGE),
+        Rule(13, "deny", "user", bot),
+        Rule(14, "deny", "facebook", "4"),
+    ]
+    allow = Rule(1, "allow", "facebook", "1")
+    decision = agent_room_decision(room_row(joined, *noise), [allow, *deny_noise], settings)
+    assert decision == Decision(True, None, 1, "rule")
+
+    # An allow rule matching only a non-counted member allows nothing.
+    only_noise = [Rule(2, "allow", "user", SELF_ID), Rule(3, "allow", "user", LEFT)]
+    decision = agent_room_decision(room_row(joined, *noise), only_noise, settings)
+    assert decision == Decision(False, NOT_ALLOWED, None, "default")
+
+    # A counted denied member still denies.
+    deny_joined = Rule(15, "deny", "facebook", "1")
+    decision = agent_room_decision(room_row(joined, *noise), [allow, deny_joined], settings)
+    assert decision == Decision(False, "denied: facebook", 15, "rule")
+
+    # Room facts reach the decision: an encrypted room is refused.
+    decision = agent_room_decision(room_row(joined, encrypted=True), [allow], settings)
+    assert decision == Decision(False, ROOM_ENCRYPTED, None, "room")
