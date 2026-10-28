@@ -31,6 +31,15 @@ class SessionView(BaseModel):
     status: str
 
 
+class BindingView(BaseModel):
+    """The room's active binding; a reservation by a first run in progress has no session yet."""
+
+    session_id: uuid.UUID | None
+    slug: str | None
+    origin: Literal["inbound", "agent"]
+    since: datetime
+
+
 class RoomView(BaseModel):
     room_id: str
     name: str | None
@@ -44,7 +53,9 @@ class RoomView(BaseModel):
     preset_id: uuid.UUID | None
     trigger: Literal["all", "mention"] | None
     effective_trigger: Literal["all", "mention"]
+    agents_may_initiate: bool
     session: SessionView | None
+    binding: BindingView | None
     last_event_at: datetime | None
     queued: int
 
@@ -64,6 +75,8 @@ class RoomDetail(RoomView):
 class RoomSettingsIn(BaseModel):
     preset_id: uuid.UUID | None = None
     trigger: Literal["all", "mention"] | None = None
+    agents_may_initiate: bool | None = None
+    """None (or omitted) keeps the stored value: the flag is an authorisation grant."""
 
 
 class MessageView(BaseModel):

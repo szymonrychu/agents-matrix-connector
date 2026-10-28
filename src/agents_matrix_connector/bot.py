@@ -1,4 +1,5 @@
-"""The bot process: Matrix sync, dispatch worker and reply tracker under one singleton lock."""
+"""The bot process: Matrix sync, dispatch worker, agent sender and reply tracker under one
+singleton lock."""
 
 import asyncio
 import contextlib
@@ -14,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
 
 from agents_matrix_connector.matrix import MatrixAuthError, MatrixClient
+from agents_matrix_connector.sender import Sender
 from agents_matrix_connector.settings import BotSettings
 from agents_matrix_connector.sync import SyncLoop, utcnow
 from agents_matrix_connector.tracker import Tracker
@@ -74,10 +76,13 @@ def build_health_app(sync: SyncLoop, settings: BotSettings) -> FastAPI:
     return app
 
 
-async def _work_loop(worker: Worker, tracker: Tracker, settings: BotSettings, stop) -> None:
-    """Worker.tick then Tracker.tick every poll interval; only a Matrix auth failure escapes."""
+async def _work_loop(
+    worker: Worker, sender: Sender, tracker: Tracker, settings: BotSettings, stop
+) -> None:
+    """Worker.tick, Sender.tick then Tracker.tick every poll interval; only a Matrix auth
+    failure escapes."""
     while not stop.is_set():
-        for tick in (worker.tick, tracker.tick):
+        for tick in (worker.tick, sender.tick, tracker.tick):
             try:
                 await tick()
             except MatrixAuthError:
@@ -92,6 +97,7 @@ async def _locked(
     pool,
     sync: SyncLoop,
     worker: Worker,
+    sender: Sender,
     tracker: Tracker,
     settings: BotSettings,
     stop: asyncio.Event,
@@ -109,15 +115,15 @@ async def _locked(
     try:
         async with advisory_singleton(pool, LOCK_NAME):
             held.set()
-            return await _run_loops(sync, worker, tracker, settings, stop, health)
+            return await _run_loops(sync, worker, sender, tracker, settings, stop, health)
     finally:
         stop.set()
         await asyncio.gather(health, return_exceptions=True)
 
 
-async def _run_loops(sync, worker, tracker, settings, stop, health) -> int:
+async def _run_loops(sync, worker, sender, tracker, settings, stop, health) -> int:
     syncing = asyncio.create_task(sync.run(stop), name="sync")
-    working = asyncio.create_task(_work_loop(worker, tracker, settings, stop), name="work")
+    working = asyncio.create_task(_work_loop(worker, sender, tracker, settings, stop), name="work")
     stopper = asyncio.create_task(stop.wait())
     tasks = {syncing, working}
     try:
@@ -187,10 +193,11 @@ async def _main(settings, pool, orchestrator, matrix, stop) -> int:
         return EXIT_BAD_SETTINGS
     sync = SyncLoop(matrix, pool, settings)
     worker = Worker(orchestrator, matrix, pool, settings)
+    sender = Sender(pool, settings)
     tracker = Tracker(orchestrator, matrix, pool, settings)
     held = asyncio.Event()
     body = asyncio.create_task(
-        _locked(pool, sync, worker, tracker, settings, stop, held), name="bot"
+        _locked(pool, sync, worker, sender, tracker, settings, stop, held), name="bot"
     )
     stopper = asyncio.create_task(stop.wait())
     try:

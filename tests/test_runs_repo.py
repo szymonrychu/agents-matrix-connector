@@ -60,24 +60,43 @@ async def test_run_store_protocol_and_guards(conn, pool):
         await runs.finish(conn, ref.id, "in-progress")
 
 
-async def test_create_run_and_latest_session(conn):
-    assert await runs.latest_session(conn, ROOM) is None
+async def test_create_run(conn):
+    # The room-session binding (room_bindings) replaced the latest-session lookup.
+    assert not hasattr(runs, "latest_session")
     first = await new_run(conn)
     assert first.slug == f"mx-{first.id}"
     assert first.session_id is None and first.message_id is None
     assert isinstance(first.id, int)
-    assert await runs.latest_session(conn, ROOM) is None
-
-    s1, s2 = uuid.uuid4(), uuid.uuid4()
-    await conn.execute("UPDATE runs SET session_id = %s WHERE id = %s", (s1, first.id))
-    second = await new_run(conn, kind="follow")
-    await conn.execute("UPDATE runs SET session_id = %s WHERE id = %s", (s2, second.id))
-    await new_run(conn, kind="follow")
-    other = await new_run(conn, room="!b:x")
-    await conn.execute("UPDATE runs SET session_id = %s WHERE id = %s", (uuid.uuid4(), other.id))
-    assert await runs.latest_session(conn, ROOM) == (second.id, s2)
     with pytest.raises(ValueError):
         await runs.create_run(conn, room_id=ROOM, preset_id=str(uuid.uuid4()), kind="other")
+
+    # A follow run may have no preset: NULL in the row, "" in its RunRef.
+    follow = await runs.create_run(conn, room_id=ROOM, preset_id=None, kind="follow")
+    assert follow.preset_id == ""
+    assert follow.slug == f"mx-{follow.id}"
+    [_, row] = await runs.in_progress(conn)
+    assert (row.id, row.kind, row.preset_id) == (follow.id, "follow", None)
+    # A first run always has one.
+    with pytest.raises(psycopg.errors.CheckViolation):
+        await runs.create_run(conn, room_id=ROOM, preset_id=None, kind="first")
+
+
+async def test_has_other_run(conn):
+    s1, s2 = uuid.uuid4(), uuid.uuid4()
+    first = await new_run(conn)
+    await conn.execute("UPDATE runs SET session_id = %s WHERE id = %s", (s1, first.id))
+    # The run itself does not count.
+    assert await runs.has_other_run(conn, s1, ROOM, first.id) is False
+    follow = await new_run(conn, kind="follow")
+    await conn.execute("UPDATE runs SET session_id = %s WHERE id = %s", (s1, follow.id))
+    assert await runs.has_other_run(conn, s1, ROOM, follow.id) is True
+    # A finished run counts; a run of the session in another room does not.
+    assert await runs.finish(conn, first.id, "handled")
+    assert await runs.has_other_run(conn, s1, ROOM, follow.id) is True
+    elsewhere = await new_run(conn, room="!b:x", kind="follow")
+    await conn.execute("UPDATE runs SET session_id = %s WHERE id = %s", (s2, elsewhere.id))
+    assert await runs.has_other_run(conn, s2, ROOM, 0) is False
+    assert await runs.has_other_run(conn, s2, "!b:x", elsewhere.id) is False
 
 
 async def test_count_first_in_progress(conn):

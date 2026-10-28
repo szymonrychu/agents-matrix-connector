@@ -1,11 +1,13 @@
-"""The bot's reply tracker: agent results back into the Matrix room (design D9, D10).
+"""The bot's reply tracker: agent results back into the Matrix room (design D7, D9, D10).
 
 Each tick polls every in-progress run's orchestrator message. A finished run is closed in
 one transaction that also settles its inbound rows and stores its outbound rows, whose
 transaction ids (`mxc-<run id>-<n>`, `mxc-<run id>-notice`) are deterministic: a crash
 between the send and the `sent` update re-sends the same transaction id on the next tick,
-and the homeserver deduplicates it, so the room gets the message once. Pending outbound rows
-are then sent oldest first, and once a day old rows are pruned.
+and the homeserver deduplicates it, so the room gets the message once. Pending outbound rows,
+the runs' and the agent sends' (`mxa-` ids, stored by the sender), are then sent oldest first,
+each with its own event type and content; a send's row is sent only while its room still
+passes the agent room policy. Once a day old rows are pruned.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector.chunks import split
 from agents_matrix_connector.clock import utcnow
-from agents_matrix_connector.db import inbound, runs
+from agents_matrix_connector.db import bindings, inbound, runs, sends
 from agents_matrix_connector.matrix import (
     MatrixAuthError,
     MatrixClient,
@@ -34,6 +36,7 @@ from agents_matrix_connector.matrix import (
     MatrixForbidden,
     MatrixUnavailable,
 )
+from agents_matrix_connector.sender import RoomPolicy, event_content, refuse_sending
 from agents_matrix_connector.settings import BotSettings
 
 log = logging.getLogger(__name__)
@@ -42,6 +45,7 @@ SESSION_GONE = "session_gone"
 TURN_FAILED = "turn_failed"
 TIMEOUT = "timeout"
 EMPTY_REPLY = "empty_reply"
+ALREADY_SENT = "already_sent"
 FORBIDDEN = "forbidden"
 MESSAGE_FAILED = "message_failed"
 MESSAGE_CANCELLED = "message_cancelled"
@@ -121,7 +125,14 @@ class Tracker:
         turn = message.turn
         if turn is not None and turn.status == "completed":
             chunks = split(turn.final_text or "", self._settings.reply_chunk_chars)
-            return _Outcome("handled", None if chunks else EMPTY_REPLY, chunks=chunks)
+            if not chunks:
+                return _Outcome("handled", EMPTY_REPLY)
+            match = await self._send_match(run, (turn.final_text or "").strip())
+            if match == "sent":
+                return _Outcome("handled", ALREADY_SENT)
+            if match == "pending" and self._now() - run.started_at <= self._timeout:
+                return None
+            return _Outcome("handled", None, chunks=chunks)
         if turn is not None and turn.status == "failed":
             return _failed(TURN_FAILED)
         if message.status in ("failed", "cancelled"):
@@ -129,6 +140,19 @@ class Tracker:
                 return _SESSION_GONE
             return _failed(_MESSAGE_REASONS[message.status])
         return self._timed_out(run)
+
+    async def _send_match(self, run: runs.RunRow, final_text: str) -> str | None:
+        """How the final answer was already said (design D10): "sent" when a message send of
+        the run's session made since the run started and equal to it (stripped) reached the
+        user, else "pending" when one is still queued or sending, else None."""
+        if run.session_id is None:
+            return None
+        async with self._pool.connection() as conn:
+            made = await sends.message_sends_since(conn, run.session_id, run.started_at)
+        statuses = {status for text, status in made if text.strip() == final_text}
+        if "sent" in statuses:
+            return "sent"
+        return "pending" if statuses else None
 
     def _timed_out(self, run: runs.RunRow) -> _Outcome | None:
         if self._now() - run.started_at > self._timeout:
@@ -160,13 +184,27 @@ class Tracker:
         """Send pending rows oldest first; an unavailable homeserver stops the pass so later
         chunks never overtake earlier ones, any other refusal fails that row (reason
         `forbidden`, else the errcode) and a lost token propagates. Typing ends once a run
-        has no pending row left."""
+        has no pending row left. A send's row first re-checks its room (D4 (a)); a denied
+        room refuses the send and nothing more of it is sent."""
         async with self._pool.connection() as conn:
             pending = await runs.pending(conn)
         left = Counter(row.run_id for row in pending)
+        room_policy = RoomPolicy(self._pool, self._settings)
+        refused: set[int] = set()
         for row in pending:
+            if row.send_id is not None:
+                if row.send_id in refused:
+                    continue
+                refusal = await room_policy.refusal(row.room_id)
+                if refusal is not None:
+                    refused.add(row.send_id)
+                    await self._refuse(row.send_id, refusal)
+                    continue
+            content = event_content(row.event_type, row.body, row.relates_to)
             try:
-                event_id = await self._matrix.send_text(row.room_id, row.txn_id, row.body)
+                event_id = await self._matrix.send_event(
+                    row.room_id, row.event_type, row.txn_id, content
+                )
             except MatrixUnavailable as exc:
                 log.warning(
                     "matrix unavailable sending %s, retrying next tick: %s", row.txn_id, exc
@@ -186,6 +224,11 @@ class Tracker:
             left[row.run_id] -= 1
             if row.run_id is not None and left[row.run_id] == 0:
                 await self._typing(row.room_id, False)
+
+    async def _refuse(self, send_id: int, reason: str) -> None:
+        async with self._pool.connection() as conn, conn.transaction():
+            await refuse_sending(conn, send_id, reason)
+        log.info("send s%s refused at send time: %s", send_id, reason)
 
     async def _mark_failed(self, outbound_id: int, reason: str) -> None:
         async with self._pool.connection() as conn:
@@ -208,10 +251,15 @@ class Tracker:
         async with self._pool.connection() as conn, conn.transaction():
             inbound_deleted = await inbound.prune(conn, cutoff)
             runs_deleted = await runs.prune(conn, cutoff)
+            sends_deleted = await sends.prune(conn, cutoff)
+            bindings_deleted = await bindings.prune_released(conn, cutoff)
         self._last_prune = now
         log.info(
-            "pruned %s inbound and %s run and outbound rows older than %s",
+            "pruned %s inbound, %s run and outbound, %s send and %s released binding rows"
+            " older than %s",
             inbound_deleted,
             runs_deleted,
+            sends_deleted,
+            bindings_deleted,
             cutoff.isoformat(),
         )

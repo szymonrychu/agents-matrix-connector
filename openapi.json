@@ -43,6 +43,55 @@
         "title": "AccessView",
         "type": "object"
       },
+      "BindingView": {
+        "description": "The room's active binding; a reservation by a first run in progress has no session yet.",
+        "properties": {
+          "origin": {
+            "enum": [
+              "inbound",
+              "agent"
+            ],
+            "title": "Origin",
+            "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "since": {
+            "format": "date-time",
+            "title": "Since",
+            "type": "string"
+          },
+          "slug": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slug"
+          }
+        },
+        "required": [
+          "session_id",
+          "slug",
+          "origin",
+          "since"
+        ],
+        "title": "BindingView",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -244,6 +293,10 @@
           "access": {
             "$ref": "#/components/schemas/AccessView"
           },
+          "agents_may_initiate": {
+            "title": "Agents May Initiate",
+            "type": "boolean"
+          },
           "alias": {
             "anyOf": [
               {
@@ -254,6 +307,16 @@
               }
             ],
             "title": "Alias"
+          },
+          "binding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BindingView"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "effective_trigger": {
             "enum": [
@@ -379,7 +442,9 @@
           "preset_id",
           "trigger",
           "effective_trigger",
+          "agents_may_initiate",
           "session",
+          "binding",
           "last_event_at",
           "queued",
           "members"
@@ -389,6 +454,17 @@
       },
       "RoomSettingsIn": {
         "properties": {
+          "agents_may_initiate": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agents May Initiate"
+          },
           "preset_id": {
             "anyOf": [
               {
@@ -425,6 +501,10 @@
           "access": {
             "$ref": "#/components/schemas/AccessView"
           },
+          "agents_may_initiate": {
+            "title": "Agents May Initiate",
+            "type": "boolean"
+          },
           "alias": {
             "anyOf": [
               {
@@ -435,6 +515,16 @@
               }
             ],
             "title": "Alias"
+          },
+          "binding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BindingView"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "effective_trigger": {
             "enum": [
@@ -553,7 +643,9 @@
           "preset_id",
           "trigger",
           "effective_trigger",
+          "agents_may_initiate",
           "session",
+          "binding",
           "last_event_at",
           "queued"
         ],

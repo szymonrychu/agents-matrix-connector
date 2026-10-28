@@ -15,6 +15,7 @@ from pydantic import Field, SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from agents_matrix_connector import __version__
+from agents_matrix_connector.api.agent import create_agent_app
 from agents_matrix_connector.api.app import create_api_app
 from agents_matrix_connector.bot import run_bot, serve_asgi
 from agents_matrix_connector.settings import ApiSettings, BotSettings
@@ -23,7 +24,7 @@ EXIT_BAD_SETTINGS = 78
 
 SUBCOMMANDS = {
     "migrate": "apply database migrations",
-    "api": "run the UI API",
+    "api": "run the UI API and, with MATRIX_AGENT_TOKEN_SHA256 set, the agent listener",
     "bot": "run the Matrix sync, dispatch worker and reply tracker",
 }
 
@@ -72,12 +73,29 @@ def _cmd_migrate(settings: MigrateSettings) -> int:
     return 0
 
 
+async def _serve_all(servers: Sequence[Awaitable[None]], stop: asyncio.Event) -> None:
+    """Run every server until `stop` is set or one of them ends, then stop the rest."""
+    tasks = [asyncio.ensure_future(server) for server in servers]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        stop.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+
+
 def _cmd_api(settings: ApiSettings) -> int:
+    grace = settings.shutdown_grace_seconds
+
     async def body(pool, client, stop):
-        app = create_api_app(pool, client, settings)
-        await serve_asgi(
-            app, settings.http_host, settings.http_port, settings.shutdown_grace_seconds, stop
-        )
+        ui = create_api_app(pool, client, settings)
+        servers = [serve_asgi(ui, settings.http_host, settings.http_port, grace, stop)]
+        if settings.agent_token_sha256.get_secret_value():
+            agent = create_agent_app(pool, settings)
+            servers.append(serve_asgi(agent, settings.http_host, settings.agent_port, grace, stop))
+        await _serve_all(servers, stop)
 
     return _run(settings, body)
 

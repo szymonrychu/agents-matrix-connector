@@ -73,6 +73,11 @@ spec:
             - name: http
               containerPort: 8000
               protocol: TCP
+            {{- if eq $component "api" }}
+            - name: agents
+              containerPort: {{ $.Values.agentApi.port }}
+              protocol: TCP
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz

@@ -2,6 +2,7 @@
 {{- $_ := include "agents-matrix-connector.databaseSecretName" . }}
 {{- $_ := include "agents-matrix-connector.tokenSecretName" . }}
 {{- $_ := include "agents-matrix-connector.matrixSecretName" . }}
+{{- $_ := include "agents-matrix-connector.agentTokenSecretName" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

@@ -119,9 +119,34 @@ matrix-access-token
 {{- end }}
 
 {{/*
+Name of the Secret holding the agent token sha256, empty when none is set (the agent listener
+then stays unbound). Fails on an inline hash that is not 64 lowercase hex, without echoing it.
+*/}}
+{{- define "agents-matrix-connector.agentTokenSecretName" -}}
+{{- $a := .Values.agentApi -}}
+{{- if and $a.tokenSecret $a.tokenSecret.name -}}
+{{- $a.tokenSecret.name -}}
+{{- else if $a.tokenSha256 -}}
+{{- if not (regexMatch "^[0-9a-f]{64}$" (toString $a.tokenSha256)) -}}
+{{- fail "agents-matrix-connector: agentApi.tokenSha256 must be 64 lowercase hex characters" -}}
+{{- end -}}
+{{- include "agents-matrix-connector.fullname" . -}}
+{{- end -}}
+{{- end }}
+
+{{- define "agents-matrix-connector.agentTokenSecretKey" -}}
+{{- if and .Values.agentApi.tokenSecret .Values.agentApi.tokenSecret.name -}}
+{{- .Values.agentApi.tokenSecret.key | default "token-sha256" -}}
+{{- else -}}
+agent-token-sha256
+{{- end -}}
+{{- end }}
+
+{{/*
 Container env for a component. Call with (dict "context" . "component" "api"): the settings
 ConfigMap and the database URL for every container; the orchestrator token for api and bot (not
-migrate); the api allowlist for api only. The Matrix token is never an env var.
+migrate); the api allowlist and the agent token sha256 for api only. The Matrix token is never an
+env var.
 */}}
 {{- define "agents-matrix-connector.env" -}}
 envFrom:
@@ -136,6 +161,13 @@ env:
 {{- if eq .component "api" }}
   - name: MATRIX_API_ALLOWED_CIDRS
     value: {{ join "," (.context.Values.api.allowedCidrs | default (list "127.0.0.1/32")) | quote }}
+{{- with include "agents-matrix-connector.agentTokenSecretName" .context }}
+  - name: MATRIX_AGENT_TOKEN_SHA256
+    valueFrom:
+      secretKeyRef:
+        name: {{ . }}
+        key: {{ include "agents-matrix-connector.agentTokenSecretKey" $.context }}
+{{- end }}
 {{- end }}
 {{- if has .component (list "api" "bot") }}
   - name: MATRIX_ORCHESTRATOR_TOKEN

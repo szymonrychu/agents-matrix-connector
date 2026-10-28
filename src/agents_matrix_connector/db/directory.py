@@ -1,7 +1,8 @@
 """Rooms, users, members and the sync state.
 
 The bot's sync loop is the only writer: writers take a connection and never commit, so the
-caller owns one transaction per sync response. The API reads through the pool.
+caller owns one transaction per sync response. The API reads through the pool, including each
+room's active `room_bindings` row (read only here; the bot worker is its writer).
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Literal
 
 import psycopg
 from psycopg.rows import dict_row
@@ -23,6 +25,16 @@ class SessionRef:
     session_id: uuid.UUID | None
     slug: str | None
     status: str
+
+
+@dataclass(frozen=True)
+class BindingRef:
+    """A room's active binding; `session_id` is None for a first run's reservation."""
+
+    session_id: uuid.UUID | None
+    slug: str | None
+    origin: Literal["inbound", "agent"]
+    since: datetime
 
 
 @dataclass(frozen=True)
@@ -49,6 +61,7 @@ class RoomRow:
     queued: int
     session: SessionRef | None
     members: list[MemberRow] = field(default_factory=list)
+    binding: BindingRef | None = None
 
 
 @dataclass(frozen=True)
@@ -188,12 +201,15 @@ _ROOM_SELECT = """
            r.inviter, r.member_count, r.discovered_at, r.last_event_at,
            (SELECT count(*) FROM inbound i
              WHERE i.room_id = r.room_id AND i.status = 'new') AS queued,
-           lr.session_id, lr.slug, lr.status AS run_status
+           lr.session_id, lr.slug, lr.status AS run_status,
+           b.session_id AS binding_session_id, b.slug AS binding_slug,
+           b.origin AS binding_origin, b.created_at AS binding_since
     FROM rooms r
     LEFT JOIN LATERAL (
         SELECT session_id, slug, status FROM runs
         WHERE runs.room_id = r.room_id ORDER BY id DESC LIMIT 1
     ) lr ON true
+    LEFT JOIN room_bindings b ON b.room_id = r.room_id AND b.released_at IS NULL
 """
 
 
@@ -201,6 +217,16 @@ def _room(row: dict, members: list[MemberRow] | None = None) -> RoomRow:
     session = (
         SessionRef(row["session_id"], row["slug"], row["run_status"])
         if row["run_status"] is not None
+        else None
+    )
+    binding = (
+        BindingRef(
+            row["binding_session_id"],
+            row["binding_slug"],
+            row["binding_origin"],
+            row["binding_since"],
+        )
+        if row["binding_origin"] is not None
         else None
     )
     return RoomRow(
@@ -218,6 +244,7 @@ def _room(row: dict, members: list[MemberRow] | None = None) -> RoomRow:
         queued=row["queued"],
         session=session,
         members=members or [],
+        binding=binding,
     )
 
 

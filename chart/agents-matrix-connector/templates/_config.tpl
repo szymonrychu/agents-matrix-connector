@@ -18,6 +18,8 @@ MATRIX_RUN_TIMEOUT_SECONDS: {{ .Values.limits.runTimeoutSeconds | int | toString
 MATRIX_POLL_SECONDS: {{ .Values.limits.pollSeconds | toString | quote }}
 MATRIX_SYNC_TIMEOUT_SECONDS: {{ .Values.limits.syncTimeoutSeconds | int | toString | quote }}
 MATRIX_RETENTION_DAYS: {{ .Values.limits.retentionDays | int | toString | quote }}
+MATRIX_AGENT_PORT: {{ .Values.agentApi.port | int | toString | quote }}
+MATRIX_AGENT_RATE_PER_MINUTE: {{ .Values.limits.agentRatePerMinute | int | toString | quote }}
 {{- range $k, $v := .Values.env }}
 {{- if not (hasPrefix "MATRIX_" $k) }}
 {{- fail (printf "agents-matrix-connector: env key %q must start with MATRIX_" $k) }}

@@ -46,6 +46,9 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_RETENTION_DAYS` | 30 | bot | days messages are kept (>= 1) |
 | `MATRIX_BACKFILL_MAX_EVENTS` | 500 | bot | max events read back per room when a sync timeline arrives limited (>= 1) |
 | `MATRIX_API_ALLOWED_CIDRS` | 127.0.0.1/32 | api | client networks allowed to call the api, comma separated |
+| `MATRIX_AGENT_PORT` | 8001 | api | bind port of the agent listener; must differ from `MATRIX_HTTP_PORT` |
+| `MATRIX_AGENT_TOKEN_SHA256` | empty | api | sha256 hex (64 lowercase characters) of the orchestrator's agent bearer token; empty leaves the agent listener unbound |
+| `MATRIX_AGENT_RATE_PER_MINUTE` | 20 | api | max agent sends (messages and reactions together) per session in the last 60 s (>= 1) |
 | `MATRIX_ACCESS_TOKEN` | none | bot | Matrix access token (required unless the file is set) |
 | `MATRIX_ACCESS_TOKEN_FILE` | empty | bot | file holding the Matrix access token; wins over the variable, stripped |
 
@@ -100,8 +103,19 @@ when not plain handled:
 - `message_cancelled`: failed, the orchestrator message was cancelled
 - `timeout`: failed, no result within `MATRIX_RUN_TIMEOUT_SECONDS`
 - `empty_reply`: handled, the agent answered with no text
+- `already_sent`: handled, the turn's final answer equals (stripped) a message the agent sent
+  with the send tool during the run, so it is not posted a second time
 - `forbidden`: an outbound reply the homeserver refused (a failed outbound row)
 - `denied: <kind>` and `not_allowed` also appear on ignored messages
+
+Only a delivered send suppresses the final answer: when a turn completes, the bot compares its
+final answer, stripped, with the stripped text of every message send of the same session
+created at or after the run started. A matching `sent` send closes the run `already_sent` and
+posts nothing. A matching send still `queued` or `sending` keeps the run in progress (the room's
+next batch waits) until it settles, bounded by `MATRIX_RUN_TIMEOUT_SECONDS` from the run's
+start; when the timeout passes first the final answer is posted. A matching send that ended
+`failed` or `refused` does not count, so the final answer is posted. Every other final answer
+is posted as usual.
 
 ### `GET /matrix/api/v1/meta`
 
@@ -113,7 +127,11 @@ Bot user, homeserver, default policy, group trigger, rule kinds per list and syn
 
 Discovered rooms. Query: `kind` (`dm`, `group`, `matrix`, `infrastructure`), `access`
 (`allowed`, `denied`, `default`). 200 list of rooms with `access`, `preset_id`, `trigger`,
-`effective_trigger`, `session` (`id`, `slug`, `status`, or null) and `queued` (messages waiting); 422 `invalid_request`.
+`effective_trigger`, `agents_may_initiate` (false when the room has no settings), `session`
+(the latest run: `id`, `slug`, `status`, or null), `binding` (the room's active session binding:
+`session_id`, `slug`, `origin` `inbound` or `agent`, `since`; `session_id` null while a first run
+reserves the room; null when the room is unbound) and `queued` (messages waiting); 422
+`invalid_request`. The binding is read only: no route writes, releases or moves it.
 
     curl -s 'http://localhost:8000/matrix/api/v1/rooms?kind=dm&access=allowed'
 
@@ -125,9 +143,13 @@ One room with its `members` (`user_id`, `display_name`, `facebook_id`, `membersh
 
 ### `PUT /matrix/api/v1/rooms/{room_id}/settings`
 
-Body `{"preset_id": uuid|null, "trigger": "all"|"mention"|null}`: the room's preset and
-trigger override (null clears). 200 room; 404 `not_found`; 422 `unknown_preset` or
-`invalid_request`; 503 `unavailable`; 502 `orchestrator_error`.
+Body `{"preset_id": uuid|null, "trigger": "all"|"mention"|null, "agents_may_initiate":
+true|false|null}`: the room's preset and trigger override (null or omitted clears) and whether
+agents may start a chat in the room while it is unbound (`agents_may_initiate`, off by default).
+An omitted or null `agents_may_initiate` keeps the stored value (false for a room without
+settings), so a save of the preset or trigger never grants or revokes it. 200 room; 404
+`not_found`; 422 `unknown_preset` or `invalid_request`; 503 `unavailable`; 502
+`orchestrator_error`.
 
     curl -s -X PUT -H 'content-type: application/json' -d '{"trigger": "all"}' \
       'http://localhost:8000/matrix/api/v1/rooms/!abc:server/settings'
@@ -192,6 +214,137 @@ Inbound messages across all rooms, newest first. Query: `status` (`new`, `in-pro
 
     curl -s 'http://localhost:8000/matrix/api/v1/messages?status=failed'
 
+## Agent API
+
+The agent listener of the `api` subcommand, called by agents-orchestrator on behalf of a session
+leader (the `orchestrator_chat_*` tools). With `MATRIX_AGENT_TOKEN_SHA256` set, the `api`
+subcommand also binds `MATRIX_AGENT_PORT`, which serves only `/chat/v1/*`, `/healthz` and
+`/readyz`. Base path `/chat/v1`; the OpenAPI document is committed as `openapi-agent.json`
+(regenerate with `uv run python -m agents_matrix_connector.api.openapi --agent >
+openapi-agent.json`) and served at `/chat/v1/openapi.json`.
+
+Auth: every path but the probes needs `Authorization: Bearer <token>`, where the sha256 hex of
+the token equals `MATRIX_AGENT_TOKEN_SHA256` (constant-time compare); anything else gets `401
+unauthorized` with `WWW-Authenticate: Bearer`. The token is the only credential: no source
+allowlist applies to this port, so the orchestrator pod reaches it directly. Paths outside
+`/chat/v1` get `404 not_found`. The token and its hash never reach a log line or an error body.
+The UI app on `MATRIX_HTTP_PORT` serves no `/chat/v1` path. Every `/chat/v1` call also carries
+`X-Orch-Session: <session uuid>` (missing or malformed: `401 unauthorized`) and `X-Orch-Slug:
+<slug>` (stored with the send; may be absent). The agent's own token never reaches the
+connector.
+
+Message ids: `m<n>` is a chat message (the `id` the prompt shows on each `<message>`), `s<n>`
+a send of this session. Raw Matrix event ids are never accepted.
+
+Room rule (design D4): a session may post to a room only when both hold:
+
+- (a) the room is policy-allowed for agent sends (see "Let agents start chats in a room"):
+  checked when the api accepts the request, when the bot claims the send and again before
+  each of its Matrix events is sent;
+- (b) the room is bound to the session, or it is unbound, flagged `agents_may_initiate` and the
+  session is bound to no room (an initiation).
+
+Binding rule: a chat room and a session are bound 1:1. A room is bound to at most one session
+and a session to at most one room, through `room_bindings`, whose only writer is the bot. The api
+never writes a binding: an initiation is accepted unbound, and the bot's claim of the send binds
+the room to the session. A room reserved by another session's first run in progress counts as
+bound to another session. The binding is released only when the session is deleted (or when the
+send that created it reached nobody); turning `agents_may_initiate` off does not release it.
+
+Checks run in this order and a refusal queues nothing: `X-Orch-Session` (`401 unauthorized`),
+body (`422 invalid_request`, `422 invalid_key`, `422 invalid_text`), references (`422 bad_reference`), room choice
+(`422 room_required`), (a) (`403 room_not_allowed`), (b) (`409 room_bound`, `403
+room_not_authorised`, `409 session_bound`, in that order), duplicate (`202` with the existing
+send), rate (`429 rate_limited`). The (b) check, the duplicate lookup and the rate count are
+advisory: they are not atomic with the insert, and the bot's claim re-checks (b), refusing a send
+that lost a race with reason `room_bound`, `session_bound` or `room_not_authorised`.
+
+Duplicate rule: a request identical to a send of the same session, room and kind, with the same
+`text` (message) or `key` (reaction) and the same `reply_to` (a reaction's `to`), compared
+exactly, whose status is `queued`, `sending` or `sent` and that was created in the last 60 s,
+answers `202` with the existing send's id and current status and stores nothing, so a retry after
+a timeout never posts twice. A `failed` or `refused` send is not a duplicate. A duplicate is not
+counted by the rate limit and is answered even at the limit.
+
+Rate: at most `MATRIX_AGENT_RATE_PER_MINUTE` sends (messages and reactions together, of any
+status) per session in the last 60 s.
+
+Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `unauthorized` | 401 | the bearer token is missing or wrong, or `X-Orch-Session` is not a uuid |
+| `not_found` | 404 | the id is not one of this session's sends, or the path does not exist |
+| `invalid_request` | 422 | a body field failed validation: `text` empty or over 16000 characters, a wrong type, an unknown field |
+| `invalid_text` | 422 | the message `text` has no non-whitespace character, so it could never be delivered |
+| `invalid_key` | 422 | the reaction `key` is not 1 to 16 code points, or has ASCII, whitespace or control characters |
+| `bad_reference` | 422 | `reply_to` or `to` is not an `m<n>` or `s<n>` this session can reference: unknown, another session's send, a send not yet `sent`, a reaction, of another room than the given `room`, or a raw event id |
+| `room_required` | 422 | no `room`, no `reply_to`, and the session is bound to no room |
+| `room_not_allowed` | 403 | the room is unknown or not policy-allowed for agent sends (both answer the same) |
+| `room_bound` | 409 | the room is bound to (or reserved by) another session |
+| `room_not_authorised` | 403 | the room is unbound and not flagged `agents_may_initiate` |
+| `session_bound` | 409 | the room is unbound and flagged, but the session is already bound to another room |
+| `rate_limited` | 429 | the session reached `MATRIX_AGENT_RATE_PER_MINUTE` sends in the last 60 s |
+| `unavailable` | 503 | the database is unavailable |
+
+Send statuses: `queued` (accepted, waiting for the bot), `sending` (claimed by the bot, being
+delivered), `sent` (every Matrix event delivered), `failed` (delivery failed), `refused` (the bot's
+claim or send-time check refused it). Reasons:
+
+- `room_bound`, `session_bound`, `room_not_authorised`: refused, (b) failed at the bot's claim
+- `room_infrastructure`, `room_encrypted`, `denied: <kind>`, `not_allowed`: refused, (a)
+  failed at the claim or before a Matrix event was sent
+- `forbidden`: failed, the homeserver refused the event; another failure carries the
+  homeserver's errcode, or `send_failed`
+
+### `GET /chat/v1/rooms`
+
+The rooms this session may post to, exactly those passing (a) and (b): its bound room (`bound`
+true) when it passes (a), else, while the session is bound to no room, every unbound flagged
+room passing (a). The bound room comes first, then by `name` (code point order, rooms without a
+name last), then `room_id`. 200 `{"rooms": [{"room_id", "name", "kind", "bound",
+"agents_may_initiate"}]}`; 401 `unauthorized`.
+
+    curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      http://localhost:8001/chat/v1/rooms
+
+### `POST /chat/v1/messages`
+
+Body `{"text": str, "room": str|null, "reply_to": "m<n>"|"s<n>"|null}`: `text` 1 to 16000
+characters, stored unchanged and split into `MATRIX_REPLY_CHUNK_CHARS` chunks by the bot.
+`room` is a Matrix room id; omitted, the room of `reply_to`, else the session's bound room. A
+`reply_to` sends a quoted reply to that message. 202 `{"id": "s<n>", "status": "queued"}` (a
+duplicate: the existing id and its status `queued`, `sending` or `sent`); 401 `unauthorized`;
+422 `invalid_request`, `invalid_text`, `bad_reference` or `room_required`; 403 `room_not_allowed` or
+`room_not_authorised`; 409 `room_bound` or `session_bound`; 429 `rate_limited`; 503
+`unavailable`.
+
+    curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      -H 'content-type: application/json' -d '{"text": "Build finished", "reply_to": "m42"}' \
+      http://localhost:8001/chat/v1/messages
+
+### `POST /chat/v1/reactions`
+
+Body `{"to": "m<n>"|"s<n>", "key": str}`: react to that message with an emoji `key`; the
+reaction goes to the message's room, which passes (a) and (b) like a given room. 202 `{"id":
+"s<n>", "status": "queued"}` (a duplicate: as for messages); 401 `unauthorized`; 422
+`invalid_request`, `invalid_key` or `bad_reference`; 403 `room_not_allowed` or
+`room_not_authorised`; 409 `room_bound` or `session_bound`; 429 `rate_limited`; 503
+`unavailable`.
+
+    curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      -H 'content-type: application/json' -d '{"to": "m42", "key": "\ud83d\udc4d"}' \
+      http://localhost:8001/chat/v1/reactions
+
+### `GET /chat/v1/messages/{id}`
+
+One of this session's sends by `s<n>`: 200 `{"id", "kind" ("message" or "reaction"), "status",
+"reason", "room_id", "created_at", "sent_at"}`; 404 `not_found` for any other id, another
+session's send included; 401 `unauthorized`.
+
+    curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      http://localhost:8001/chat/v1/messages/s7
+
 ## Operations
 
 ### Bot identity (taken over from Hermes)
@@ -227,7 +380,64 @@ allow it, or call the API:
 Allow by `facebook` (the numeric Facebook id) or `user` to cover every chat of one person, or
 by `room` for one chat. A deny rule always wins over an allow rule. Set a preset per room
 (`PUT /matrix/api/v1/rooms/{room_id}/settings`) or one default preset
-(`PUT /matrix/api/v1/settings`); an allowed room with no preset is ignored with `no_preset`.
+(`PUT /matrix/api/v1/settings`); an allowed unbound room with no preset is ignored with
+`no_preset` (see "One session per room, one room per session").
+
+### One session per room, one room per session
+
+A chat room and a session are bound one to one (`room_bindings`): a room has at most one bound
+session and a session at most one bound room. A room gets bound in one of two ways:
+
+- an inbound chat in an unbound room starts a new `mx-<run id>` session from the room's preset
+  (else the default preset) under `MATRIX_MAX_NEW_SESSIONS`; the run reserves the room when it
+  claims the messages, so no agent can initiate there meanwhile, and the new session fills the
+  binding. A first run that ends without a session (for example `preset_not_found`) releases
+  the reservation (`run_failed`);
+- an agent initiates in an unbound room flagged `agents_may_initiate` (see "Let agents start
+  chats in a room"); its first send binds the room to its session, and a send that reached
+  nobody releases it again (`send_failed`).
+
+The user's messages in a bound room always go to the bound session, whatever it is (an `mx-`
+chat session, a hive leader, a webhook or schedule session), and never to any other session; a
+preset is needed only to start a new session in an unbound room. A session that has no other run
+in the room gets the untrusted-input preamble with its first batch. A busy session (for example a
+hive leader in a long turn) gets the batch queued behind its current turn; the bot follows that
+message until the session replies or the run timeout (`MATRIX_RUN_TIMEOUT_SECONDS`, default 1800
+s) passes, and meanwhile the room's later messages stay `new` and go in the next batch.
+
+Only deleting the session releases the binding (`session_gone`): once the session is deleted
+(not found, or being deleted), the bot releases the binding at the room's next message, and
+otherwise within about a minute through a sweep of the bound sessions. The room is then unbound:
+the next message starts a new `mx-` session (a preset is needed), and an agent may initiate
+there if the room is flagged. Turning `agents_may_initiate` off or adding a deny rule does not
+release the binding (a deny rule still stops every agent send and every inbound message). A
+session check the orchestrator refuses keeps the binding and the messages `new`; an unavailable
+orchestrator is retried on the next tick.
+
+### Let agents start chats in a room
+
+Agents may post only to policy-allowed rooms that are bound to their session, or that are
+unbound and flagged `agents_may_initiate` (off by default). The flag lets an agent start a chat
+only while the room is unbound; its first send binds the room to its session. Only the owner DM
+`!iLWrAwaTMYnINJsyNv:szymonrichert.pl` gets the flag, set once after deploy, through the
+agents-web toggle once deployed, or through a port-forward to the api container (bypassing its
+SSO sidecar):
+
+    kubectl -n agents port-forward deploy/agents-matrix-connector-api 8000:8000 &
+    curl -s -X PUT -H 'content-type: application/json' -d '{"agents_may_initiate": true}' \
+      'http://localhost:8000/matrix/api/v1/rooms/!iLWrAwaTMYnINJsyNv:szymonrichert.pl/settings'
+
+The answer shows `agents_may_initiate` true and the room's `binding`. Send
+`{"agents_may_initiate": false}` the same way to turn it off; turning it off does not release a
+binding.
+
+A room is policy-allowed for agent sends through the same rules as inbound chats, read for
+a message with no sender: a room or alias allow rule allows it, or one current member that the
+rules allow does (a `facebook` or `user` allow rule, or the default `allow` policy). Any denied
+current member denies the room, as does a room or alias deny rule; an infrastructure or
+encrypted room is never allowed. Current members are those who have joined, leaving out the bot
+user, its self identities and the bridge bots. A room with no such member and no room or alias
+allow rule is `not_allowed`.
 
 ### Read receipts
 

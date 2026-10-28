@@ -284,6 +284,81 @@ async def test_txn_id_dedupe(fake, client):
     assert bodies == ["hello", "second"]
 
 
+async def test_send_event_type_and_content(fake, recorder, client):
+    fake.add_room(ROOM, [], {BOT: "Bot", ALICE: "Alice"})
+    reply = {
+        "msgtype": "m.text",
+        "body": "answer",
+        "m.relates_to": {"m.in_reply_to": {"event_id": "$target"}},
+    }
+    reaction = {
+        "m.relates_to": {"rel_type": "m.annotation", "event_id": "$target", "key": "\U0001f44d"}
+    }
+
+    reply_id = await client.send_event(ROOM, "m.room.message", "txn/r", reply)
+    reaction_id = await client.send_event(ROOM, "m.reaction", "txn/e", reaction)
+    assert reply_id.startswith("$") and reaction_id.startswith("$") and reply_id != reaction_id
+    assert fake.sent(ROOM) == [reply, reaction]
+
+    room = "%21a%3Ahs"
+    assert recorder.calls() == [
+        ("PUT", f"{API}/rooms/{room}/send/m.room.message/txn%2Fr"),
+        ("PUT", f"{API}/rooms/{room}/send/m.reaction/txn%2Fe"),
+    ]
+    assert [json.loads(r.content) for r in recorder.requests] == [reply, reaction]
+    sync = await client.sync(None, 0, None)
+    timeline = sync["rooms"]["join"][ROOM]["timeline"]["events"]
+    assert [(e["type"], e["event_id"]) for e in timeline if e["type"] != "m.room.member"][-2:] == [
+        ("m.room.message", reply_id),
+        ("m.reaction", reaction_id),
+    ]
+
+    again = await client.send_event(ROOM, "m.reaction", "txn/e", reaction)
+    assert again == reaction_id
+    assert fake.sent(ROOM) == [reply, reaction]
+
+    recorder.requests.clear()
+    text_id = await client.send_text(ROOM, "txn/t", "plain")
+    assert text_id.startswith("$")
+    assert recorder.calls() == [("PUT", f"{API}/rooms/{room}/send/m.room.message/txn%2Ft")]
+    assert json.loads(recorder.requests[0].content) == {"msgtype": "m.text", "body": "plain"}
+
+
+async def test_send_event_errors(fake, client):
+    fake.add_room(ROOM, [], {BOT: "Bot", ALICE: "Alice"})
+    content = {"m.relates_to": {"rel_type": "m.annotation", "event_id": "$e", "key": "x"}}
+    cases = [
+        (401, None, MatrixAuthError, "M_UNKNOWN_TOKEN"),
+        (403, "M_UNKNOWN_TOKEN", MatrixAuthError, "M_UNKNOWN_TOKEN"),
+        (403, None, MatrixForbidden, "M_FORBIDDEN"),
+        (404, None, MatrixNotFound, "M_NOT_FOUND"),
+        (400, "M_BAD_JSON", MatrixError, "M_BAD_JSON"),
+        (500, None, MatrixUnavailable, "M_UNKNOWN"),
+    ]
+    for status, errcode, cls, expected_errcode in cases:
+        fake.fail_next("send_text", status, errcode)
+        with pytest.raises(MatrixError) as exc:
+            await client.send_event(ROOM, "m.reaction", "t1", content)
+        assert type(exc.value) is cls, (status, errcode)
+        assert exc.value.status == status
+        assert exc.value.errcode == expected_errcode
+    assert fake.sent(ROOM) == []
+
+    fake.add_room("!other:hs", [], {ALICE: "Alice"})
+    with pytest.raises(MatrixForbidden):
+        await client.send_event("!other:hs", "m.reaction", "t2", content)
+    with pytest.raises(MatrixNotFound):
+        await client.send_event("!nowhere:hs", "m.reaction", "t3", content)
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    async with MatrixClient(BASE, TOKEN, transport=httpx.MockTransport(refuse)) as down:
+        with pytest.raises(MatrixUnavailable) as transport:
+            await down.send_event(ROOM, "m.reaction", "t4", content)
+    assert transport.value.status is None
+
+
 async def test_join_needs_invite(fake, client):
     fake.add_room(ROOM, [], {ALICE: "Alice"})
     with pytest.raises(MatrixForbidden) as exc:

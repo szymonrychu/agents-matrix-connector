@@ -9,9 +9,10 @@ from agents_common.fake_orchestrator import FakeOrchestrator
 from agents_common.orchestrator import OrchestratorClient
 
 from agents_matrix_connector.chunks import split
-from agents_matrix_connector.db import inbound, runs
+from agents_matrix_connector.db import inbound, runs, sends
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
 from agents_matrix_connector.matrix import MatrixAuthError, MatrixClient
+from agents_matrix_connector.sender import Sender
 from agents_matrix_connector.settings import BotSettings
 from agents_matrix_connector.tracker import NOTICE, Tracker
 
@@ -32,16 +33,26 @@ class Clock:
 
 
 class SpyMatrix:
-    """Records the bot's send and typing calls and forwards them to the real client."""
+    """Records the bot's send and typing calls and forwards them to the real client.
+
+    `events` records every `send_event` call; `sends` keeps the text view
+    `(room, txn id, body)` of each `m.room.message` sent either way."""
 
     def __init__(self, client: MatrixClient):
         self._client = client
         self.sends: list[tuple[str, str, str]] = []
+        self.events: list[tuple[str, str, str, dict]] = []
         self.typings: list[tuple[str, bool, int]] = []
 
     async def send_text(self, room_id: str, txn_id: str, body: str) -> str:
         self.sends.append((room_id, txn_id, body))
         return await self._client.send_text(room_id, txn_id, body)
+
+    async def send_event(self, room_id: str, event_type: str, txn_id: str, content: dict) -> str:
+        self.events.append((room_id, event_type, txn_id, content))
+        if event_type == "m.room.message":
+            self.sends.append((room_id, txn_id, content["body"]))
+        return await self._client.send_event(room_id, event_type, txn_id, content)
 
     async def typing(
         self, user_id: str, room_id: str, typing: bool, timeout_ms: int = 30000
@@ -240,6 +251,153 @@ async def test_completed_turn_replies(tracker, pool, orch, orch_client, hs, matr
     assert await outbound_rows(pool, "!c:hs") == []
     assert bodies(hs, "!c:hs") == []
     assert hs.typing_state("!c:hs") is False
+
+
+async def put_send(
+    pool, session_id, text, *, status="sent", kind="message", at=T0, room=ROOM
+) -> int:
+    """A send of the session, with the given status and creation time (reactions carry `text`
+    as their key)."""
+    async with pool.connection() as conn:
+        send_id = await sends.insert(
+            conn,
+            session_id=session_id,
+            slug=None,
+            kind=kind,
+            room_id=room,
+            text=text if kind == "message" else None,
+            key=text if kind == "reaction" else None,
+            reply_to=None,
+            ref_event_id=None,
+        )
+        await conn.execute(
+            "UPDATE sends SET status = %s, created_at = %s WHERE id = %s", (status, at, send_id)
+        )
+    return send_id
+
+
+async def set_send_status(pool, send_id, status) -> None:
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE sends SET status = %s WHERE id = %s", (status, send_id))
+
+
+async def test_final_text_already_sent_is_not_posted(tracker, pool, orch, orch_client, hs, matrix):
+    run_id, message_id, session = await seed(pool, orch, orch_client, bodies=("hi", "there"))
+    await put_send(pool, session, "something else", at=T0 + timedelta(minutes=1))
+    # Created exactly at the run's start, compared stripped on both sides.
+    await put_send(pool, session, "  The build passed\n", at=T0)
+    orch.complete_turn(message_id, "The build passed\n\n")
+    await tracker.tick()
+    assert await run_state(pool, run_id) == ("handled", "already_sent")
+    assert await row_states(pool) == [
+        ("handled", "already_sent", run_id),
+        ("handled", "already_sent", run_id),
+    ]
+    assert await outbound_rows(pool) == []
+    assert bodies(hs) == []
+    assert matrix.sends == []
+    assert hs.typing_state(ROOM) is False
+
+
+async def test_final_text_posted_unless_already_sent(tracker, pool, orch, orch_client, hs):
+    during = T0 + timedelta(minutes=1)
+    cases = []
+    for room, text, make in (
+        (ROOM, "different", lambda session: put_send(pool, session, "other text", at=during)),
+        (
+            "!b:hs",
+            "before the run",
+            lambda session: put_send(pool, session, "before the run", at=T0 - timedelta(seconds=1)),
+        ),
+        (
+            "!c:hs",
+            "reaction",
+            lambda session: put_send(pool, session, "reaction", kind="reaction", at=during),
+        ),
+        (
+            "!d:hs",
+            "another session",
+            lambda session: put_send(pool, uuid.uuid4(), "another session", at=during),
+        ),
+    ):
+        run_id, message_id, session = await seed(pool, orch, orch_client, room=room)
+        await make(session)
+        orch.complete_turn(message_id, text)
+        cases.append((run_id, room, text))
+    await tracker.tick()
+    for run_id, room, text in cases:
+        assert await run_state(pool, run_id) == ("handled", None)
+        assert await outbound_rows(pool, room) == [
+            ("reply", text, f"mxc-{run_id}-1", "sent", None, True)
+        ]
+        assert bodies(hs, room) == [text]
+
+
+@pytest.mark.parametrize("status", ["failed", "refused"])
+async def test_final_text_posted_when_matching_send_failed(
+    tracker, pool, orch, orch_client, hs, status
+):
+    run_id, message_id, session = await seed(pool, orch, orch_client)
+    await put_send(pool, session, "Hello", status=status, at=T0 + timedelta(minutes=1))
+    orch.complete_turn(message_id, "Hello")
+    await tracker.tick()
+    assert await run_state(pool, run_id) == ("handled", None)
+    assert await outbound_rows(pool) == [("reply", "Hello", f"mxc-{run_id}-1", "sent", None, True)]
+    assert bodies(hs) == ["Hello"]
+
+
+async def test_pending_matching_send_delays_close(tracker, pool, orch, orch_client, hs):
+    at = T0 + timedelta(minutes=1)
+    queued_run, queued_message, queued_session = await seed(pool, orch, orch_client)
+    sending_run, sending_message, sending_session = await seed(
+        pool, orch, orch_client, room="!b:hs"
+    )
+    queued_send = await put_send(pool, queued_session, "Hello", status="queued", at=at)
+    sending_send = await put_send(
+        pool, sending_session, "Hello", status="sending", at=at, room="!b:hs"
+    )
+    orch.complete_turn(queued_message, "Hello")
+    orch.complete_turn(sending_message, "Hello")
+
+    for _ in range(2):
+        await tracker.tick()
+        for run_id, room in ((queued_run, ROOM), (sending_run, "!b:hs")):
+            assert await run_state(pool, run_id) == ("in-progress", None)
+            assert await row_states(pool, room) == [("in-progress", None, run_id)]
+            assert await outbound_rows(pool, room) == []
+            assert bodies(hs, room) == []
+            assert hs.typing_state(room) is True
+
+    # The queued send fails: the final answer is posted. The sending one is sent: no post.
+    await set_send_status(pool, queued_send, "failed")
+    await set_send_status(pool, sending_send, "sent")
+    await tracker.tick()
+    assert await run_state(pool, queued_run) == ("handled", None)
+    assert await outbound_rows(pool) == [
+        ("reply", "Hello", f"mxc-{queued_run}-1", "sent", None, True)
+    ]
+    assert bodies(hs) == ["Hello"]
+    assert await run_state(pool, sending_run) == ("handled", "already_sent")
+    assert await row_states(pool, "!b:hs") == [("handled", "already_sent", sending_run)]
+    assert await outbound_rows(pool, "!b:hs") == []
+    assert bodies(hs, "!b:hs") == []
+    assert hs.typing_state("!b:hs") is False
+
+
+async def test_pending_match_bounded_by_run_timeout(tracker, pool, orch, orch_client, hs, clock):
+    run_id, message_id, session = await seed(pool, orch, orch_client)
+    await put_send(pool, session, "Hello", status="sending", at=T0 + timedelta(minutes=1))
+    orch.complete_turn(message_id, "Hello")
+    clock.at = T0 + timedelta(seconds=600)  # exactly the timeout: still within it
+    await tracker.tick()
+    assert await run_state(pool, run_id) == ("in-progress", None)
+    assert bodies(hs) == []
+
+    clock.at = T0 + timedelta(seconds=601)
+    await tracker.tick()
+    assert await run_state(pool, run_id) == ("handled", None)
+    assert await outbound_rows(pool) == [("reply", "Hello", f"mxc-{run_id}-1", "sent", None, True)]
+    assert bodies(hs) == ["Hello"]
 
 
 async def test_resend_is_idempotent(
@@ -513,3 +671,115 @@ async def test_daily_prune(tracker, pool, clock, hs):
     assert ("later", "handled") not in runs_left and ("later", "in-progress") in runs_left
     assert ("later-sent",) not in outbound_left and ("later-pending",) in outbound_left
     assert len(inbound_left) == 6
+
+
+async def test_agent_rows_rechecked_before_send(
+    tracker, pool, orch, orch_client, hs, matrix, clock
+):
+    """Agent rows already pending when (a) turns to deny are not sent: the send is refused with
+    the policy reason, its pending rows fail, an initiation that sent nothing is released; run
+    replies are not re-checked."""
+    run_id, message_id, _ = await seed(pool, orch, orch_client)
+    initiator, bound, partly = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    async with pool.connection() as conn:
+        for room in ("!b:hs", "!c:hs", "!d:hs"):
+            await conn.execute(
+                "INSERT INTO rooms (room_id, kind, membership, member_count)"
+                " VALUES (%s, 'dm', 'join', 1)",
+                (room,),
+            )
+            await conn.execute(
+                "INSERT INTO users (user_id, facebook_id) VALUES (%s, '1') ON CONFLICT DO NOTHING",
+                (ALICE,),
+            )
+            await conn.execute(
+                "INSERT INTO room_members (room_id, user_id, membership) VALUES (%s, %s, 'join')",
+                (room, ALICE),
+            )
+            await conn.execute(
+                "INSERT INTO access_rules (list, kind, value) VALUES ('allow', 'room', %s)",
+                (room,),
+            )
+            await conn.execute(
+                "INSERT INTO room_settings (room_id, agents_may_initiate) VALUES (%s, true)",
+                (room,),
+            )
+        await conn.execute(
+            "INSERT INTO room_bindings (room_id, session_id, origin, send_id)"
+            " VALUES ('!c:hs', %s, 'agent', 999)",
+            (bound,),
+        )
+
+        async def queue(session, room, text):
+            return await sends.insert(
+                conn,
+                session_id=session,
+                slug="hive-1",
+                kind="message",
+                room_id=room,
+                text=text,
+                key=None,
+                reply_to=None,
+                ref_event_id=None,
+            )
+
+        initiation = await queue(initiator, "!b:hs", "first contact")
+        into_bound = await queue(bound, "!c:hs", f"{'A' * 60}\n\n{'B' * 60}")
+        partial = await queue(partly, "!d:hs", f"{'C' * 60}\n\n{'D' * 60}")
+
+    sender = Sender(pool, make_settings(), now=clock)
+    await sender.tick()
+    orch.complete_turn(message_id, "Hello")
+    hs.fail_next("send_text", 503)  # the homeserver is down: every row stays pending
+    await tracker.tick()
+    assert [status for *_, status, _, _ in await agent_rows(pool)] == ["pending"] * 5
+    async with pool.connection() as conn:
+        [first_d] = [
+            row.id for row in await runs.pending(conn) if row.txn_id.endswith(f"{partial}-1")
+        ]
+        await runs.mark_sent(conn, first_d, "$sent-before")  # an earlier pass sent chunk 1
+        await conn.execute(
+            "INSERT INTO access_rules (list, kind, value) VALUES ('deny', 'user', %s)", (ALICE,)
+        )
+
+    await tracker.tick()
+    assert await agent_rows(pool) == [
+        (initiation, f"mxa-{initiation}-1", "failed", "denied: user", False),
+        (into_bound, f"mxa-{into_bound}-1", "failed", "denied: user", False),
+        (into_bound, f"mxa-{into_bound}-2", "failed", "denied: user", False),
+        (partial, f"mxa-{partial}-1", "sent", None, True),
+        (partial, f"mxa-{partial}-2", "failed", "denied: user", False),
+    ]
+    for send_id in (initiation, into_bound, partial):
+        assert await fetch(pool, "SELECT status, reason FROM sends WHERE id = %s", send_id) == [
+            ("refused", "denied: user")
+        ]
+    assert hs.sent("!b:hs") == hs.sent("!c:hs") == hs.sent("!d:hs") == []
+    assert await fetch(
+        pool,
+        "SELECT room_id, session_id, send_id, released_at IS NOT NULL, release_reason"
+        " FROM room_bindings ORDER BY id",
+    ) == [
+        ("!c:hs", bound, 999, False, None),
+        ("!b:hs", initiator, initiation, True, "send_failed"),
+        ("!d:hs", partly, partial, False, None),
+    ]
+
+    # The run's reply is not re-checked and goes out as before, through send_event.
+    assert await run_state(pool, run_id) == ("handled", None)
+    assert await outbound_rows(pool) == [("reply", "Hello", f"mxc-{run_id}-1", "sent", None, True)]
+    assert bodies(hs) == ["Hello"]
+    assert matrix.events[-1] == (
+        ROOM,
+        "m.room.message",
+        f"mxc-{run_id}-1",
+        {"msgtype": "m.text", "body": "Hello"},
+    )
+
+
+async def agent_rows(pool) -> list[tuple]:
+    return await fetch(
+        pool,
+        "SELECT send_id, txn_id, status, reason, event_id IS NOT NULL FROM outbound"
+        " WHERE send_id IS NOT NULL ORDER BY id",
+    )

@@ -9,7 +9,9 @@ poll there and no read races a request handler.
 
 import asyncio
 import contextlib
+import hashlib
 import os
+import secrets
 import shutil
 import signal
 import socket
@@ -19,6 +21,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -39,6 +42,8 @@ BOT = f"@agents:{SERVER}"
 BRIDGE_BOT = f"@facebookbot:{SERVER}"
 WAIT_SECONDS = 30.0
 API = "/matrix/api/v1"
+CHAT = "/chat/v1"
+CHUNK_CHARS = 4000
 SCRIPT = "agents-matrix-connector"
 
 
@@ -142,7 +147,8 @@ class Stack:
         self.orch = FakeOrchestrator(ORCH_TOKEN)
         self.hs_server = Served(self.hs.app, "fake homeserver")
         self.orch_server = Served(self.orch.app, "fake orchestrator")
-        self.api_port, self.bot_port = free_port(), free_port()
+        self.api_port, self.bot_port, self.agent_port = free_port(), free_port(), free_port()
+        self.agent_token = secrets.token_hex(32)
         self.procs: dict[str, subprocess.Popen] = {}
         self.http = httpx.Client(timeout=30)
         self.preset_id = ""
@@ -162,6 +168,9 @@ class Stack:
             "MATRIX_BRIDGE_BOTS": BRIDGE_BOT,
             "MATRIX_HTTP_HOST": "127.0.0.1",
             "MATRIX_HTTP_PORT": str(port),
+            "MATRIX_AGENT_PORT": str(self.agent_port),
+            "MATRIX_AGENT_TOKEN_SHA256": hashlib.sha256(self.agent_token.encode()).hexdigest(),
+            "MATRIX_REPLY_CHUNK_CHARS": str(CHUNK_CHARS),
             "MATRIX_POLL_SECONDS": "0.2",
             "MATRIX_SYNC_TIMEOUT_SECONDS": "1",
             "MATRIX_SHUTDOWN_GRACE_SECONDS": "5",
@@ -193,6 +202,7 @@ class Stack:
         self.procs["api"] = self._spawn("api", self.api_port)
         self.start_bot()
         wait_for(lambda: self._ready("api", self.api_port), "api readyz")
+        wait_for(lambda: self._ready("api", self.agent_port), "agent listener readyz")
 
     def start_bot(self) -> None:
         """Start the bot and wait until it holds the lock and finished its first sync."""
@@ -289,6 +299,27 @@ class Stack:
     def discard_session(self, session_id: str) -> None:
         self.orch_server.call(self.orch.discard_session, session_id)
 
+    def remove_session(self, session_id: str) -> None:
+        self.orch_server.call(self.orch.remove_session, session_id)
+
+    def add_session(self, slug: str) -> dict[str, Any]:
+        """A running session the connector did not create (a slug without the `mx-` prefix)."""
+
+        def create() -> dict[str, Any]:
+            session_id = str(uuid.uuid4())
+            session = {
+                "id": session_id,
+                "slug": slug,
+                "preset_id": self.preset_id,
+                "preset_name": "chat",
+                "desired": "active",
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+            self.orch.sessions[session_id] = session
+            return dict(session)
+
+        return self.orch_server.call(create)
+
     def wait_session(self, count: int) -> list[dict[str, Any]]:
         """Wait until the orchestrator holds `count` sessions; returns them oldest first."""
         return wait_for(
@@ -359,9 +390,69 @@ class Stack:
         assert r.status_code == 200, r.text
         assert r.json() == {"default_preset_id": self.preset_id}
 
+    def flag_room(self, room_id: str) -> None:
+        """Let agents start a chat in the room (`agents_may_initiate`)."""
+        r = self.http.put(
+            f"{self.api}/rooms/{quote(room_id, safe='')}/settings",
+            json={"agents_may_initiate": True},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["agents_may_initiate"] is True
+
     def allow_room(self, room_id: str) -> None:
         self.add_rule("allow", "room", room_id)
         self.set_default_preset()
+
+    # The agent, through the agent listener's /chat/v1 --------------------------------------
+
+    def chat(
+        self,
+        method: str,
+        path: str,
+        session: dict[str, Any],
+        *,
+        json: dict[str, Any] | None = None,
+        token: str | None = None,
+    ) -> httpx.Response:
+        """A `/chat/v1` call for `session` with the test bearer, the session id and its slug."""
+        return self.http.request(
+            method,
+            f"http://127.0.0.1:{self.agent_port}{CHAT}{path}",
+            json=json,
+            headers={
+                "Authorization": f"Bearer {token or self.agent_token}",
+                "X-Orch-Session": session["id"],
+                "X-Orch-Slug": session["slug"],
+            },
+        )
+
+    def send(
+        self,
+        session: dict[str, Any],
+        body: str,
+        *,
+        room: str | None = None,
+        reply_to: str | None = None,
+    ) -> httpx.Response:
+        payload = {"text": body, "room": room, "reply_to": reply_to}
+        return self.chat(
+            "POST", "/messages", session, json={k: v for k, v in payload.items() if v is not None}
+        )
+
+    def react(self, session: dict[str, Any], to: str, key: str) -> httpx.Response:
+        return self.chat("POST", "/reactions", session, json={"to": to, "key": key})
+
+    def wait_send(self, session: dict[str, Any], send_id: str, status: str) -> dict[str, Any]:
+        """Wait until the session's send has this status; returns its status view."""
+
+        def probe() -> dict[str, Any] | None:
+            r = self.chat("GET", f"/messages/{send_id}", session)
+            assert r.status_code == 200, r.text
+            view = r.json()
+            assert view["status"] not in ("failed", "refused") or view["status"] == status, view
+            return view if view["status"] == status else None
+
+        return wait_for(probe, f"send {send_id} to be {status}")
 
 
 @pytest.fixture

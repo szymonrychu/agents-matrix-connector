@@ -1,4 +1,8 @@
-"""Agent runs per room and the outbound reply queue (bot worker is the only writer).
+"""Agent runs per room and the outbound queue (bot worker is the only writer).
+
+Outbound rows are the replies and notices of runs (`run_id`) and the messages and reactions of
+agent sends (`send_id`); each carries its Matrix event type and, for a quoted reply or a
+reaction, its `m.relates_to` relation.
 
 Run and outbound rows change status only through status-guarded UPDATEs. Writers that take a
 connection never commit, so the caller owns the transaction; `PgRunStore` takes the pool and
@@ -11,11 +15,13 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 import psycopg
 from agents_common.db.queue import transition
 from agents_common.runs import RunId, RunRef, RunStatus
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 _RUN_COLUMNS = (
@@ -23,7 +29,8 @@ _RUN_COLUMNS = (
     " started_at, finished_at"
 )
 _OUTBOUND_COLUMNS = (
-    "id, room_id, run_id, kind, body, txn_id, event_id, status, reason, created_at, sent_at"
+    "id, room_id, run_id, send_id, kind, event_type, body, relates_to, txn_id, event_id, status,"
+    " reason, created_at, sent_at"
 )
 
 
@@ -31,7 +38,7 @@ _OUTBOUND_COLUMNS = (
 class RunRow:
     id: int
     room_id: str
-    preset_id: uuid.UUID
+    preset_id: uuid.UUID | None
     kind: str
     slug: str | None
     session_id: uuid.UUID | None
@@ -47,8 +54,11 @@ class OutboundRow:
     id: int
     room_id: str
     run_id: int | None
+    send_id: int | None
     kind: str
+    event_type: str
     body: str
+    relates_to: dict[str, Any] | None
     txn_id: str
     event_id: str | None
     status: str
@@ -64,26 +74,26 @@ class PgRunStore:
         self._pool = pool
 
     async def set_session(self, run_id: RunId, session_id: str) -> None:
-        await self._update("session_id = %s::uuid", session_id, run_id)
+        async with self._pool.connection() as conn:
+            await set_session(conn, int(run_id), session_id)
 
     async def set_message(self, run_id: RunId, message_id: str) -> None:
-        await self._update("message_id = %s", message_id, run_id)
+        async with self._pool.connection() as conn:
+            await conn.execute(
+                "UPDATE runs SET message_id = %s WHERE id = %s AND status = 'in-progress'",
+                (message_id, int(run_id)),
+            )
 
     async def finish(self, run_id: RunId, status: RunStatus, reason: str | None) -> bool:
         async with self._pool.connection() as conn:
             return await finish(conn, int(run_id), status, reason)
 
-    async def _update(self, assignment: str, value: str, run_id: RunId) -> None:
-        async with self._pool.connection() as conn:
-            await conn.execute(
-                f"UPDATE runs SET {assignment} WHERE id = %s AND status = 'in-progress'",
-                (value, int(run_id)),
-            )
-
 
 async def create_run(
-    conn: psycopg.AsyncConnection, *, room_id: str, preset_id: str, kind: str
+    conn: psycopg.AsyncConnection, *, room_id: str, preset_id: str | None, kind: str
 ) -> RunRef:
+    """Insert an in-progress run with slug `mx-<id>`. A follow run may have no preset (NULL, and
+    `""` in its RunRef, which `deliver` never reads); a first run always has one (CHECK)."""
     if kind not in ("first", "follow"):
         raise ValueError(f"run kind must be first or follow, got {kind!r}")
     cur = await conn.execute(
@@ -99,23 +109,39 @@ async def create_run(
     return RunRef(
         id=run_id,
         slug=slug,
-        preset_id=preset_id,
+        preset_id=preset_id or "",
         session_id=None,
         message_id=None,
         started_at=started_at,
     )
 
 
-async def latest_session(
-    conn: psycopg.AsyncConnection, room_id: str
-) -> tuple[int, uuid.UUID] | None:
+async def set_session(
+    conn: psycopg.AsyncConnection, run_id: int, session_id: uuid.UUID | str
+) -> str | None:
+    """Store the session of an in-progress run; its slug, or None when it is not in progress."""
     cur = await conn.execute(
-        "SELECT id, session_id FROM runs WHERE room_id = %s AND session_id IS NOT NULL"
-        " ORDER BY id DESC LIMIT 1",
-        (room_id,),
+        "UPDATE runs SET session_id = %s::uuid WHERE id = %s AND status = 'in-progress'"
+        " RETURNING coalesce(slug, 'mx-' || id)",
+        (str(session_id), run_id),
     )
     row = await cur.fetchone()
-    return (row[0], row[1]) if row else None
+    return row[0] if row else None
+
+
+async def has_other_run(
+    conn: psycopg.AsyncConnection,
+    session_id: uuid.UUID | str,
+    room_id: str,
+    exclude_run_id: int,
+) -> bool:
+    """Whether the session has a run in the room other than `exclude_run_id`, of any status."""
+    cur = await conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM runs"
+        " WHERE session_id = %s::uuid AND room_id = %s AND id <> %s)",
+        (str(session_id), room_id, exclude_run_id),
+    )
+    return (await cur.fetchone())[0]
 
 
 async def in_progress(conn: psycopg.AsyncConnection) -> list[RunRow]:
@@ -149,32 +175,53 @@ async def finish(
     )
 
 
+def _txn_ids(kind: str, run_id: int | None, send_id: int | None, chunk_count: int) -> list[str]:
+    """The deterministic transaction ids of a kind: `mxc-` for a run, `mxa-` for a send."""
+    if kind in ("reply", "notice"):
+        if run_id is None or send_id is not None:
+            raise ValueError(f"a {kind} belongs to a run and no send")
+    elif kind in ("agent", "reaction"):
+        if send_id is None or run_id is not None:
+            raise ValueError(f"an {kind} row belongs to a send and no run")
+    else:
+        raise ValueError(f"outbound kind must be reply, notice, agent or reaction, got {kind!r}")
+    if kind in ("notice", "reaction") and chunk_count != 1:
+        raise ValueError(f"a {kind} is exactly one chunk")
+    if kind == "reply":
+        return [f"mxc-{run_id}-{n}" for n in range(1, chunk_count + 1)]
+    if kind == "notice":
+        return [f"mxc-{run_id}-notice"]
+    if kind == "agent":
+        return [f"mxa-{send_id}-{n}" for n in range(1, chunk_count + 1)]
+    return [f"mxa-{send_id}-r"]
+
+
 async def add_outbound(
     conn: psycopg.AsyncConnection,
     *,
     room_id: str,
-    run_id: int,
+    run_id: int | None = None,
+    send_id: int | None = None,
     kind: str,
     chunks: Sequence[str],
+    event_type: str = "m.room.message",
+    relates_to: dict[str, Any] | None = None,
 ) -> list[int]:
-    """Store the chunks pending; re-adding the same run's chunks returns the existing ids."""
-    if kind == "reply":
-        txn_ids = [f"mxc-{run_id}-{n}" for n in range(1, len(chunks) + 1)]
-    elif kind == "notice":
-        if len(chunks) != 1:
-            raise ValueError("a notice is exactly one chunk")
-        txn_ids = [f"mxc-{run_id}-notice"]
-    else:
-        raise ValueError(f"outbound kind must be reply or notice, got {kind!r}")
+    """Store the chunks pending, `relates_to` on the first only; re-adding the same chunks
+    returns the existing ids. Replies and notices belong to a run, agent messages and reactions
+    to a send."""
+    txn_ids = _txn_ids(kind, run_id, send_id, len(chunks))
     ids = []
-    for txn_id, body in zip(txn_ids, chunks, strict=True):
+    for n, (txn_id, body) in enumerate(zip(txn_ids, chunks, strict=True)):
+        relation = Jsonb(relates_to) if relates_to is not None and n == 0 else None
         await conn.execute(
             """
-            INSERT INTO outbound (room_id, run_id, kind, body, txn_id, status)
-            VALUES (%s, %s, %s, %s, %s, 'pending')
+            INSERT INTO outbound (room_id, run_id, send_id, kind, event_type, body, relates_to,
+                                  txn_id, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending')
             ON CONFLICT (txn_id) DO NOTHING
             """,
-            (room_id, run_id, kind, body, txn_id),
+            (room_id, run_id, send_id, kind, event_type, body, relation, txn_id),
         )
         cur = await conn.execute("SELECT id FROM outbound WHERE txn_id = %s", (txn_id,))
         ids.append((await cur.fetchone())[0])
@@ -203,6 +250,25 @@ async def mark_sent(conn: psycopg.AsyncConnection, outbound_id: int, event_id: s
 
 async def mark_failed(conn: psycopg.AsyncConnection, outbound_id: int, reason: str) -> bool:
     return await transition(conn, "outbound", outbound_id, "pending", "failed", reason=reason)
+
+
+async def fail_pending_of_send(conn: psycopg.AsyncConnection, send_id: int, reason: str) -> int:
+    """Fail every still-pending row of the send; the number of rows failed."""
+    cur = await conn.execute(
+        "SELECT id FROM outbound WHERE send_id = %s AND status = 'pending' ORDER BY id",
+        (send_id,),
+    )
+    failed = 0
+    for (outbound_id,) in await cur.fetchall():
+        failed += await mark_failed(conn, outbound_id, reason)
+    return failed
+
+
+async def count_sent_of_send(conn: psycopg.AsyncConnection, send_id: int) -> int:
+    cur = await conn.execute(
+        "SELECT count(*) FROM outbound WHERE send_id = %s AND status = 'sent'", (send_id,)
+    )
+    return (await cur.fetchone())[0]
 
 
 async def list_outbound(

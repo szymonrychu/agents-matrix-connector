@@ -4,14 +4,21 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
-from agents_common.orchestrator import OrchestratorClient
+from agents_common.orchestrator import (
+    NotFound,
+    OrchestratorClient,
+    OrchestratorError,
+    OrchestratorUnavailable,
+    Session,
+)
 
-from agents_matrix_connector.db import inbound, runs
+from agents_matrix_connector.db import bindings, inbound, runs
+from agents_matrix_connector.db.bindings import BindingRow
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
 from agents_matrix_connector.matrix import MatrixClient
 from agents_matrix_connector.prompt import PREAMBLE
 from agents_matrix_connector.settings import BotSettings
-from agents_matrix_connector.worker import Worker
+from agents_matrix_connector.worker import Worker, binding_state, check_action
 
 T0 = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
 TOKEN = "syt_worker_test_token"
@@ -20,6 +27,7 @@ ALICE = "@facebook_111:hs"
 DM = "!dm:hs"
 OTHER = "!other:hs"
 THIRD = "!third:hs"
+FOURTH = "!fourth:hs"
 
 
 class Clock:
@@ -223,7 +231,7 @@ async def test_first_dispatch_batches_room(conn, fake, preset, make_worker):
     assert str(message["id"]) == message_id
     text = message["text"]
     assert text.startswith(PREAMBLE)
-    assert '<chat room="Alice" kind="dm">' in text
+    assert f'<chat room="Alice" kind="dm" room_id="{DM}">' in text
     assert text.index("hello one") < text.index("hello &lt;two&gt;")
     assert 'facebook_id="111"' in text
     assert text.endswith(marker(run_id))
@@ -555,3 +563,511 @@ async def test_orchestrator_unavailable_retries_with_stored_ids(
     assert message_id is not None and status == "in-progress"
     texts = [m["text"] for m in session_messages(fake, session_id)]
     assert len(texts) == 2 and texts[1].endswith(marker(follow_id))
+
+
+# The hard 1:1 room-session binding (design D9).
+
+
+def add_session(fake, slug: str, preset_id=None) -> str:
+    """A running orchestrator session that this connector did not create (a hive leader, a
+    webhook or schedule session)."""
+    sid = str(uuid.uuid4())
+    fake.sessions[sid] = {
+        "id": sid,
+        "slug": slug,
+        "preset_id": None if preset_id is None else str(preset_id),
+        "preset_name": None,
+        "desired": "active",
+        "created_at": T0.isoformat(),
+    }
+    return sid
+
+
+async def bind_agent(conn, room_id: str, session_id: str, send_id: int = 1) -> None:
+    """What the sender does when an agent initiates in an unbound flagged room."""
+    outcome = await bindings.bind_for_send(
+        conn,
+        room_id=room_id,
+        session_id=uuid.UUID(session_id),
+        slug=f"slug-{session_id[:4]}",
+        send_id=send_id,
+    )
+    assert outcome == "bound"
+
+
+async def room_bindings(conn, room_id: str) -> list[tuple]:
+    return await fetch(
+        conn,
+        "SELECT origin, run_id, session_id, slug, released_at IS NOT NULL, release_reason"
+        " FROM room_bindings WHERE room_id = %s ORDER BY id",
+        room_id,
+    )
+
+
+async def active_binding(conn, room_id: str) -> tuple | None:
+    active = [b for b in await room_bindings(conn, room_id) if not b[4]]
+    assert len(active) <= 1
+    return active[0] if active else None
+
+
+async def add_run(conn, room_id: str, session_id, kind: str = "first", finished: bool = True):
+    ref = await runs.create_run(conn, room_id=room_id, preset_id=str(uuid.uuid4()), kind=kind)
+    await conn.execute("UPDATE runs SET session_id = %s WHERE id = %s", (session_id, ref.id))
+    if finished:
+        assert await runs.finish(conn, ref.id, "handled")
+    return ref.id
+
+
+def session_checks(fake) -> int:
+    return sum(
+        r.method == "GET"
+        and r.url.path.count("/") == 4
+        and r.url.path.startswith("/api/v1/sessions/")
+        for r in fake.requests
+    )
+
+
+def _binding(session_id=None) -> BindingRow:
+    return BindingRow(
+        id=1,
+        room_id=DM,
+        session_id=session_id,
+        slug=None,
+        origin="inbound",
+        run_id=1,
+        send_id=None,
+        created_at=T0,
+        released_at=None,
+        release_reason=None,
+    )
+
+
+def test_routing_decision():
+    """The pure decision of `Worker._room` and the binding sweep (no database)."""
+    assert binding_state(None) == "unbound"
+    assert binding_state(_binding()) == "reserved"
+    assert binding_state(_binding(uuid.uuid4())) == "bound"
+
+    running = Session(id=uuid.uuid4(), slug="hive-lead", desired="active")
+    assert check_action(running) == "follow"
+    # running_session answers None for not found and for desired `deleting`.
+    assert check_action(None) == "release"
+    assert check_action(NotFound(404, "not_found", "gone")) == "release"
+    assert check_action(OrchestratorError(403, "forbidden", "no")) == "keep"
+    assert check_action(OrchestratorError(409, "conflict", "busy")) == "keep"
+    assert check_action(OrchestratorUnavailable("down")) == "retry"
+
+
+async def test_first_run_binds_room(conn, fake, preset, make_worker):
+    await preset()
+    await add_room(conn, DM)
+    await queue(conn, DM, "one")
+    worker = make_worker()
+
+    # The session cannot be created yet: the claim already reserved the room for the run.
+    fake.fail_next("create_session", 503)
+    await worker.tick()
+    [(run_id, kind, _, session_id, *_)] = await room_runs(conn, DM)
+    assert (kind, session_id) == ("first", None)
+    assert await room_bindings(conn, DM) == [("inbound", run_id, None, None, False, None)]
+
+    await worker.tick()
+    [(_, _, _, session_id, message_id, status, *_)] = await room_runs(conn, DM)
+    assert session_id is not None and message_id is not None and status == "in-progress"
+    assert await room_bindings(conn, DM) == [
+        ("inbound", run_id, session_id, f"mx-{run_id}", False, None)
+    ]
+
+    # A retried dispatch with the same ids changes nothing.
+    await conn.execute(
+        "UPDATE runs SET session_id = NULL, message_id = NULL WHERE id = %s", (run_id,)
+    )
+    await worker.tick()
+    [(_, _, _, adopted, *_)] = await room_runs(conn, DM)
+    assert adopted == session_id
+    assert await room_bindings(conn, DM) == [
+        ("inbound", run_id, session_id, f"mx-{run_id}", False, None)
+    ]
+    assert len(fake.sessions) == 1
+
+
+async def test_failed_first_run_releases_reservation(conn, fake, preset, make_worker):
+    default = await preset()
+    for room in (DM, OTHER):
+        await add_room(conn, room)
+    await conn.execute(
+        "INSERT INTO room_settings (room_id, preset_id) VALUES (%s, %s)", (OTHER, uuid.uuid4())
+    )
+    await queue(conn, DM, "refused")
+    await queue(conn, OTHER, "unknown preset")
+    worker = make_worker()
+
+    # DM: the orchestrator refuses the new session; OTHER: its preset does not exist.
+    fake.fail_next("create_session", 422)
+    await worker.tick()
+
+    [(dm_run, _, _, dm_session, _, dm_status, *_)] = await room_runs(conn, DM)
+    assert (dm_session, dm_status) == (None, "failed")
+    [(other_run, _, _, other_session, _, other_status, reason, _)] = await room_runs(conn, OTHER)
+    assert (other_session, other_status, reason) == (None, "failed", "preset_not_found")
+    assert await room_bindings(conn, DM) == [("inbound", dm_run, None, None, True, "run_failed")]
+    assert await room_bindings(conn, OTHER) == [
+        ("inbound", other_run, None, None, True, "run_failed")
+    ]
+
+    await queue(conn, DM, "again")
+    await conn.execute(
+        "UPDATE room_settings SET preset_id = %s WHERE room_id = %s", (default.id, OTHER)
+    )
+    await queue(conn, OTHER, "again")
+    await worker.tick()
+
+    for room, failed_run in ((DM, dm_run), (OTHER, other_run)):
+        _, (new_run, kind, slug, session_id, _, status, *_) = await room_runs(conn, room)
+        assert (kind, status) == ("first", "in-progress")
+        assert await room_bindings(conn, room) == [
+            ("inbound", failed_run, None, None, True, "run_failed"),
+            ("inbound", new_run, session_id, slug, False, None),
+        ]
+
+
+async def test_bound_session_gets_batch_without_preset(conn, fake, make_worker):
+    await add_room(conn, DM)
+    leader = add_session(fake, "hive-lead")
+    await bind_agent(conn, DM, leader)
+    await queue(conn, DM, "my answer")
+
+    await make_worker().tick()
+
+    [(run_id, kind, _, session_id, message_id, status, reason, preset_id)] = await room_runs(
+        conn, DM
+    )
+    assert (kind, str(session_id), status, reason, preset_id) == (
+        "follow",
+        leader,
+        "in-progress",
+        None,
+        None,
+    )
+    [message] = session_messages(fake, leader)
+    assert str(message["id"]) == message_id
+    assert "my answer" in message["text"] and message["text"].endswith(marker(run_id))
+    assert await room_rows(conn, DM) == [("my answer", "in-progress", None, run_id)]
+    assert len(fake.sessions) == 1
+    assert await active_binding(conn, DM) == (
+        "agent",
+        None,
+        uuid.UUID(leader),
+        f"slug-{leader[:4]}",
+        False,
+        None,
+    )
+
+
+async def test_batch_goes_only_to_bound_session(conn, fake, preset, make_worker):
+    await preset()
+    for room in (DM, OTHER):
+        await add_room(conn, room)
+    bound = add_session(fake, "hive-lead")
+    earlier = add_session(fake, "mx-old")
+    elsewhere = add_session(fake, "mx-elsewhere")
+    # Another running session holds runs in this room, and a newer run of a third session
+    # is in another room.
+    await add_run(conn, DM, earlier)
+    await add_run(conn, DM, earlier, kind="follow")
+    await bind_agent(conn, DM, bound, send_id=1)
+    await add_run(conn, OTHER, elsewhere)
+    await bind_agent(conn, OTHER, elsewhere, send_id=2)
+    await queue(conn, DM, "for the bound session")
+    worker = make_worker()
+
+    await worker.tick()
+
+    *_, (run_id, kind, _, session_id, _, status, *_) = await room_runs(conn, DM)
+    assert (kind, str(session_id), status) == ("follow", bound, "in-progress")
+    assert len(session_messages(fake, bound)) == 1
+    assert session_messages(fake, earlier) == []
+    assert session_messages(fake, elsewhere) == []
+    assert len(fake.sessions) == 3
+
+    await finish_handled(conn, run_id)
+    await queue(conn, DM, "again")
+    await worker.tick()
+    assert len(session_messages(fake, bound)) == 2
+    assert session_messages(fake, earlier) == [] and session_messages(fake, elsewhere) == []
+
+
+async def test_gone_bound_session_released(conn, fake, make_worker):
+    room_preset = fake.add_preset("room-preset")
+    for room in (DM, OTHER):
+        await add_room(conn, room)
+    await conn.execute(
+        "INSERT INTO room_settings (room_id, preset_id) VALUES (%s, %s)", (DM, room_preset.id)
+    )
+    gone = add_session(fake, "hive-gone")
+    deleting = add_session(fake, "hive-deleting")
+    await bind_agent(conn, DM, gone, send_id=1)
+    await bind_agent(conn, OTHER, deleting, send_id=2)
+    fake.remove_session(gone)
+    fake.discard_session(deleting)
+    await queue(conn, DM, "to a new session")
+    await queue(conn, OTHER, "nobody")
+
+    await make_worker().tick()
+
+    # DM has a preset: released, and in the same tick a new mx- session binds it.
+    [(run_id, kind, slug, session_id, message_id, status, *_)] = await room_runs(conn, DM)
+    assert (kind, slug, status) == ("first", f"mx-{run_id}", "in-progress")
+    assert message_id is not None and str(session_id) not in (gone, deleting)
+    assert await room_bindings(conn, DM) == [
+        ("agent", None, uuid.UUID(gone), f"slug-{gone[:4]}", True, "session_gone"),
+        ("inbound", run_id, session_id, f"mx-{run_id}", False, None),
+    ]
+    assert session_messages(fake, session_id)[0]["text"].startswith(PREAMBLE)
+    # OTHER has no preset: released, the rows ignored and the room stays unbound.
+    assert await room_runs(conn, OTHER) == []
+    assert await room_rows(conn, OTHER) == [("nobody", "ignored", "no_preset", None)]
+    assert await room_bindings(conn, OTHER) == [
+        ("agent", None, uuid.UUID(deleting), f"slug-{deleting[:4]}", True, "session_gone"),
+    ]
+
+
+async def test_session_gone_releases_binding(conn, fake, orchestrator, preset, make_worker):
+    await preset()
+    await add_room(conn, DM)
+    worker = make_worker()
+    await queue(conn, DM, "one")
+    await worker.tick()
+    [(first_id, _, _, old_session, *_)] = await room_runs(conn, DM)
+    await finish_handled(conn, first_id)
+    await queue(conn, DM, "two")
+
+    # The session answers running and is gone when the batch is posted.
+    await make_worker(DiscardAfterCheck(orchestrator, fake)).tick()
+
+    _, (_, kind, _, _, _, status, reason, _) = await room_runs(conn, DM)
+    assert (kind, status, reason) == ("follow", "failed", "session_gone")
+    assert await room_bindings(conn, DM) == [
+        ("inbound", first_id, old_session, f"mx-{first_id}", True, "session_gone")
+    ]
+    assert (await room_rows(conn, DM))[1] == ("two", "new", None, None)
+
+    await worker.tick()
+
+    *_, (new_id, kind, _, new_session, _, status, *_) = await room_runs(conn, DM)
+    assert (kind, status) == ("first", "in-progress") and new_session != old_session
+    assert await active_binding(conn, DM) == (
+        "inbound",
+        new_id,
+        new_session,
+        f"mx-{new_id}",
+        False,
+        None,
+    )
+
+
+async def test_refused_check_keeps_binding(conn, fake, preset, make_worker, clock, caplog):
+    caplog.set_level(logging.WARNING, logger="agents_matrix_connector.worker")
+    await preset()
+    await add_room(conn, DM)
+    leader = add_session(fake, "hive-lead")
+    await bind_agent(conn, DM, leader)
+    await queue(conn, DM, "answer")
+    worker = make_worker()
+    binding = await active_binding(conn, DM)
+
+    # A refused check keeps the binding and the rows, logged at most once a minute.
+    for at in (T0, T0 + timedelta(seconds=30)):
+        clock.at = at
+        fake.fail_next("get_session", 403)
+        await worker.tick()
+        assert await room_runs(conn, DM) == []
+        assert await room_rows(conn, DM) == [("answer", "new", None, None)]
+        assert await active_binding(conn, DM) == binding
+    refused = [r.getMessage() for r in caplog.records if "refused" in r.getMessage()]
+    assert len(refused) == 1 and DM in refused[0]
+
+    # An unavailable orchestrator: retried next tick.
+    fake.fail_next("get_session", 503)
+    await worker.tick()
+    assert await room_runs(conn, DM) == []
+    assert await room_rows(conn, DM) == [("answer", "new", None, None)]
+    assert await active_binding(conn, DM) == binding
+    assert len(fake.sessions) == 1
+
+    await worker.tick()
+    [(_, kind, _, session_id, message_id, *_)] = await room_runs(conn, DM)
+    assert (kind, str(session_id)) == ("follow", leader) and message_id is not None
+    assert len(fake.sessions) == 1
+    assert await active_binding(conn, DM) == binding
+
+
+async def test_binding_sweep_releases_deleted_sessions(conn, fake, make_worker, clock):
+    def active(room_id):
+        return active_binding(conn, room_id)
+
+    gone, deleting, running = (add_session(fake, f"s-{n}") for n in range(3))
+    for n, (room, session) in enumerate(((DM, gone), (OTHER, deleting), (THIRD, running))):
+        await bind_agent(conn, room, session, send_id=n + 1)
+    assert await bindings.reserve_for_run(conn, FOURTH, 999)
+    fake.remove_session(gone)
+    fake.discard_session(deleting)
+    worker = make_worker()
+
+    # The first sweep is one interval after the worker starts.
+    await worker.tick()
+    assert all([await active(room) for room in (DM, OTHER, THIRD, FOURTH)])
+    assert session_checks(fake) == 0
+
+    clock.at = T0 + timedelta(seconds=60)
+    await worker.tick()
+    assert (await room_bindings(conn, DM))[0][4:] == (True, "session_gone")
+    assert (await room_bindings(conn, OTHER))[0][4:] == (True, "session_gone")
+    assert await active(THIRD) is not None
+    assert await active(FOURTH) == ("inbound", 999, None, None, False, None)
+    assert session_checks(fake) == 3
+
+    # At most once per 60 s.
+    fake.remove_session(running)
+    clock.at = T0 + timedelta(seconds=90)
+    await worker.tick()
+    assert await active(THIRD) is not None
+    assert session_checks(fake) == 3
+    clock.at = T0 + timedelta(seconds=120)
+    await worker.tick()
+    assert (await room_bindings(conn, THIRD))[0][4:] == (True, "session_gone")
+    assert await active(FOURTH) is not None
+
+    # An unavailable orchestrator ends the sweep without releasing anything.
+    later = [add_session(fake, f"later-{n}") for n in range(2)]
+    for n, (room, session) in enumerate(zip((DM, OTHER), later, strict=True)):
+        await bind_agent(conn, room, session, send_id=10 + n)
+        fake.remove_session(session)
+    checks = session_checks(fake)
+    fake.fail_next("get_session", 503)
+    clock.at = T0 + timedelta(seconds=180)
+    await worker.tick()
+    assert session_checks(fake) == checks + 1
+    assert await active(DM) is not None and await active(OTHER) is not None
+    clock.at = T0 + timedelta(seconds=200)
+    await worker.tick()
+    assert await active(DM) is not None and await active(OTHER) is not None
+    clock.at = T0 + timedelta(seconds=240)
+    await worker.tick()
+    assert await active(DM) is None and await active(OTHER) is None
+
+    # A refused check keeps that binding; the sweep goes on with the next one.
+    refused, gone_too = add_session(fake, "refused"), add_session(fake, "gone-too")
+    await bind_agent(conn, DM, refused, send_id=20)
+    await bind_agent(conn, OTHER, gone_too, send_id=21)
+    fake.remove_session(gone_too)
+    fake.fail_next("get_session", 403)
+    clock.at = T0 + timedelta(seconds=300)
+    await worker.tick()
+    assert (await active(DM))[2] == uuid.UUID(refused)
+    assert await active(OTHER) is None
+    assert await active(FOURTH) is not None
+
+
+async def test_follow_run_preset_from_session(conn, fake, make_worker):
+    session_preset = fake.add_preset("session-preset")
+    room_preset = fake.add_preset("room-preset")
+    for room in (DM, OTHER, THIRD):
+        await add_room(conn, room)
+    await conn.execute(
+        "INSERT INTO room_settings (room_id, preset_id) VALUES (%s, %s), (%s, %s)",
+        (DM, room_preset.id, OTHER, room_preset.id),
+    )
+    with_preset = add_session(fake, "with-preset", preset_id=session_preset.id)
+    without = add_session(fake, "without")
+    neither = add_session(fake, "neither")
+    for n, (room, session) in enumerate(((DM, with_preset), (OTHER, without), (THIRD, neither))):
+        await bind_agent(conn, room, session, send_id=n + 1)
+        await queue(conn, room, f"to {room}")
+    worker = make_worker()
+
+    await worker.tick()
+
+    # The session's preset; else the room's effective preset; else none, without an error.
+    expected = {DM: session_preset.id, OTHER: room_preset.id, THIRD: None}
+    for room, preset_id in expected.items():
+        [(run_id, kind, _, _, message_id, status, reason, stored)] = await room_runs(conn, room)
+        assert (kind, status, reason, stored) == ("follow", "in-progress", None, preset_id)
+        assert message_id is not None
+
+    # The default preset is the room's effective preset when the room has none.
+    default = fake.add_preset("default")
+    await conn.execute("UPDATE settings SET default_preset_id = %s WHERE id = 1", (default.id,))
+    [(third_run, *_)] = await room_runs(conn, THIRD)
+    await finish_handled(conn, third_run)
+    await queue(conn, THIRD, "again")
+    await worker.tick()
+    _, (_, kind, _, _, _, _, _, stored) = await room_runs(conn, THIRD)
+    assert (kind, stored) == ("follow", default.id)
+
+
+async def test_preamble_for_session_new_to_room(conn, fake, make_worker):
+    for room in (DM, OTHER, THIRD):
+        await add_room(conn, room)
+    leader = add_session(fake, "hive-lead")
+    await bind_agent(conn, DM, leader)
+    await queue(conn, DM, "first answer")
+    worker = make_worker()
+
+    await worker.tick()
+
+    [(run_id, *_)] = await room_runs(conn, DM)
+    [message] = session_messages(fake, leader)
+    assert message["text"].startswith(PREAMBLE)
+    assert f'<chat room="Alice" kind="dm" room_id="{DM}">' in message["text"]
+    assert "first answer" in message["text"]
+
+    # The session has an earlier run in the room now.
+    await finish_handled(conn, run_id)
+    await queue(conn, DM, "second answer")
+    await worker.tick()
+    [_, second] = session_messages(fake, leader)
+    assert second["text"].startswith("New messages in the chat:")
+    assert PREAMBLE not in second["text"] and "second answer" in second["text"]
+
+    # A session whose earlier runs are in another room is new to this one.
+    other = add_session(fake, "hive-other")
+    await add_run(conn, OTHER, other, kind="follow")
+    await bind_agent(conn, THIRD, other, send_id=2)
+    await queue(conn, THIRD, "hello")
+    await worker.tick()
+    [message] = session_messages(fake, other)
+    assert message["text"].startswith(PREAMBLE)
+
+
+async def test_resume_keeps_preamble_for_session_new_to_room(conn, fake, make_worker):
+    await add_room(conn, DM)
+    leader = add_session(fake, "hive-lead")
+    await bind_agent(conn, DM, leader)
+    worker = make_worker()
+
+    # The first delivery fails; the retry through Worker._resume keeps the PREAMBLE, the run
+    # itself not counting as an earlier run of the session in the room.
+    await queue(conn, DM, "one")
+    fake.fail_next("post_message", 503)
+    await worker.tick()
+    [(run_id, kind, _, _, message_id, status, *_)] = await room_runs(conn, DM)
+    assert (kind, message_id, status) == ("follow", None, "in-progress")
+    assert session_messages(fake, leader) == []
+    await worker.tick()
+    [message] = session_messages(fake, leader)
+    assert message["text"].startswith(PREAMBLE) and message["text"].endswith(marker(run_id))
+    [(_, _, _, _, message_id, *_)] = await room_runs(conn, DM)
+    assert message_id == str(message["id"])
+
+    # A resumed follow run into a session with an earlier run in the room: no PREAMBLE.
+    await finish_handled(conn, run_id)
+    await queue(conn, DM, "two")
+    fake.fail_next("post_message", 503)
+    await worker.tick()
+    _, (follow_id, _, _, _, message_id, *_) = await room_runs(conn, DM)
+    assert message_id is None
+    await worker.tick()
+    [_, resumed] = session_messages(fake, leader)
+    assert resumed["text"].startswith("New messages in the chat:")
+    assert PREAMBLE not in resumed["text"] and resumed["text"].endswith(marker(follow_id))

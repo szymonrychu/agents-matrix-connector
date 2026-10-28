@@ -12,6 +12,7 @@ CHART = Path(__file__).resolve().parent.parent / "chart" / "agents-matrix-connec
 DB_PASS = "".join(["db", "-", "fixture", "-", "value"])
 ORCH = "".join(["orch", "-", "fixture", "-", "value"])
 MX = "".join(["mx", "-", "fixture", "-", "value"])
+HASH = "0123456789abcdef" * 4
 
 BASE = {
     "image": {"tag": "1.2.3"},
@@ -80,7 +81,7 @@ def test_deployments_render():
         assert c["command"] == ["agents-matrix-connector"]
         assert c["args"] == [name]
         assert c["image"] == ("harbor.szymonrichert.pl/containers/agents-matrix-connector:1.2.3")
-        assert c["ports"] == [{"name": "http", "containerPort": 8000, "protocol": "TCP"}]
+        assert c["ports"][0] == {"name": "http", "containerPort": 8000, "protocol": "TCP"}
         assert c["livenessProbe"]["httpGet"] == {"path": "/healthz", "port": 8000}
         assert c["readinessProbe"]["httpGet"] == {"path": "/readyz", "port": 8000}
         assert c["envFrom"] == [{"configMapRef": {"name": "mx-agents-matrix-connector-settings"}}]
@@ -223,8 +224,91 @@ def test_config_rendered():
     assert data["MATRIX_RETENTION_DAYS"] == "7"
     assert data["MATRIX_POLL_SECONDS"] == "3"
     assert data["MATRIX_LOG_LEVEL"] == "DEBUG"
+    assert data["MATRIX_AGENT_PORT"] == "8001"
+    assert data["MATRIX_AGENT_RATE_PER_MINUTE"] == "20"
     assert "MATRIX_API_ALLOWED_CIDRS" not in data
     assert "MATRIX_PUPPET_PATTERN" in data
+    custom = render({"agentApi": {"port": 9001}, "limits": {"agentRatePerMinute": 7}})
+    data = next(d for d in custom if d["kind"] == "ConfigMap")["data"]
+    assert data["MATRIX_AGENT_PORT"] == "9001"
+    assert data["MATRIX_AGENT_RATE_PER_MINUTE"] == "7"
+
+
+def test_agent_port_only_on_api():
+    deps = deployments(render())
+    assert main_container(deps["api"])["ports"] == [
+        {"name": "http", "containerPort": 8000, "protocol": "TCP"},
+        {"name": "agents", "containerPort": 8001, "protocol": "TCP"},
+    ]
+    assert main_container(deps["bot"])["ports"] == [
+        {"name": "http", "containerPort": 8000, "protocol": "TCP"}
+    ]
+    for dep in deps.values():
+        assert "ports" not in pod(dep)["initContainers"][0]
+    custom = deployments(render({"agentApi": {"port": 9001}}))
+    assert main_container(custom["api"])["ports"][1] == {
+        "name": "agents",
+        "containerPort": 9001,
+        "protocol": "TCP",
+    }
+
+
+def _hash_refs(docs: list[dict]) -> dict[str, dict]:
+    """MATRIX_AGENT_TOKEN_SHA256 env entries by container name, across every Deployment."""
+    refs = {}
+    for name, dep in deployments(docs).items():
+        for c in pod(dep)["containers"] + pod(dep)["initContainers"]:
+            entry = env_of(c).get("MATRIX_AGENT_TOKEN_SHA256")
+            if entry is not None:
+                refs[f"{name}/{c['name']}"] = entry
+    return refs
+
+
+def test_agent_token_hash_secret_on_api_only():
+    # inline hash: chart Secret key, api container only, never the ConfigMap
+    docs = render({"agentApi": {"tokenSha256": HASH}})
+    secret = next(d for d in docs if d["kind"] == "Secret")
+    assert secret["stringData"]["agent-token-sha256"] == HASH
+    assert _hash_refs(docs) == {
+        "api/api": {
+            "name": "MATRIX_AGENT_TOKEN_SHA256",
+            "valueFrom": {
+                "secretKeyRef": {"name": "mx-agents-matrix-connector", "key": "agent-token-sha256"}
+            },
+        }
+    }
+    cm = next(d for d in docs if d["kind"] == "ConfigMap")
+    assert HASH not in yaml.safe_dump(cm)
+    assert "MATRIX_AGENT_TOKEN_SHA256" not in cm["data"]
+    for dep in deployments(docs).values():
+        assert HASH not in yaml.safe_dump(dep)
+    # the named Secret wins over the inline hash
+    docs = render(
+        {"agentApi": {"tokenSha256": HASH, "tokenSecret": {"name": "agent-tok", "key": "h"}}}
+    )
+    secret = next(d for d in docs if d["kind"] == "Secret")
+    assert "agent-token-sha256" not in secret["stringData"]
+    assert _hash_refs(docs) == {
+        "api/api": {
+            "name": "MATRIX_AGENT_TOKEN_SHA256",
+            "valueFrom": {"secretKeyRef": {"name": "agent-tok", "key": "h"}},
+        }
+    }
+    docs = render({"agentApi": {"tokenSecret": {"name": "agent-tok"}}})
+    assert _hash_refs(docs)["api/api"]["valueFrom"]["secretKeyRef"] == {
+        "name": "agent-tok",
+        "key": "token-sha256",
+    }
+    # neither set: no hash anywhere, so the agent listener stays unbound
+    docs = render()
+    assert _hash_refs(docs) == {}
+    assert "agent-token-sha256" not in next(d for d in docs if d["kind"] == "Secret")["stringData"]
+    # a malformed hash fails the render
+    for bad in (HASH.upper(), HASH[:-1], HASH + "0", "z" * 64, "not-a-hash"):
+        proc = _run(_merge(BASE, {"agentApi": {"tokenSha256": bad}}))
+        assert proc.returncode != 0, bad
+        assert "agentApi.tokenSha256" in proc.stderr
+        assert bad not in proc.stderr
 
 
 def test_config_rejects_foreign_env_key():
