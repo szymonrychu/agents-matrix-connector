@@ -725,6 +725,24 @@ async def test_validation(agent, conn):
     assert await count_sends(conn) == before
 
 
+async def test_whitespace_only_text_refused(agent, conn):
+    home = "!home:x"
+    await add_room(conn, home)
+    await allow_room(conn, home)
+    session = uuid.uuid4()
+    await bind(conn, home, session)
+
+    for text in (" ", "\n", " \t\r\n ", "\u00a0", "\u2003\u3000", "\n \n\t\n"):
+        r = await say(agent, session, text)
+        refused(r, 422, "invalid_text")
+        r = await say(agent, session, text, room=home)
+        refused(r, 422, "invalid_text")
+    assert await count_sends(conn) == 0
+
+    kept = accepted(await say(agent, session, "  hi  "))
+    assert (await send_row(conn, kept))["text"] == "  hi  "
+
+
 async def test_rooms_listing_order(agent, conn):
     rooms = {
         "!b1:x": "Beta",

@@ -252,7 +252,7 @@ bound to another session. The binding is released only when the session is delet
 send that created it reached nobody); turning `agents_may_initiate` off does not release it.
 
 Checks run in this order and a refusal queues nothing: `X-Orch-Session` (`401 unauthorized`),
-body (`422 invalid_request`, `422 invalid_key`), references (`422 bad_reference`), room choice
+body (`422 invalid_request`, `422 invalid_key`, `422 invalid_text`), references (`422 bad_reference`), room choice
 (`422 room_required`), (a) (`403 room_not_allowed`), (b) (`409 room_bound`, `403
 room_not_authorised`, `409 session_bound`, in that order), duplicate (`202` with the existing
 send), rate (`429 rate_limited`). The (b) check, the duplicate lookup and the rate count are
@@ -276,6 +276,7 @@ Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
 | `unauthorized` | 401 | the bearer token is missing or wrong, or `X-Orch-Session` is not a uuid |
 | `not_found` | 404 | the id is not one of this session's sends, or the path does not exist |
 | `invalid_request` | 422 | a body field failed validation: `text` empty or over 16000 characters, a wrong type, an unknown field |
+| `invalid_text` | 422 | the message `text` has no non-whitespace character, so it could never be delivered |
 | `invalid_key` | 422 | the reaction `key` is not 1 to 16 code points, or has ASCII, whitespace or control characters |
 | `bad_reference` | 422 | `reply_to` or `to` is not an `m<n>` or `s<n>` this session can reference: unknown, another session's send, a send not yet `sent`, a reaction, of another room than the given `room`, or a raw event id |
 | `room_required` | 422 | no `room`, no `reply_to`, and the session is bound to no room |
@@ -314,7 +315,7 @@ characters, stored unchanged and split into `MATRIX_REPLY_CHUNK_CHARS` chunks by
 `room` is a Matrix room id; omitted, the room of `reply_to`, else the session's bound room. A
 `reply_to` sends a quoted reply to that message. 202 `{"id": "s<n>", "status": "queued"}` (a
 duplicate: the existing id and its status `queued`, `sending` or `sent`); 401 `unauthorized`;
-422 `invalid_request`, `bad_reference` or `room_required`; 403 `room_not_allowed` or
+422 `invalid_request`, `invalid_text`, `bad_reference` or `room_required`; 403 `room_not_allowed` or
 `room_not_authorised`; 409 `room_bound` or `session_bound`; 429 `rate_limited`; 503
 `unavailable`.
 

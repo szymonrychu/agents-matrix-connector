@@ -4,6 +4,14 @@ Lessons that outlive a session. Newest first.
 
 ## 2026-10-28 decisions
 
+- A whitespace-only message text is refused at the api (2026-10-28, epic
+  matrix-connector-agent-initi, found by mxc-bot-sends-delivery): `POST /chat/v1/messages`
+  answers 422 `invalid_text` and queues nothing when the text has no non-whitespace character
+  (`str.strip()` is empty, the same test `chunks.split` uses to return no chunk). Why: the
+  sender fails such a row as `empty_text`, so the agent would get 202 for a message that can
+  never be delivered. The sender keeps its `empty_text` failure as a defence for rows queued
+  before this change. An empty text stays the pydantic length check (422 `invalid_request`).
+
 - One session per room and one room per session (2026-10-27, epic matrix-connector-agent-initi):
   hard 1:1 binding in `room_bindings`, released only when the session is deleted; it amends the
   2026-10-25 "One agent session per room". Why: the user's final-gate decision (2026-10-27,

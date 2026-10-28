@@ -343,6 +343,10 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
         who: Annotated[Caller, Depends(caller)], body: MessageIn
     ) -> SendAccepted:
         """Queue a message, optionally a quoted reply."""
+        if not body.text.strip():
+            raise ApiError(
+                422, "invalid_text", "text: needs a non-whitespace character to be delivered"
+            )
         async with pool.connection() as conn:
             ref = None
             if body.reply_to is not None:
