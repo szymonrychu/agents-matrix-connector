@@ -231,7 +231,7 @@ async def test_first_dispatch_batches_room(conn, fake, preset, make_worker):
     assert str(message["id"]) == message_id
     text = message["text"]
     assert text.startswith(PREAMBLE)
-    assert '<chat room="Alice" kind="dm">' in text
+    assert f'<chat room="Alice" kind="dm" room_id="{DM}">' in text
     assert text.index("hello one") < text.index("hello &lt;two&gt;")
     assert 'facebook_id="111"' in text
     assert text.endswith(marker(run_id))
@@ -1019,7 +1019,7 @@ async def test_preamble_for_session_new_to_room(conn, fake, make_worker):
     [(run_id, *_)] = await room_runs(conn, DM)
     [message] = session_messages(fake, leader)
     assert message["text"].startswith(PREAMBLE)
-    assert '<chat room="Alice" kind="dm">' in message["text"]
+    assert f'<chat room="Alice" kind="dm" room_id="{DM}">' in message["text"]
     assert "first answer" in message["text"]
 
     # The session has an earlier run in the room now.
