@@ -128,8 +128,8 @@ def clock() -> Clock:
 
 
 @pytest.fixture
-def sender(matrix, pool, clock):
-    return Sender(matrix, pool, make_settings(), now=clock)
+def sender(pool, clock):
+    return Sender(pool, make_settings(), now=clock)
 
 
 @pytest.fixture
@@ -714,7 +714,7 @@ async def test_restart_exactly_once(
     assert hs.sent(R1) == [text_event("A" * 60)]
     monkeypatch.setattr(runs, "mark_sent", real_mark_sent)
 
-    restarted_sender = Sender(matrix, pool, make_settings(), now=clock)
+    restarted_sender = Sender(pool, make_settings(), now=clock)
     restarted = Tracker(orch_client, matrix, pool, make_settings(), now=clock)
     await restarted_sender.tick()
     await restarted.tick()

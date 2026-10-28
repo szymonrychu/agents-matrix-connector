@@ -31,7 +31,6 @@ from agents_matrix_connector.api.rooms import agent_room_decision
 from agents_matrix_connector.chunks import split
 from agents_matrix_connector.clock import utcnow
 from agents_matrix_connector.db import bindings, directory, rules, runs, sends
-from agents_matrix_connector.matrix import MatrixClient
 from agents_matrix_connector.settings import BotSettings
 
 log = logging.getLogger(__name__)
@@ -121,13 +120,11 @@ async def refuse_sending(conn: psycopg.AsyncConnection, send_id: int, reason: st
 class Sender:
     def __init__(
         self,
-        matrix: MatrixClient,
         pool: AsyncConnectionPool,
         settings: BotSettings,
         *,
         now: Callable[[], datetime] = utcnow,
     ):
-        self._matrix = matrix
         self._pool = pool
         self._settings = settings
         self._now = now

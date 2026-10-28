@@ -193,7 +193,7 @@ async def _main(settings, pool, orchestrator, matrix, stop) -> int:
         return EXIT_BAD_SETTINGS
     sync = SyncLoop(matrix, pool, settings)
     worker = Worker(orchestrator, matrix, pool, settings)
-    sender = Sender(matrix, pool, settings)
+    sender = Sender(pool, settings)
     tracker = Tracker(orchestrator, matrix, pool, settings)
     held = asyncio.Event()
     body = asyncio.create_task(

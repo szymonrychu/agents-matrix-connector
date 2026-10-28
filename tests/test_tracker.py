@@ -580,7 +580,7 @@ async def test_agent_rows_rechecked_before_send(
         into_bound = await queue(bound, "!c:hs", f"{'A' * 60}\n\n{'B' * 60}")
         partial = await queue(partly, "!d:hs", f"{'C' * 60}\n\n{'D' * 60}")
 
-    sender = Sender(matrix, pool, make_settings(), now=clock)
+    sender = Sender(pool, make_settings(), now=clock)
     await sender.tick()
     orch.complete_turn(message_id, "Hello")
     hs.fail_next("send_text", 503)  # the homeserver is down: every row stays pending
