@@ -4,6 +4,31 @@ Lessons that outlive a session. Newest first.
 
 ## 2026-10-28 decisions
 
+- Agent outbound limits (2026-10-28, epic matrix-connector-agent-initi, security review MEDIUM 2
+  and LOW 2/3; outbound messages reach a real Messenger user, so abuse limits must hold):
+  - The duplicate lookup, the per-session rate count (`MATRIX_AGENT_RATE_PER_MINUTE`, 20 per 60 s)
+    and the new per-room cap now run in one transaction under `pg_advisory_xact_lock` on the
+    session id and then on the room id (always in that order, so no lock cycle), before the
+    insert. Why: counting and inserting in separate statements let parallel requests exceed the
+    limit. The room-check (b) stays advisory; the bot's claim re-checks it.
+  - New `MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR`, default 60 chunks per hour (>= 1): at most that many per room
+    in the last hour, summed over all sessions. A message counts `len(chunks.split(text,
+    MATRIX_REPLY_CHUNK_CHARS))` (one 16000-character send is 4 chunks at 4000), a reaction 1,
+    `refused` sends 0. Why chunks and not sends: the rate limit alone let a session push about 80
+    Messenger messages a minute (20 sends of 4 chunks). 60 per hour is one a minute on average,
+    conservative for a person's DM. Refusal is 429 `room_chunk_limit`, distinct from
+    `rate_limited`; a send that would pass the cap is refused whole.
+  - `X-Orch-Slug` is validated with the orchestrator's session slug rules (DNS-1123 label, at
+    most 40 characters, not `orchestrator` or `orchestrator-*`) and answers 400 `invalid_slug`;
+    absent or empty stays NULL. Why: it was stored unvalidated and unbounded. The session
+    check (401) still comes first.
+  - A reply or reaction to an `m<n>` whose room check fails now answers 422 `bad_reference`, the
+    same as an unknown id, unless that room is the session's own bound room. Why: 409
+    `room_bound` for a room bound elsewhere versus 422 for an unknown id let a session probe
+    which ids exist in other rooms. In its own room the specific refusal (for example 403
+    `room_not_allowed` after the room turned denied) is kept, because the session already knows
+    that room. Replies to `s<n>` keep their codes: those are the session's own sends.
+
 - A whitespace-only message text is refused at the api (2026-10-28, epic
   matrix-connector-agent-initi, found by mxc-bot-sends-delivery): `POST /chat/v1/messages`
   answers 422 `invalid_text` and queues nothing when the text has no non-whitespace character

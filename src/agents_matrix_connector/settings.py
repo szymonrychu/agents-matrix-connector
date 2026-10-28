@@ -44,6 +44,7 @@ class ConnectorSettings(BaseServiceSettings):
     agent_port: int = 8001
     agent_token_sha256: SecretStr = Field(SecretStr(""), repr=False)
     agent_rate_per_minute: int = Field(20, ge=1)
+    agent_room_chunks_per_hour: int = Field(60, ge=1)
 
     @field_validator("homeserver_url")
     @classmethod
