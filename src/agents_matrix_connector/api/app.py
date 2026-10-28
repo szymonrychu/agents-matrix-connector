@@ -27,8 +27,12 @@ PREFIX = "/matrix/api/v1"
 EXEMPT_PATHS = frozenset({"/healthz", "/readyz"})
 
 
-def _error(status: int, code: str, message: str) -> JSONResponse:
-    return JSONResponse({"error": {"code": code, "message": message}}, status_code=status)
+def error_response(
+    status: int, code: str, message: str, headers: dict[str, str] | None = None
+) -> JSONResponse:
+    return JSONResponse(
+        {"error": {"code": code, "message": message}}, status_code=status, headers=headers
+    )
 
 
 class SourceAllowlist:
@@ -58,7 +62,55 @@ class SourceAllowlist:
         if scope["type"] != "http" or scope.get("path") in EXEMPT_PATHS or self.allowed(scope):
             await self.app(scope, receive, send)
             return
-        await _error(403, "forbidden", "source address is not allowed")(scope, receive, send)
+        await error_response(403, "forbidden", "source address is not allowed")(
+            scope, receive, send
+        )
+
+
+def add_error_handlers(app: FastAPI) -> None:
+    """Answer every error as `{error: {code, message}}`; shared by the UI and agent apps."""
+
+    @app.exception_handler(ApiError)
+    async def _api_error(request: Request, exc: ApiError) -> JSONResponse:
+        return error_response(exc.status, exc.code, exc.message)
+
+    @app.exception_handler(RequestValidationError)
+    async def _invalid(request: Request, exc: RequestValidationError) -> JSONResponse:
+        first = exc.errors()[0] if exc.errors() else {}
+        where = ".".join(
+            str(part) for part in first.get("loc", ()) if part not in ("body", "query")
+        )
+        return error_response(
+            422, "invalid_request", f"{where}: {first.get('msg', 'invalid request')}"
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        code = "not_found" if exc.status_code == 404 else "invalid_request"
+        return error_response(exc.status_code, code, str(exc.detail))
+
+    @app.exception_handler(psycopg.Error)
+    async def _db(request: Request, exc: psycopg.Error) -> JSONResponse:
+        log.error("api: database error (%s)", type(exc).__name__)
+        return error_response(503, "unavailable", "database unavailable")
+
+
+def add_probes(app: FastAPI, pool: AsyncConnectionPool) -> None:
+    """`/healthz` says the process is up; `/readyz` says the database answers."""
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/readyz")
+    async def readyz() -> Response:
+        try:
+            async with pool.connection() as conn:
+                await conn.execute("SELECT 1")
+        except psycopg.Error as exc:
+            log.warning("readyz: database unreachable (%s)", type(exc).__name__)
+            return error_response(503, "unavailable", "database unavailable")
+        return JSONResponse({"status": "ok"})
 
 
 def create_api_app(
@@ -73,41 +125,6 @@ def create_api_app(
     app.include_router(build_rooms_router(pool, orchestrator, settings), prefix=PREFIX)
     app.include_router(build_rules_router(pool, orchestrator), prefix=PREFIX)
     app.add_middleware(SourceAllowlist, networks=settings.api_networks())
-
-    @app.exception_handler(ApiError)
-    async def _api_error(request: Request, exc: ApiError) -> JSONResponse:
-        return _error(exc.status, exc.code, exc.message)
-
-    @app.exception_handler(RequestValidationError)
-    async def _invalid(request: Request, exc: RequestValidationError) -> JSONResponse:
-        first = exc.errors()[0] if exc.errors() else {}
-        where = ".".join(
-            str(part) for part in first.get("loc", ()) if part not in ("body", "query")
-        )
-        return _error(422, "invalid_request", f"{where}: {first.get('msg', 'invalid request')}")
-
-    @app.exception_handler(StarletteHTTPException)
-    async def _http(request: Request, exc: StarletteHTTPException) -> JSONResponse:
-        code = "not_found" if exc.status_code == 404 else "invalid_request"
-        return _error(exc.status_code, code, str(exc.detail))
-
-    @app.exception_handler(psycopg.Error)
-    async def _db(request: Request, exc: psycopg.Error) -> JSONResponse:
-        log.error("api: database error (%s)", type(exc).__name__)
-        return _error(503, "unavailable", "database unavailable")
-
-    @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
-        return {"status": "ok"}
-
-    @app.get("/readyz")
-    async def readyz() -> Response:
-        try:
-            async with pool.connection() as conn:
-                await conn.execute("SELECT 1")
-        except psycopg.Error as exc:
-            log.warning("readyz: database unreachable (%s)", type(exc).__name__)
-            return _error(503, "unavailable", "database unavailable")
-        return JSONResponse({"status": "ok"})
-
+    add_error_handlers(app)
+    add_probes(app, pool)
     return app

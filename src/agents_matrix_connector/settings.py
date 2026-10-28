@@ -11,6 +11,7 @@ from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_va
 from pydantic_settings import SettingsConfigDict
 
 USER_ID_RE = re.compile(r"^@[^:\s]+:\S+$")
+SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _var(info: ValidationInfo) -> str:
@@ -40,6 +41,9 @@ class ConnectorSettings(BaseServiceSettings):
     retention_days: int = Field(30, ge=1)
     backfill_max_events: int = Field(500, ge=1)
     api_allowed_cidrs: CsvList = ["127.0.0.1/32"]
+    agent_port: int = 8001
+    agent_token_sha256: SecretStr = Field(SecretStr(""), repr=False)
+    agent_rate_per_minute: int = Field(20, ge=1)
 
     @field_validator("homeserver_url")
     @classmethod
@@ -84,6 +88,20 @@ class ConnectorSettings(BaseServiceSettings):
             except ValueError:
                 raise ValueError(f"{_var(info)}::not a CIDR: {item!r}") from None
         return value
+
+    @field_validator("agent_token_sha256")
+    @classmethod
+    def _agent_token_sha256(cls, value: SecretStr, info: ValidationInfo) -> SecretStr:
+        digest = value.get_secret_value()
+        if digest and not SHA256_HEX_RE.fullmatch(digest):
+            raise ValueError(f"{_var(info)}::not 64 lowercase hex characters")
+        return value
+
+    @model_validator(mode="after")
+    def _agent_port_differs(self):
+        if self.agent_port == self.http_port:
+            raise ValueError("MATRIX_AGENT_PORT::must differ from MATRIX_HTTP_PORT")
+        return self
 
     def self_ids(self) -> frozenset[str]:
         return frozenset([self.user_id, *self.self_identities])

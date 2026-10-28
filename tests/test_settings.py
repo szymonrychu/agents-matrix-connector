@@ -1,5 +1,7 @@
 """MATRIX_* settings of the connector."""
 
+import hashlib
+import secrets
 from pathlib import Path
 
 import pytest
@@ -140,3 +142,38 @@ def test_readme_lists_every_variable():
     names = {f"MATRIX_{n.upper()}" for n in BotSettings.model_fields}
     missing = [n for n in sorted(names) if f"`{n}`" not in section]
     assert not missing
+
+
+def test_agent_listener_settings(monkeypatch):
+    s = load_settings(ApiSettings)
+    assert s.agent_port == 8001
+    assert s.agent_token_sha256.get_secret_value() == ""
+    assert s.agent_rate_per_minute == 20
+
+    digest = hashlib.sha256(secrets.token_hex(32).encode()).hexdigest()
+    monkeypatch.setenv("MATRIX_AGENT_TOKEN_SHA256", digest)
+    monkeypatch.setenv("MATRIX_AGENT_PORT", "9001")
+    monkeypatch.setenv("MATRIX_AGENT_RATE_PER_MINUTE", "1")
+    s = load_settings(ApiSettings)
+    assert s.agent_token_sha256.get_secret_value() == digest
+    assert s.agent_port == 9001
+    assert s.agent_rate_per_minute == 1
+    for text in (repr(s), str(s), repr(load_settings(BotSettings))):
+        assert digest not in text
+
+    for bad in (digest.upper(), digest[:-1], digest + "0", "g" * 64, " " + digest[1:]):
+        monkeypatch.setenv("MATRIX_AGENT_TOKEN_SHA256", bad)
+        found = problems(ApiSettings)
+        assert "MATRIX_AGENT_TOKEN_SHA256" in found
+        assert bad.strip() not in str(found)
+    monkeypatch.setenv("MATRIX_AGENT_TOKEN_SHA256", digest)
+
+    monkeypatch.setenv("MATRIX_AGENT_RATE_PER_MINUTE", "0")
+    assert "MATRIX_AGENT_RATE_PER_MINUTE" in problems(ApiSettings)
+    monkeypatch.setenv("MATRIX_AGENT_RATE_PER_MINUTE", "20")
+
+    monkeypatch.setenv("MATRIX_HTTP_PORT", "9001")
+    assert "MATRIX_AGENT_PORT" in problems(ApiSettings)
+    monkeypatch.delenv("MATRIX_HTTP_PORT")
+    monkeypatch.setenv("MATRIX_AGENT_PORT", "8000")
+    assert "MATRIX_AGENT_PORT" in problems(ApiSettings)

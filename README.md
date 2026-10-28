@@ -46,6 +46,9 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_RETENTION_DAYS` | 30 | bot | days messages are kept (>= 1) |
 | `MATRIX_BACKFILL_MAX_EVENTS` | 500 | bot | max events read back per room when a sync timeline arrives limited (>= 1) |
 | `MATRIX_API_ALLOWED_CIDRS` | 127.0.0.1/32 | api | client networks allowed to call the api, comma separated |
+| `MATRIX_AGENT_PORT` | 8001 | api | bind port of the agent listener; must differ from `MATRIX_HTTP_PORT` |
+| `MATRIX_AGENT_TOKEN_SHA256` | empty | api | sha256 hex (64 lowercase characters) of the orchestrator's agent bearer token; empty leaves the agent listener unbound |
+| `MATRIX_AGENT_RATE_PER_MINUTE` | 20 | api | max agent sends (messages and reactions together) per session in the last 60 s (>= 1) |
 | `MATRIX_ACCESS_TOKEN` | none | bot | Matrix access token (required unless the file is set) |
 | `MATRIX_ACCESS_TOKEN_FILE` | empty | bot | file holding the Matrix access token; wins over the variable, stripped |
 
@@ -61,6 +64,15 @@ socket peers inside `MATRIX_API_ALLOWED_CIDRS` (X-Forwarded-For is never read); 
 source gets `403 forbidden`. Probes are exempt. In a cluster without the ingress, reach it
 with `kubectl port-forward` from an allowed source.
 
+Agent listener: with `MATRIX_AGENT_TOKEN_SHA256` set, the `api` subcommand also binds
+`MATRIX_AGENT_PORT`, which serves only `/chat/v1/*` (OpenAPI at `/chat/v1/openapi.json`),
+`/healthz` and `/readyz`. Every path but the probes needs `Authorization: Bearer <token>`, where
+the sha256 hex of the token equals `MATRIX_AGENT_TOKEN_SHA256` (constant-time compare); anything
+else gets `401 unauthorized` with `WWW-Authenticate: Bearer`. The token is the only credential:
+no source allowlist applies to this port, so the orchestrator pod reaches it directly. Paths
+outside `/chat/v1` get `404 not_found`. The token and its hash never reach a log line or an
+error body. The UI app on `MATRIX_HTTP_PORT` serves no `/chat/v1` path.
+
 Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
 
 | Code | Status | Meaning |
@@ -71,6 +83,7 @@ Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
 | `unknown_preset` | 422 | the preset id does not exist in the orchestrator |
 | `not_found` | 404 | the room, rule or path does not exist |
 | `forbidden` | 403 | the caller's source address is not allowed |
+| `unauthorized` | 401 | agent listener only: the bearer token is missing or wrong |
 
 A database outage answers `503 unavailable`, an unreachable orchestrator `503 unavailable`
 and an orchestrator refusal `502 orchestrator_error`.
