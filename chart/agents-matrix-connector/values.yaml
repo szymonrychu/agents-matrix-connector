@@ -56,12 +56,25 @@ limits:
   pollSeconds: 3
   syncTimeoutSeconds: 30
   retentionDays: 30
+  # MATRIX_AGENT_RATE_PER_MINUTE: agent sends accepted per session per minute.
+  agentRatePerMinute: 20
 
 # Source allowlist of the api (MATRIX_API_ALLOWED_CIDRS, api pod only): the direct peer must be
 # inside one of these CIDRs or the api answers 403 (probes excepted).
 api:
   allowedCidrs:
     - 127.0.0.1/32
+
+# The api's agent listener (MATRIX_AGENT_PORT, /chat/v1 behind a bearer token), served by the
+# <fullname>-api-agents Service. tokenSha256 is the sha256 hex (64 lowercase characters) of the
+# token the orchestrator presents; set it or tokenSecret (tokenSecret wins). It reaches the api pod
+# only, from a Secret. With neither set the listener is not bound.
+agentApi:
+  port: 8001
+  tokenSha256: ""
+  tokenSecret:
+    name: ""
+    key: token-sha256
 
 # Extra MATRIX_* settings; keys must start with MATRIX_.
 env: {}

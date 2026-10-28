@@ -1,4 +1,4 @@
-"""Chart network: the api Service and the /matrix/api Ingress; nothing reaches the bot."""
+"""Chart network: the api and agents Services, the /matrix/api Ingress; nothing reaches the bot."""
 
 from test_chart_workloads import render
 
@@ -16,18 +16,27 @@ def by_kind(docs, kind):
     return {d["metadata"]["name"]: d for d in docs if d["kind"] == kind}
 
 
-def test_service_selects_api_only():
+API_SELECTOR = {
+    "app.kubernetes.io/name": "agents-matrix-connector",
+    "app.kubernetes.io/instance": "mx",
+    "app.kubernetes.io/component": "api",
+}
+
+
+def test_services_select_api_only():
     svcs = by_kind(render(ING), "Service")
-    assert set(svcs) == {"mx-agents-matrix-connector-api"}
-    svc = svcs["mx-agents-matrix-connector-api"]
-    assert svc["spec"]["type"] == "ClusterIP"
-    port = svc["spec"]["ports"][0]
-    assert port["name"] == "http" and port["port"] == 8000 and port["targetPort"] == "http"
-    assert svc["spec"]["selector"] == {
-        "app.kubernetes.io/name": "agents-matrix-connector",
-        "app.kubernetes.io/instance": "mx",
-        "app.kubernetes.io/component": "api",
-    }
+    assert set(svcs) == {"mx-agents-matrix-connector-api", "mx-agents-matrix-connector-api-agents"}
+    for svc in svcs.values():
+        assert svc["spec"]["type"] == "ClusterIP"
+        assert svc["spec"]["selector"] == API_SELECTOR
+        assert svc["spec"]["selector"]["app.kubernetes.io/component"] != "bot"
+    (http,) = svcs["mx-agents-matrix-connector-api"]["spec"]["ports"]
+    assert http == {"name": "http", "port": 8000, "targetPort": "http", "protocol": "TCP"}
+    (agents,) = svcs["mx-agents-matrix-connector-api-agents"]["spec"]["ports"]
+    assert agents == {"name": "agents", "port": 8001, "targetPort": "agents", "protocol": "TCP"}
+    custom = by_kind(render({**ING, "agentApi": {"port": 9001}}), "Service")
+    (port,) = custom["mx-agents-matrix-connector-api-agents"]["spec"]["ports"]
+    assert port["port"] == 9001 and port["targetPort"] == "agents"
 
 
 def test_ingress_routes_api_prefix():
