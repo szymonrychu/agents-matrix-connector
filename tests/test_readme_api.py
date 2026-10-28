@@ -94,6 +94,7 @@ def test_readme_lists_every_reason() -> None:
         tracker.TURN_FAILED,
         tracker.TIMEOUT,
         tracker.EMPTY_REPLY,
+        tracker.ALREADY_SENT,
         tracker.FORBIDDEN,
         tracker.MESSAGE_FAILED,
         tracker.MESSAGE_CANCELLED,

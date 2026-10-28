@@ -45,6 +45,7 @@ SESSION_GONE = "session_gone"
 TURN_FAILED = "turn_failed"
 TIMEOUT = "timeout"
 EMPTY_REPLY = "empty_reply"
+ALREADY_SENT = "already_sent"
 FORBIDDEN = "forbidden"
 MESSAGE_FAILED = "message_failed"
 MESSAGE_CANCELLED = "message_cancelled"
@@ -124,7 +125,14 @@ class Tracker:
         turn = message.turn
         if turn is not None and turn.status == "completed":
             chunks = split(turn.final_text or "", self._settings.reply_chunk_chars)
-            return _Outcome("handled", None if chunks else EMPTY_REPLY, chunks=chunks)
+            if not chunks:
+                return _Outcome("handled", EMPTY_REPLY)
+            match = await self._send_match(run, (turn.final_text or "").strip())
+            if match == "sent":
+                return _Outcome("handled", ALREADY_SENT)
+            if match == "pending" and self._now() - run.started_at <= self._timeout:
+                return None
+            return _Outcome("handled", None, chunks=chunks)
         if turn is not None and turn.status == "failed":
             return _failed(TURN_FAILED)
         if message.status in ("failed", "cancelled"):
@@ -132,6 +140,19 @@ class Tracker:
                 return _SESSION_GONE
             return _failed(_MESSAGE_REASONS[message.status])
         return self._timed_out(run)
+
+    async def _send_match(self, run: runs.RunRow, final_text: str) -> str | None:
+        """How the final answer was already said (design D10): "sent" when a message send of
+        the run's session made since the run started and equal to it (stripped) reached the
+        user, else "pending" when one is still queued or sending, else None."""
+        if run.session_id is None:
+            return None
+        async with self._pool.connection() as conn:
+            made = await sends.message_sends_since(conn, run.session_id, run.started_at)
+        statuses = {status for text, status in made if text.strip() == final_text}
+        if "sent" in statuses:
+            return "sent"
+        return "pending" if statuses else None
 
     def _timed_out(self, run: runs.RunRow) -> _Outcome | None:
         if self._now() - run.started_at > self._timeout:

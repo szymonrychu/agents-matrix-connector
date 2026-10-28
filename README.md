@@ -103,8 +103,19 @@ when not plain handled:
 - `message_cancelled`: failed, the orchestrator message was cancelled
 - `timeout`: failed, no result within `MATRIX_RUN_TIMEOUT_SECONDS`
 - `empty_reply`: handled, the agent answered with no text
+- `already_sent`: handled, the turn's final answer equals (stripped) a message the agent sent
+  with the send tool during the run, so it is not posted a second time
 - `forbidden`: an outbound reply the homeserver refused (a failed outbound row)
 - `denied: <kind>` and `not_allowed` also appear on ignored messages
+
+Only a delivered send suppresses the final answer: when a turn completes, the bot compares its
+final answer, stripped, with the stripped text of every message send of the same session
+created at or after the run started. A matching `sent` send closes the run `already_sent` and
+posts nothing. A matching send still `queued` or `sending` keeps the run in progress (the room's
+next batch waits) until it settles, bounded by `MATRIX_RUN_TIMEOUT_SECONDS` from the run's
+start; when the timeout passes first the final answer is posted. A matching send that ended
+`failed` or `refused` does not count, so the final answer is posted. Every other final answer
+is posted as usual.
 
 ### `GET /matrix/api/v1/meta`
 

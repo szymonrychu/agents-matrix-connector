@@ -210,6 +210,20 @@ async def find_duplicate(
     return SendRow(**row) if row else None
 
 
+async def message_sends_since(
+    conn: psycopg.AsyncConnection, session_id: uuid.UUID, since: datetime
+) -> list[tuple[str, str]]:
+    """`(text, status)` of the session's message sends created at or after `since` that still
+    count as the agent having spoken: queued, sending or sent (not failed or refused)."""
+    cur = await conn.execute(
+        "SELECT text, status FROM sends"
+        " WHERE session_id = %s AND kind = 'message' AND text IS NOT NULL AND created_at >= %s"
+        " AND status IN ('queued', 'sending', 'sent') ORDER BY id",
+        (session_id, since),
+    )
+    return await cur.fetchall()
+
+
 async def resolve(conn: psycopg.AsyncConnection, ref: str) -> Ref | None:
     """`m<n>` to the inbound row's room and event id; `s<n>` to the send's room, session, kind,
     status and delivered event id. None for an unknown or malformed reference."""
