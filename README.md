@@ -113,7 +113,11 @@ Bot user, homeserver, default policy, group trigger, rule kinds per list and syn
 
 Discovered rooms. Query: `kind` (`dm`, `group`, `matrix`, `infrastructure`), `access`
 (`allowed`, `denied`, `default`). 200 list of rooms with `access`, `preset_id`, `trigger`,
-`effective_trigger`, `session` (`id`, `slug`, `status`, or null) and `queued` (messages waiting); 422 `invalid_request`.
+`effective_trigger`, `agents_may_initiate` (false when the room has no settings), `session`
+(the latest run: `id`, `slug`, `status`, or null), `binding` (the room's active session binding:
+`session_id`, `slug`, `origin` `inbound` or `agent`, `since`; `session_id` null while a first run
+reserves the room; null when the room is unbound) and `queued` (messages waiting); 422
+`invalid_request`. The binding is read only: no route writes, releases or moves it.
 
     curl -s 'http://localhost:8000/matrix/api/v1/rooms?kind=dm&access=allowed'
 
@@ -125,9 +129,13 @@ One room with its `members` (`user_id`, `display_name`, `facebook_id`, `membersh
 
 ### `PUT /matrix/api/v1/rooms/{room_id}/settings`
 
-Body `{"preset_id": uuid|null, "trigger": "all"|"mention"|null}`: the room's preset and
-trigger override (null clears). 200 room; 404 `not_found`; 422 `unknown_preset` or
-`invalid_request`; 503 `unavailable`; 502 `orchestrator_error`.
+Body `{"preset_id": uuid|null, "trigger": "all"|"mention"|null, "agents_may_initiate":
+true|false|null}`: the room's preset and trigger override (null or omitted clears) and whether
+agents may start a chat in the room while it is unbound (`agents_may_initiate`, off by default).
+An omitted or null `agents_may_initiate` keeps the stored value (false for a room without
+settings), so a save of the preset or trigger never grants or revokes it. 200 room; 404
+`not_found`; 422 `unknown_preset` or `invalid_request`; 503 `unavailable`; 502
+`orchestrator_error`.
 
     curl -s -X PUT -H 'content-type: application/json' -d '{"trigger": "all"}' \
       'http://localhost:8000/matrix/api/v1/rooms/!abc:server/settings'
@@ -228,6 +236,23 @@ Allow by `facebook` (the numeric Facebook id) or `user` to cover every chat of o
 by `room` for one chat. A deny rule always wins over an allow rule. Set a preset per room
 (`PUT /matrix/api/v1/rooms/{room_id}/settings`) or one default preset
 (`PUT /matrix/api/v1/settings`); an allowed room with no preset is ignored with `no_preset`.
+
+### Let agents start chats in a room
+
+Agents may post only to policy-allowed rooms that are bound to their session, or that are
+unbound and flagged `agents_may_initiate` (off by default). The flag lets an agent start a chat
+only while the room is unbound; its first send binds the room to its session. Only the owner DM
+`!iLWrAwaTMYnINJsyNv:szymonrichert.pl` gets the flag, set once after deploy, through the
+agents-web toggle once deployed, or through a port-forward to the api container (bypassing its
+SSO sidecar):
+
+    kubectl -n agents port-forward deploy/agents-matrix-connector-api 8000:8000 &
+    curl -s -X PUT -H 'content-type: application/json' -d '{"agents_may_initiate": true}' \
+      'http://localhost:8000/matrix/api/v1/rooms/!iLWrAwaTMYnINJsyNv:szymonrichert.pl/settings'
+
+The answer shows `agents_may_initiate` true and the room's `binding`. Send
+`{"agents_may_initiate": false}` the same way to turn it off; turning it off does not release a
+binding.
 
 ### Read receipts
 

@@ -40,6 +40,7 @@ class RuleRow:
 class RoomSettings:
     preset_id: uuid.UUID | None
     trigger: str | None
+    agents_may_initiate: bool = False
 
 
 @asynccontextmanager
@@ -91,25 +92,42 @@ async def list_rule_rows(pool: AsyncConnectionPool) -> list[RuleRow]:
 async def get_room_settings(source: Source, room_id: str) -> RoomSettings | None:
     async with _conn(source) as conn:
         cur = await conn.execute(
-            "SELECT preset_id, trigger FROM room_settings WHERE room_id = %s", (room_id,)
+            "SELECT preset_id, trigger, agents_may_initiate FROM room_settings WHERE room_id = %s",
+            (room_id,),
         )
         row = await cur.fetchone()
     return None if row is None else RoomSettings(*row)
 
 
 async def set_room_settings(
-    pool: AsyncConnectionPool, room_id: str, *, preset_id: uuid.UUID | None, trigger: str | None
+    pool: AsyncConnectionPool,
+    room_id: str,
+    *,
+    preset_id: uuid.UUID | None,
+    trigger: str | None,
+    agents_may_initiate: bool | None = None,
 ) -> RoomSettings:
+    """Store the room's preset and trigger; `agents_may_initiate` None keeps the stored flag.
+
+    A new row without the flag gets false. The flag is an authorisation grant, so a save that
+    does not name it never grants or revokes it.
+    """
     async with pool.connection() as conn:
-        await conn.execute(
+        cur = await conn.execute(
             """
-            INSERT INTO room_settings (room_id, preset_id, trigger) VALUES (%s, %s, %s)
+            INSERT INTO room_settings (room_id, preset_id, trigger, agents_may_initiate)
+            VALUES (%(room)s, %(preset)s, %(trigger)s, COALESCE(%(flag)s::boolean, false))
             ON CONFLICT (room_id) DO UPDATE
-            SET preset_id = EXCLUDED.preset_id, trigger = EXCLUDED.trigger, updated_at = now()
+            SET preset_id = EXCLUDED.preset_id, trigger = EXCLUDED.trigger,
+                agents_may_initiate = COALESCE(%(flag)s::boolean,
+                                               room_settings.agents_may_initiate),
+                updated_at = now()
+            RETURNING agents_may_initiate
             """,
-            (room_id, preset_id, trigger),
+            {"room": room_id, "preset": preset_id, "trigger": trigger, "flag": agents_may_initiate},
         )
-    return RoomSettings(preset_id, trigger)
+        stored = (await cur.fetchone())[0]
+    return RoomSettings(preset_id, trigger, stored)
 
 
 async def get_default_preset(source: Source) -> uuid.UUID | None:

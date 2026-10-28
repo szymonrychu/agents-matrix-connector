@@ -11,6 +11,7 @@ from api_helpers import (
     GRP,
     INFRA,
     PREFIX,
+    T0,
     add_inbound,
     add_outbound,
     make_settings,
@@ -152,6 +153,153 @@ async def test_room_settings(api, conn, fake):
     assert missing.status_code == 404 and missing.json()["error"]["code"] == "not_found"
     cur = await conn.execute("SELECT count(*) FROM room_settings WHERE room_id = '!nope:x'")
     assert (await cur.fetchone())[0] == 0
+
+
+async def _stored_flag(conn, room_id):
+    cur = await conn.execute(
+        "SELECT agents_may_initiate FROM room_settings WHERE room_id = %s", (room_id,)
+    )
+    row = await cur.fetchone()
+    return None if row is None else row[0]
+
+
+async def _listed(api, room_id):
+    return next(r for r in (await api.get("/rooms")).json() if r["room_id"] == room_id)
+
+
+def _binding(room):
+    binding = room["binding"]
+    return binding and {**binding, "since": datetime.fromisoformat(binding["since"])}
+
+
+async def test_room_settings_agents_may_initiate(api, conn):
+    await seed(conn)
+    r = await api.put(room_path(DM, "/settings"), json={"agents_may_initiate": True})
+    assert r.status_code == 200
+    assert r.json()["agents_may_initiate"] is True
+    assert await _stored_flag(conn, DM) is True
+
+    assert (await api.get(room_path(DM))).json()["agents_may_initiate"] is True
+    rooms = {r["room_id"]: r["agents_may_initiate"] for r in (await api.get("/rooms")).json()}
+    assert rooms == {DM: True, GRP: False, ENC: False, INFRA: False}
+
+
+async def test_room_settings_flag_omitted_keeps_value(api, conn, fake):
+    await seed(conn)
+    preset = fake.add_preset("chat")
+    assert (
+        await api.put(room_path(DM, "/settings"), json={"agents_may_initiate": True})
+    ).status_code == 200
+
+    kept = await api.put(
+        room_path(DM, "/settings"), json={"preset_id": str(preset.id), "trigger": "all"}
+    )
+    assert kept.status_code == 200
+    body = kept.json()
+    assert body["agents_may_initiate"] is True
+    assert body["preset_id"] == str(preset.id) and body["trigger"] == "all"
+    assert await _stored_flag(conn, DM) is True
+
+    null = await api.put(room_path(DM, "/settings"), json={"agents_may_initiate": None})
+    assert null.json()["agents_may_initiate"] is True
+    assert null.json()["preset_id"] is None and null.json()["trigger"] is None
+    assert await _stored_flag(conn, DM) is True
+
+    cleared = await api.put(room_path(DM, "/settings"), json={"agents_may_initiate": False})
+    assert cleared.status_code == 200 and cleared.json()["agents_may_initiate"] is False
+    assert await _stored_flag(conn, DM) is False
+
+    still = await api.put(room_path(DM, "/settings"), json={"trigger": "mention"})
+    assert still.json()["agents_may_initiate"] is False
+    assert await _stored_flag(conn, DM) is False
+    assert (await _listed(api, DM))["agents_may_initiate"] is False
+
+    bad = await api.put(room_path(DM, "/settings"), json={"agents_may_initiate": "maybe"})
+    assert bad.status_code == 422 and bad.json()["error"]["code"] == "invalid_request"
+    assert await _stored_flag(conn, DM) is False
+
+
+async def test_agents_may_initiate_default_false(api, conn):
+    await seed(conn)
+    assert await _stored_flag(conn, GRP) is None
+    assert (await api.get(room_path(GRP))).json()["agents_may_initiate"] is False
+    assert all(r["agents_may_initiate"] is False for r in (await api.get("/rooms")).json())
+
+    saved = await api.put(room_path(GRP, "/settings"), json={"trigger": "all"})
+    assert saved.status_code == 200 and saved.json()["agents_may_initiate"] is False
+    assert await _stored_flag(conn, GRP) is False
+
+
+async def test_room_binding_view(api, conn):
+    await seed(conn)
+    bound, older, latest = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    cur = await conn.execute(
+        "INSERT INTO runs (room_id, preset_id, kind, slug, session_id, status)"
+        " VALUES (%s, %s, 'first', 'mx-1', %s, 'handled') RETURNING id",
+        (DM, uuid.uuid4(), bound),
+    )
+    dm_run = (await cur.fetchone())[0]
+    since = T0 + timedelta(minutes=5)
+    await conn.execute(
+        "INSERT INTO room_bindings (room_id, session_id, slug, origin, run_id, created_at)"
+        " VALUES (%s, %s, 'mx-1', 'inbound', %s, %s)",
+        (DM, bound, dm_run, since),
+    )
+    # The latest run differs from the binding: `session` stays the latest run.
+    await conn.execute(
+        "INSERT INTO runs (room_id, preset_id, kind, slug, session_id, status)"
+        " VALUES (%s, NULL, 'follow', 'mx-1', %s, 'in-progress')",
+        (DM, bound),
+    )
+
+    cur = await conn.execute(
+        "INSERT INTO runs (room_id, preset_id, kind, status)"
+        " VALUES (%s, %s, 'first', 'in-progress') RETURNING id",
+        (GRP, uuid.uuid4()),
+    )
+    grp_run = (await cur.fetchone())[0]
+    await conn.execute(
+        "INSERT INTO room_bindings (room_id, origin, run_id, created_at)"
+        " VALUES (%s, 'inbound', %s, %s)",
+        (GRP, grp_run, since + timedelta(minutes=1)),
+    )
+
+    await conn.execute(
+        "INSERT INTO room_bindings (room_id, session_id, slug, origin, send_id, released_at,"
+        " release_reason) VALUES (%s, %s, 'hive', 'agent', 7, now(), 'session_gone')",
+        (ENC, older),
+    )
+    await conn.execute(
+        "INSERT INTO runs (room_id, preset_id, kind, slug, session_id, status)"
+        " VALUES (%s, %s, 'first', 'mx-9', %s, 'failed')",
+        (ENC, uuid.uuid4(), latest),
+    )
+
+    expected_dm = {
+        "session_id": str(bound),
+        "slug": "mx-1",
+        "origin": "inbound",
+        "since": since,
+    }
+    expected_grp = {
+        "session_id": None,
+        "slug": None,
+        "origin": "inbound",
+        "since": since + timedelta(minutes=1),
+    }
+    rooms = {r["room_id"]: r for r in (await api.get("/rooms")).json()}
+    details = {rid: (await api.get(room_path(rid))).json() for rid in (DM, GRP, ENC, INFRA)}
+    for view in (rooms, details):
+        assert _binding(view[DM]) == expected_dm
+        assert view[DM]["session"] == {"id": str(bound), "slug": "mx-1", "status": "in-progress"}
+        assert _binding(view[GRP]) == expected_grp
+        assert view[GRP]["session"] == {"id": None, "slug": None, "status": "in-progress"}
+        assert view[ENC]["binding"] is None
+        assert view[ENC]["session"] == {"id": str(latest), "slug": "mx-9", "status": "failed"}
+        assert view[INFRA]["binding"] is None and view[INFRA]["session"] is None
+
+    saved = await api.put(room_path(DM, "/settings"), json={"trigger": "all"})
+    assert _binding(saved.json()) == expected_dm
 
 
 async def test_room_messages(api, conn):
