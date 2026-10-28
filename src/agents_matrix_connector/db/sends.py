@@ -138,6 +138,43 @@ async def count_recent(conn: psycopg.AsyncConnection, session_id: uuid.UUID, sec
     return (await cur.fetchone())[0]
 
 
+async def find_duplicate(
+    conn: psycopg.AsyncConnection,
+    *,
+    session_id: uuid.UUID,
+    room_id: str,
+    kind: str,
+    text: str | None,
+    key: str | None,
+    reply_to: str | None,
+    seconds: int,
+) -> SendRow | None:
+    """The newest queued, sending or sent send of the session created in the last `seconds`
+    whose room, kind, text, key and reply_to equal the given ones exactly (design D5)."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            f"SELECT {_COLUMNS} FROM sends"
+            " WHERE session_id = %(session)s AND room_id = %(room)s AND kind = %(kind)s"
+            " AND text IS NOT DISTINCT FROM %(text)s::text"
+            " AND key IS NOT DISTINCT FROM %(key)s::text"
+            " AND reply_to IS NOT DISTINCT FROM %(reply_to)s::text"
+            " AND status IN ('queued', 'sending', 'sent')"
+            " AND created_at > now() - make_interval(secs => %(seconds)s)"
+            " ORDER BY id DESC LIMIT 1",
+            {
+                "session": session_id,
+                "room": room_id,
+                "kind": kind,
+                "text": text,
+                "key": key,
+                "reply_to": reply_to,
+                "seconds": seconds,
+            },
+        )
+        row = await cur.fetchone()
+    return SendRow(**row) if row else None
+
+
 async def resolve(conn: psycopg.AsyncConnection, ref: str) -> Ref | None:
     """`m<n>` to the inbound row's room and event id; `s<n>` to the send's room, session, kind,
     status and delivered event id. None for an unknown or malformed reference."""

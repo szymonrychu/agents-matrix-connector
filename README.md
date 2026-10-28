@@ -64,15 +64,6 @@ socket peers inside `MATRIX_API_ALLOWED_CIDRS` (X-Forwarded-For is never read); 
 source gets `403 forbidden`. Probes are exempt. In a cluster without the ingress, reach it
 with `kubectl port-forward` from an allowed source.
 
-Agent listener: with `MATRIX_AGENT_TOKEN_SHA256` set, the `api` subcommand also binds
-`MATRIX_AGENT_PORT`, which serves only `/chat/v1/*` (OpenAPI at `/chat/v1/openapi.json`),
-`/healthz` and `/readyz`. Every path but the probes needs `Authorization: Bearer <token>`, where
-the sha256 hex of the token equals `MATRIX_AGENT_TOKEN_SHA256` (constant-time compare); anything
-else gets `401 unauthorized` with `WWW-Authenticate: Bearer`. The token is the only credential:
-no source allowlist applies to this port, so the orchestrator pod reaches it directly. Paths
-outside `/chat/v1` get `404 not_found`. The token and its hash never reach a log line or an
-error body. The UI app on `MATRIX_HTTP_PORT` serves no `/chat/v1` path.
-
 Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
 
 | Code | Status | Meaning |
@@ -83,7 +74,6 @@ Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
 | `unknown_preset` | 422 | the preset id does not exist in the orchestrator |
 | `not_found` | 404 | the room, rule or path does not exist |
 | `forbidden` | 403 | the caller's source address is not allowed |
-| `unauthorized` | 401 | agent listener only: the bearer token is missing or wrong |
 
 A database outage answers `503 unavailable`, an unreachable orchestrator `503 unavailable`
 and an orchestrator refusal `502 orchestrator_error`.
@@ -212,6 +202,136 @@ Inbound messages across all rooms, newest first. Query: `status` (`new`, `in-pro
 (`in-<n>` only). 200; 422 `invalid_request`.
 
     curl -s 'http://localhost:8000/matrix/api/v1/messages?status=failed'
+
+## Agent API
+
+The agent listener of the `api` subcommand, called by agents-orchestrator on behalf of a session
+leader (the `orchestrator_chat_*` tools). With `MATRIX_AGENT_TOKEN_SHA256` set, the `api`
+subcommand also binds `MATRIX_AGENT_PORT`, which serves only `/chat/v1/*`, `/healthz` and
+`/readyz`. Base path `/chat/v1`; the OpenAPI document is committed as `openapi-agent.json`
+(regenerate with `uv run python -m agents_matrix_connector.api.openapi --agent >
+openapi-agent.json`) and served at `/chat/v1/openapi.json`.
+
+Auth: every path but the probes needs `Authorization: Bearer <token>`, where the sha256 hex of
+the token equals `MATRIX_AGENT_TOKEN_SHA256` (constant-time compare); anything else gets `401
+unauthorized` with `WWW-Authenticate: Bearer`. The token is the only credential: no source
+allowlist applies to this port, so the orchestrator pod reaches it directly. Paths outside
+`/chat/v1` get `404 not_found`. The token and its hash never reach a log line or an error body.
+The UI app on `MATRIX_HTTP_PORT` serves no `/chat/v1` path. Every `/chat/v1` call also carries
+`X-Orch-Session: <session uuid>` (missing or malformed: `401 unauthorized`) and `X-Orch-Slug:
+<slug>` (stored with the send; may be absent). The agent's own token never reaches the
+connector.
+
+Message ids: `m<n>` is a chat message (the `id` the prompt shows on each `<message>`), `s<n>`
+a send of this session. Raw Matrix event ids are never accepted.
+
+Room rule (design D4): a session may post to a room only when both hold:
+
+- (a) the room is policy-allowed for agent sends (see "Let agents start chats in a room"):
+  checked when the api accepts the request, when the bot claims the send and again before
+  each of its Matrix events is sent;
+- (b) the room is bound to the session, or it is unbound, flagged `agents_may_initiate` and the
+  session is bound to no room (an initiation).
+
+Binding rule: a chat room and a session are bound 1:1. A room is bound to at most one session
+and a session to at most one room, through `room_bindings`, whose only writer is the bot. The api
+never writes a binding: an initiation is accepted unbound, and the bot's claim of the send binds
+the room to the session. A room reserved by another session's first run in progress counts as
+bound to another session. The binding is released only when the session is deleted (or when the
+send that created it reached nobody); turning `agents_may_initiate` off does not release it.
+
+Checks run in this order and a refusal queues nothing: `X-Orch-Session` (`401 unauthorized`),
+body (`422 invalid_request`, `422 invalid_key`), references (`422 bad_reference`), room choice
+(`422 room_required`), (a) (`403 room_not_allowed`), (b) (`409 room_bound`, `403
+room_not_authorised`, `409 session_bound`, in that order), duplicate (`202` with the existing
+send), rate (`429 rate_limited`). The (b) check, the duplicate lookup and the rate count are
+advisory: they are not atomic with the insert, and the bot's claim re-checks (b), refusing a send
+that lost a race with reason `room_bound`, `session_bound` or `room_not_authorised`.
+
+Duplicate rule: a request identical to a send of the same session, room and kind, with the same
+`text` (message) or `key` (reaction) and the same `reply_to` (a reaction's `to`), compared
+exactly, whose status is `queued`, `sending` or `sent` and that was created in the last 60 s,
+answers `202` with the existing send's id and current status and stores nothing, so a retry after
+a timeout never posts twice. A `failed` or `refused` send is not a duplicate. A duplicate is not
+counted by the rate limit and is answered even at the limit.
+
+Rate: at most `MATRIX_AGENT_RATE_PER_MINUTE` sends (messages and reactions together, of any
+status) per session in the last 60 s.
+
+Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `unauthorized` | 401 | the bearer token is missing or wrong, or `X-Orch-Session` is not a uuid |
+| `not_found` | 404 | the id is not one of this session's sends, or the path does not exist |
+| `invalid_request` | 422 | a body field failed validation: `text` empty or over 16000 characters, a wrong type, an unknown field |
+| `invalid_key` | 422 | the reaction `key` is not 1 to 16 code points, or has ASCII, whitespace or control characters |
+| `bad_reference` | 422 | `reply_to` or `to` is not an `m<n>` or `s<n>` this session can reference: unknown, another session's send, a send not yet `sent`, a reaction, of another room than the given `room`, or a raw event id |
+| `room_required` | 422 | no `room`, no `reply_to`, and the session is bound to no room |
+| `room_not_allowed` | 403 | the room is unknown or not policy-allowed for agent sends (both answer the same) |
+| `room_bound` | 409 | the room is bound to (or reserved by) another session |
+| `room_not_authorised` | 403 | the room is unbound and not flagged `agents_may_initiate` |
+| `session_bound` | 409 | the room is unbound and flagged, but the session is already bound to another room |
+| `rate_limited` | 429 | the session reached `MATRIX_AGENT_RATE_PER_MINUTE` sends in the last 60 s |
+| `unavailable` | 503 | the database is unavailable |
+
+Send statuses: `queued` (accepted, waiting for the bot), `sending` (claimed by the bot, being
+delivered), `sent` (every Matrix event delivered), `failed` (delivery failed), `refused` (the bot's
+claim or send-time check refused it). Reasons:
+
+- `room_bound`, `session_bound`, `room_not_authorised`: refused, (b) failed at the bot's claim
+- `room_infrastructure`, `room_encrypted`, `denied: <kind>`, `not_allowed`: refused, (a)
+  failed at the claim or before a Matrix event was sent
+- `forbidden`: failed, the homeserver refused the event; another failure carries the
+  homeserver's errcode, or `send_failed`
+
+### `GET /chat/v1/rooms`
+
+The rooms this session may post to, exactly those passing (a) and (b): its bound room (`bound`
+true) when it passes (a), else, while the session is bound to no room, every unbound flagged
+room passing (a). The bound room comes first, then by `name` (code point order, rooms without a
+name last), then `room_id`. 200 `{"rooms": [{"room_id", "name", "kind", "bound",
+"agents_may_initiate"}]}`; 401 `unauthorized`.
+
+    curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      http://localhost:8001/chat/v1/rooms
+
+### `POST /chat/v1/messages`
+
+Body `{"text": str, "room": str|null, "reply_to": "m<n>"|"s<n>"|null}`: `text` 1 to 16000
+characters, stored unchanged and split into `MATRIX_REPLY_CHUNK_CHARS` chunks by the bot.
+`room` is a Matrix room id; omitted, the room of `reply_to`, else the session's bound room. A
+`reply_to` sends a quoted reply to that message. 202 `{"id": "s<n>", "status": "queued"}` (a
+duplicate: the existing id and its status `queued`, `sending` or `sent`); 401 `unauthorized`;
+422 `invalid_request`, `bad_reference` or `room_required`; 403 `room_not_allowed` or
+`room_not_authorised`; 409 `room_bound` or `session_bound`; 429 `rate_limited`; 503
+`unavailable`.
+
+    curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      -H 'content-type: application/json' -d '{"text": "Build finished", "reply_to": "m42"}' \
+      http://localhost:8001/chat/v1/messages
+
+### `POST /chat/v1/reactions`
+
+Body `{"to": "m<n>"|"s<n>", "key": str}`: react to that message with an emoji `key`; the
+reaction goes to the message's room, which passes (a) and (b) like a given room. 202 `{"id":
+"s<n>", "status": "queued"}` (a duplicate: as for messages); 401 `unauthorized`; 422
+`invalid_request`, `invalid_key` or `bad_reference`; 403 `room_not_allowed` or
+`room_not_authorised`; 409 `room_bound` or `session_bound`; 429 `rate_limited`; 503
+`unavailable`.
+
+    curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      -H 'content-type: application/json' -d '{"to": "m42", "key": "\ud83d\udc4d"}' \
+      http://localhost:8001/chat/v1/reactions
+
+### `GET /chat/v1/messages/{id}`
+
+One of this session's sends by `s<n>`: 200 `{"id", "kind" ("message" or "reaction"), "status",
+"reason", "room_id", "created_at", "sent_at"}`; 404 `not_found` for any other id, another
+session's send included; 401 `unauthorized`.
+
+    curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      http://localhost:8001/chat/v1/messages/s7
 
 ## Operations
 
