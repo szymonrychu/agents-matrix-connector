@@ -74,26 +74,26 @@ class PgRunStore:
         self._pool = pool
 
     async def set_session(self, run_id: RunId, session_id: str) -> None:
-        await self._update("session_id = %s::uuid", session_id, run_id)
+        async with self._pool.connection() as conn:
+            await set_session(conn, int(run_id), session_id)
 
     async def set_message(self, run_id: RunId, message_id: str) -> None:
-        await self._update("message_id = %s", message_id, run_id)
+        async with self._pool.connection() as conn:
+            await conn.execute(
+                "UPDATE runs SET message_id = %s WHERE id = %s AND status = 'in-progress'",
+                (message_id, int(run_id)),
+            )
 
     async def finish(self, run_id: RunId, status: RunStatus, reason: str | None) -> bool:
         async with self._pool.connection() as conn:
             return await finish(conn, int(run_id), status, reason)
 
-    async def _update(self, assignment: str, value: str, run_id: RunId) -> None:
-        async with self._pool.connection() as conn:
-            await conn.execute(
-                f"UPDATE runs SET {assignment} WHERE id = %s AND status = 'in-progress'",
-                (value, int(run_id)),
-            )
-
 
 async def create_run(
-    conn: psycopg.AsyncConnection, *, room_id: str, preset_id: str, kind: str
+    conn: psycopg.AsyncConnection, *, room_id: str, preset_id: str | None, kind: str
 ) -> RunRef:
+    """Insert an in-progress run with slug `mx-<id>`. A follow run may have no preset (NULL, and
+    `""` in its RunRef, which `deliver` never reads); a first run always has one (CHECK)."""
     if kind not in ("first", "follow"):
         raise ValueError(f"run kind must be first or follow, got {kind!r}")
     cur = await conn.execute(
@@ -109,23 +109,39 @@ async def create_run(
     return RunRef(
         id=run_id,
         slug=slug,
-        preset_id=preset_id,
+        preset_id=preset_id or "",
         session_id=None,
         message_id=None,
         started_at=started_at,
     )
 
 
-async def latest_session(
-    conn: psycopg.AsyncConnection, room_id: str
-) -> tuple[int, uuid.UUID] | None:
+async def set_session(
+    conn: psycopg.AsyncConnection, run_id: int, session_id: uuid.UUID | str
+) -> str | None:
+    """Store the session of an in-progress run; its slug, or None when it is not in progress."""
     cur = await conn.execute(
-        "SELECT id, session_id FROM runs WHERE room_id = %s AND session_id IS NOT NULL"
-        " ORDER BY id DESC LIMIT 1",
-        (room_id,),
+        "UPDATE runs SET session_id = %s::uuid WHERE id = %s AND status = 'in-progress'"
+        " RETURNING coalesce(slug, 'mx-' || id)",
+        (str(session_id), run_id),
     )
     row = await cur.fetchone()
-    return (row[0], row[1]) if row else None
+    return row[0] if row else None
+
+
+async def has_other_run(
+    conn: psycopg.AsyncConnection,
+    session_id: uuid.UUID | str,
+    room_id: str,
+    exclude_run_id: int,
+) -> bool:
+    """Whether the session has a run in the room other than `exclude_run_id`, of any status."""
+    cur = await conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM runs"
+        " WHERE session_id = %s::uuid AND room_id = %s AND id <> %s)",
+        (str(session_id), room_id, exclude_run_id),
+    )
+    return (await cur.fetchone())[0]
 
 
 async def in_progress(conn: psycopg.AsyncConnection) -> list[RunRow]:

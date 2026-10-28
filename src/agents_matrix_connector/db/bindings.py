@@ -158,6 +158,18 @@ async def release(
     return cur.rowcount == 1
 
 
+async def release_reservation(conn: psycopg.AsyncConnection, run_id: int, reason: str) -> bool:
+    """Release the run's active reservation while it has no session; False when it has none."""
+    cur = await conn.execute(
+        """
+        UPDATE room_bindings SET released_at = now(), release_reason = %s
+        WHERE run_id = %s AND origin = 'inbound' AND session_id IS NULL AND released_at IS NULL
+        """,
+        (reason, run_id),
+    )
+    return cur.rowcount == 1
+
+
 async def release_for_send(conn: psycopg.AsyncConnection, send_id: int, reason: str) -> bool:
     """Release the active binding the send created by initiating; False when it has none."""
     cur = await conn.execute(

@@ -251,3 +251,24 @@ async def test_prune_released_bindings(conn):
     cur = await conn.execute("SELECT id FROM room_bindings ORDER BY id")
     assert [r[0] for r in await cur.fetchall()] == [active_old, released_new]
     assert await bindings.prune_released(conn, cutoff) == 0
+
+
+async def test_release_reservation(conn):
+    """A first run that ends without a session releases only its own reservation."""
+    session = uuid.uuid4()
+    assert await bindings.reserve_for_run(conn, ROOM, 20) is True
+    assert await bindings.reserve_for_run(conn, "!b:x", 21) is True
+    assert await bindings.fill_session(conn, 21, session, "mx-21") is True
+    reserved = (await bindings.active_for_room(conn, ROOM)).id
+
+    assert await bindings.release_reservation(conn, 99, "run_failed") is False
+    # A run whose binding holds its session keeps it.
+    assert await bindings.release_reservation(conn, 21, "run_failed") is False
+    assert (await bindings.active_for_room(conn, "!b:x")).session_id == session
+
+    assert await bindings.release_reservation(conn, 20, "run_failed") is True
+    released = await binding(conn, reserved)
+    assert released[2] is not None and released[3] == "run_failed"
+    assert await bindings.release_reservation(conn, 20, "again") is False
+    assert (await binding(conn, reserved))[3] == "run_failed"
+    assert await bindings.active_for_room(conn, ROOM) is None
