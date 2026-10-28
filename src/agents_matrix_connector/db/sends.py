@@ -46,6 +46,18 @@ class SendRow:
 
 
 @dataclass(frozen=True)
+class Ended:
+    """A sending send whose outbound rows have all ended (none is pending)."""
+
+    id: int
+    session_id: uuid.UUID
+    sent: int
+    first_event_id: str | None
+    first_failed_reason: str | None
+    failed: int
+
+
+@dataclass(frozen=True)
 class Ref:
     """A resolved `m<n>` (an inbound row) or `s<n>` (a send); the send fields are None for m."""
 
@@ -101,13 +113,14 @@ async def get(conn: psycopg.AsyncConnection, send_id: int) -> SendRow | None:
     return SendRow(**row) if row else None
 
 
-async def claim_queued(conn: psycopg.AsyncConnection) -> list[SendRow]:
-    """Move every queued send to sending, oldest first; a send another claimer holds is skipped."""
+async def claim_queued(conn: psycopg.AsyncConnection, now: datetime | None = None) -> list[SendRow]:
+    """Move every queued send to sending, oldest first; a send another claimer holds is skipped.
+    `claimed_at` is `now`, else the current time."""
     cur = await conn.execute(
         "SELECT id FROM sends WHERE status = 'queued' ORDER BY id FOR UPDATE SKIP LOCKED"
     )
     claimed = []
-    now = datetime.now(UTC)
+    now = now or datetime.now(UTC)
     for (send_id,) in await cur.fetchall():
         if await transition(conn, "sends", send_id, "queued", "sending", claimed_at=now):
             claimed.append(await get(conn, send_id))
@@ -126,6 +139,28 @@ async def mark_failed(conn: psycopg.AsyncConnection, send_id: int, reason: str) 
 
 async def mark_refused(conn: psycopg.AsyncConnection, send_id: int, reason: str) -> bool:
     return await transition(conn, "sends", send_id, "sending", "refused", reason=reason)
+
+
+async def ended(conn: psycopg.AsyncConnection) -> list[Ended]:
+    """Every sending send that has outbound rows and none of them pending, oldest first: how
+    many were sent and failed, the first row's event id and the first failed row's reason."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT s.id, s.session_id,
+                   count(*) FILTER (WHERE o.status = 'sent') AS sent,
+                   count(*) FILTER (WHERE o.status = 'failed') AS failed,
+                   (array_agg(o.event_id ORDER BY o.id))[1] AS first_event_id,
+                   (array_agg(o.reason ORDER BY o.id)
+                       FILTER (WHERE o.status = 'failed'))[1] AS first_failed_reason
+            FROM sends s JOIN outbound o ON o.send_id = s.id
+            WHERE s.status = 'sending'
+            GROUP BY s.id, s.session_id
+            HAVING count(*) FILTER (WHERE o.status = 'pending') = 0
+            ORDER BY s.id
+            """
+        )
+        return [Ended(**row) for row in await cur.fetchall()]
 
 
 async def count_recent(conn: psycopg.AsyncConnection, session_id: uuid.UUID, seconds: int) -> int:

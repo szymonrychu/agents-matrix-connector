@@ -158,6 +158,18 @@ async def release(
     return cur.rowcount == 1
 
 
+async def release_for_send(conn: psycopg.AsyncConnection, send_id: int, reason: str) -> bool:
+    """Release the active binding the send created by initiating; False when it has none."""
+    cur = await conn.execute(
+        """
+        UPDATE room_bindings SET released_at = now(), release_reason = %s
+        WHERE send_id = %s AND origin = 'agent' AND released_at IS NULL
+        """,
+        (reason, send_id),
+    )
+    return cur.rowcount == 1
+
+
 async def prune_released(conn: psycopg.AsyncConnection, older_than: datetime) -> int:
     cur = await conn.execute("DELETE FROM room_bindings WHERE released_at < %s", (older_than,))
     return cur.rowcount
