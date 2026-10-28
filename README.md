@@ -368,7 +368,39 @@ allow it, or call the API:
 Allow by `facebook` (the numeric Facebook id) or `user` to cover every chat of one person, or
 by `room` for one chat. A deny rule always wins over an allow rule. Set a preset per room
 (`PUT /matrix/api/v1/rooms/{room_id}/settings`) or one default preset
-(`PUT /matrix/api/v1/settings`); an allowed room with no preset is ignored with `no_preset`.
+(`PUT /matrix/api/v1/settings`); an allowed unbound room with no preset is ignored with
+`no_preset` (see "One session per room, one room per session").
+
+### One session per room, one room per session
+
+A chat room and a session are bound one to one (`room_bindings`): a room has at most one bound
+session and a session at most one bound room. A room gets bound in one of two ways:
+
+- an inbound chat in an unbound room starts a new `mx-<run id>` session from the room's preset
+  (else the default preset) under `MATRIX_MAX_NEW_SESSIONS`; the run reserves the room when it
+  claims the messages, so no agent can initiate there meanwhile, and the new session fills the
+  binding. A first run that ends without a session (for example `preset_not_found`) releases
+  the reservation (`run_failed`);
+- an agent initiates in an unbound room flagged `agents_may_initiate` (see "Let agents start
+  chats in a room"); its first send binds the room to its session, and a send that reached
+  nobody releases it again (`send_failed`).
+
+The user's messages in a bound room always go to the bound session, whatever it is (an `mx-`
+chat session, a hive leader, a webhook or schedule session), and never to any other session; a
+preset is needed only to start a new session in an unbound room. A session that has no other run
+in the room gets the untrusted-input preamble with its first batch. A busy session (for example a
+hive leader in a long turn) gets the batch queued behind its current turn; the bot follows that
+message until the session replies or the run timeout (`MATRIX_RUN_TIMEOUT_SECONDS`, default 1800
+s) passes, and meanwhile the room's later messages stay `new` and go in the next batch.
+
+Only deleting the session releases the binding (`session_gone`): once the session is deleted
+(not found, or being deleted), the bot releases the binding at the room's next message, and
+otherwise within about a minute through a sweep of the bound sessions. The room is then unbound:
+the next message starts a new `mx-` session (a preset is needed), and an agent may initiate
+there if the room is flagged. Turning `agents_may_initiate` off or adding a deny rule does not
+release the binding (a deny rule still stops every agent send and every inbound message). A
+session check the orchestrator refuses keeps the binding and the messages `new`; an unavailable
+orchestrator is retried on the next tick.
 
 ### Let agents start chats in a room
 
