@@ -152,13 +152,21 @@ class MatrixClient:
             for user_id, member in body.get("joined", {}).items()
         }
 
-    async def send_text(self, room_id: str, txn_id: str, body: str) -> str:
+    async def send_event(
+        self, room_id: str, event_type: str, txn_id: str, content: dict[str, Any]
+    ) -> str:
+        """PUT one event of any type; the txn id makes a repeated send return the same event id."""
         answer = await self._request(
             "PUT",
-            _path("rooms", room_id, "send", "m.room.message", txn_id),
-            json={"msgtype": "m.text", "body": body},
+            _path("rooms", room_id, "send", event_type, txn_id),
+            json=content,
         )
         return answer["event_id"]
+
+    async def send_text(self, room_id: str, txn_id: str, body: str) -> str:
+        return await self.send_event(
+            room_id, "m.room.message", txn_id, {"msgtype": "m.text", "body": body}
+        )
 
     async def typing(
         self, user_id: str, room_id: str, typing: bool, timeout_ms: int = 30000
