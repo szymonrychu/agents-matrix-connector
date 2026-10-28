@@ -2,6 +2,25 @@
 
 Lessons that outlive a session. Newest first.
 
+## 2026-10-28 decisions
+
+- Migration 0002 backfill: a binding's slug comes from the session's first run (NULL if that
+  run was pruned), never from a follow run. The first run is the one that created the
+  session, so it is the only run whose slug names the binding's origin; a follow run may
+  carry another agent's slug and would mislabel it.
+- `/chat/v1` routes accept a missing `X-Orch-Slug` and store it as NULL (`sends.slug` is
+  nullable). The session id is the identity of the caller, so the slug is informational and
+  rejecting its absence would only break callers that have none.
+- `/chat/v1/rooms` sorts names by code point with unnamed rooms last. The order is
+  deterministic, so an agent that lists rooms twice sees the same list.
+- Unknown references, another session's sends and another room's ids share one
+  `bad_reference` message. Distinct messages would let an agent probe which ids exist for
+  other sessions.
+- Agent room policy tie-breaks (design D4 was silent): several denied members resolve to
+  the lowest rule id; several allowed members resolve rule-backed allow before default
+  allow, then lowest rule id. Both are deterministic and make a stable, explainable
+  decision (an explicit rule outranks the default).
+
 ## 2026-10-26 decisions
 
 - Read receipts (user decision 2026-10-26, "On handoff"): the bot sends one public `m.read`
