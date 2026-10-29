@@ -49,6 +49,7 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_AGENT_PORT` | 8001 | api | bind port of the agent listener; must differ from `MATRIX_HTTP_PORT` |
 | `MATRIX_AGENT_TOKEN_SHA256` | empty | api | sha256 hex (64 lowercase characters) of the orchestrator's agent bearer token; empty leaves the agent listener unbound |
 | `MATRIX_AGENT_RATE_PER_MINUTE` | 20 | api | max agent sends (messages and reactions together) per session in the last 60 s (>= 1) |
+| `MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR` | 60 | api | max Matrix events (message chunks of `MATRIX_REPLY_CHUNK_CHARS`, one per reaction) that agent sends may put into one room in the last hour, all sessions together (>= 1) |
 | `MATRIX_ACCESS_TOKEN` | none | bot | Matrix access token (required unless the file is set) |
 | `MATRIX_ACCESS_TOKEN_FILE` | empty | bot | file holding the Matrix access token; wins over the variable, stripped |
 
@@ -230,7 +231,9 @@ allowlist applies to this port, so the orchestrator pod reaches it directly. Pat
 `/chat/v1` get `404 not_found`. The token and its hash never reach a log line or an error body.
 The UI app on `MATRIX_HTTP_PORT` serves no `/chat/v1` path. Every `/chat/v1` call also carries
 `X-Orch-Session: <session uuid>` (missing or malformed: `401 unauthorized`) and `X-Orch-Slug:
-<slug>` (stored with the send; may be absent). The agent's own token never reaches the
+<slug>` (stored with the send; may be absent, else the orchestrator's session slug rules: a
+DNS-1123 label of at most 40 characters, not `orchestrator` or `orchestrator-*`, or `400
+invalid_slug`). The agent's own token never reaches the
 connector.
 
 Message ids: `m<n>` is a chat message (the `id` the prompt shows on each `<message>`), `s<n>`
@@ -252,12 +255,18 @@ bound to another session. The binding is released only when the session is delet
 send that created it reached nobody); turning `agents_may_initiate` off does not release it.
 
 Checks run in this order and a refusal queues nothing: `X-Orch-Session` (`401 unauthorized`),
-body (`422 invalid_request`, `422 invalid_key`, `422 invalid_text`), references (`422 bad_reference`), room choice
+`X-Orch-Slug` (`400 invalid_slug`), body (`422 invalid_request`, `422 invalid_key`, `422 invalid_text`), references (`422 bad_reference`), room choice
 (`422 room_required`), (a) (`403 room_not_allowed`), (b) (`409 room_bound`, `403
 room_not_authorised`, `409 session_bound`, in that order), duplicate (`202` with the existing
-send), rate (`429 rate_limited`). The (b) check, the duplicate lookup and the rate count are
-advisory: they are not atomic with the insert, and the bot's claim re-checks (b), refusing a send
-that lost a race with reason `room_bound`, `session_bound` or `room_not_authorised`.
+send), rate (`429 rate_limited`), room chunk cap (`429 room_chunk_limit`). The (b) check is
+advisory: the bot's claim re-checks it, refusing a send that lost a race with reason
+`room_bound`, `session_bound` or `room_not_authorised`. The duplicate lookup, the rate count and
+the room chunk count run under transaction-scoped advisory locks on the session and on the room,
+so they are atomic with the insert and parallel requests cannot exceed either limit.
+
+A reference (`reply_to` or `to`) to an `m<n>` of a room that is not the session's own bound room
+whose room check fails answers `422 bad_reference`, the same as an unknown id, so a session
+cannot probe which ids exist in other rooms. In the session's own room the specific code applies.
 
 Duplicate rule: a request identical to a send of the same session, room and kind, with the same
 `text` (message) or `key` (reaction) and the same `reply_to` (a reaction's `to`), compared
@@ -269,22 +278,29 @@ counted by the rate limit and is answered even at the limit.
 Rate: at most `MATRIX_AGENT_RATE_PER_MINUTE` sends (messages and reactions together, of any
 status) per session in the last 60 s.
 
+Room chunk cap: at most `MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR` Matrix events per room in the last
+hour, summed over every session that sent there. A message counts one per chunk (its text split
+at `MATRIX_REPLY_CHUNK_CHARS`, so one 16000-character message is 4 chunks at the default), a
+reaction one; `refused` sends do not count. A send that would pass the cap is refused whole.
+
 Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
 
 | Code | Status | Meaning |
 |---|---|---|
 | `unauthorized` | 401 | the bearer token is missing or wrong, or `X-Orch-Session` is not a uuid |
+| `invalid_slug` | 400 | `X-Orch-Slug` is sent but is not a valid session slug |
 | `not_found` | 404 | the id is not one of this session's sends, or the path does not exist |
 | `invalid_request` | 422 | a body field failed validation: `text` empty or over 16000 characters, a wrong type, an unknown field |
 | `invalid_text` | 422 | the message `text` has no non-whitespace character, so it could never be delivered |
 | `invalid_key` | 422 | the reaction `key` is not 1 to 16 code points, or has ASCII, whitespace or control characters |
-| `bad_reference` | 422 | `reply_to` or `to` is not an `m<n>` or `s<n>` this session can reference: unknown, another session's send, a send not yet `sent`, a reaction, of another room than the given `room`, or a raw event id |
+| `bad_reference` | 422 | `reply_to` or `to` is not an `m<n>` or `s<n>` this session can reference: unknown, another session's send, a send not yet `sent`, a reaction, of another room than the given `room`, an `m<n>` whose room is refused to a session that is not bound to it, or a raw event id |
 | `room_required` | 422 | no `room`, no `reply_to`, and the session is bound to no room |
 | `room_not_allowed` | 403 | the room is unknown or not policy-allowed for agent sends (both answer the same) |
 | `room_bound` | 409 | the room is bound to (or reserved by) another session |
 | `room_not_authorised` | 403 | the room is unbound and not flagged `agents_may_initiate` |
 | `session_bound` | 409 | the room is unbound and flagged, but the session is already bound to another room |
 | `rate_limited` | 429 | the session reached `MATRIX_AGENT_RATE_PER_MINUTE` sends in the last 60 s |
+| `room_chunk_limit` | 429 | the send would take the room past `MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR` chunks in the last hour |
 | `unavailable` | 503 | the database is unavailable |
 
 Send statuses: `queued` (accepted, waiting for the bot), `sending` (claimed by the bot, being

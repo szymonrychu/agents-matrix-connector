@@ -159,6 +159,8 @@ def test_readme_lists_every_agent_route() -> None:
         "room_bound",
         "session_bound",
         "rate_limited",
+        "room_chunk_limit",
+        "invalid_slug",
         "unavailable",
     ):
         assert f"`{code}`" in agent, f"README Agent API does not name error code {code}"
@@ -180,6 +182,7 @@ def test_readme_lists_every_agent_route() -> None:
         "X-Orch-Slug",
         "openapi-agent.json",
         "MATRIX_AGENT_RATE_PER_MINUTE",
+        "MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR",
         "agents_may_initiate",
     ):
         assert phrase in agent, phrase

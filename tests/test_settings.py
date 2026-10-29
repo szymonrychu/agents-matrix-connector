@@ -149,15 +149,18 @@ def test_agent_listener_settings(monkeypatch):
     assert s.agent_port == 8001
     assert s.agent_token_sha256.get_secret_value() == ""
     assert s.agent_rate_per_minute == 20
+    assert s.agent_room_chunks_per_hour == 60
 
     digest = hashlib.sha256(secrets.token_hex(32).encode()).hexdigest()
     monkeypatch.setenv("MATRIX_AGENT_TOKEN_SHA256", digest)
     monkeypatch.setenv("MATRIX_AGENT_PORT", "9001")
     monkeypatch.setenv("MATRIX_AGENT_RATE_PER_MINUTE", "1")
+    monkeypatch.setenv("MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR", "9")
     s = load_settings(ApiSettings)
     assert s.agent_token_sha256.get_secret_value() == digest
     assert s.agent_port == 9001
     assert s.agent_rate_per_minute == 1
+    assert s.agent_room_chunks_per_hour == 9
     for text in (repr(s), str(s), repr(load_settings(BotSettings))):
         assert digest not in text
 
@@ -171,6 +174,9 @@ def test_agent_listener_settings(monkeypatch):
     monkeypatch.setenv("MATRIX_AGENT_RATE_PER_MINUTE", "0")
     assert "MATRIX_AGENT_RATE_PER_MINUTE" in problems(ApiSettings)
     monkeypatch.setenv("MATRIX_AGENT_RATE_PER_MINUTE", "20")
+    monkeypatch.setenv("MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR", "0")
+    assert "MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR" in problems(ApiSettings)
+    monkeypatch.setenv("MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR", "60")
 
     monkeypatch.setenv("MATRIX_HTTP_PORT", "9001")
     assert "MATRIX_AGENT_PORT" in problems(ApiSettings)

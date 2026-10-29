@@ -571,7 +571,7 @@ async def test_claim_refuses_binding_conflicts(sender, tracker, pool, hs):
     ]
 
 
-async def test_failed_initiation_releases_binding(sender, tracker, pool, hs, matrix):
+async def test_failed_initiating_send_releases_binding(sender, tracker, pool, hs, matrix):
     failed_init, partly_sent, refused_init, bound_session = (uuid.uuid4() for _ in range(4))
     await allowed_room(pool, R1, flag=True)
     await allowed_room(pool, R2, flag=True)
@@ -612,6 +612,37 @@ async def test_failed_initiation_releases_binding(sender, tracker, pool, hs, mat
     assert await active_binding(pool, R3) is None
     assert await active_binding(pool, R2) == (partly_sent, "hive-1", "agent", partial)
     assert await active_binding(pool, R4) == (bound_session, "earlier", "agent", 999)
+
+
+async def test_failed_initiating_send_keeps_binding_after_later_delivery(
+    sender, tracker, pool, hs, matrix
+):
+    session, other = uuid.uuid4(), uuid.uuid4()
+    await allowed_room(pool, R1, flag=True)
+    await allowed_room(pool, R2, flag=True)
+    # m1 and m2 are queued before the claim: m1 binds R1, m2 finds it "already" bound.
+    first = await queue(pool, session, R1, text="first fails")
+    second = await queue(pool, session, R1, text="second lands")
+    # In R2 the later send fails too, so nothing reached the room and the binding goes.
+    lone_first = await queue(pool, other, R2, text="lone first fails")
+    lone_second = await queue(pool, other, R2, text="lone second fails")
+
+    await sender.tick()
+    assert await active_binding(pool, R1) == (session, "hive-1", "agent", first)
+    matrix.fail[f"mxa-{first}-1"] = MatrixError(400, "M_TOO_LARGE", "too large")
+    matrix.fail[f"mxa-{lone_first}-1"] = MatrixError(400, "M_TOO_LARGE", "too large")
+    matrix.fail[f"mxa-{lone_second}-1"] = MatrixError(400, "M_TOO_LARGE", "too large")
+    await tracker.tick()
+    await sender.tick()
+
+    assert await send_state(pool, first) == ("failed", "M_TOO_LARGE")
+    assert await send_state(pool, second) == ("sent", None)
+    assert hs.sent(R1) == [text_event("second lands")]
+    # The user's reply to the delivered message still reaches the session.
+    assert await active_binding(pool, R1) == (session, "hive-1", "agent", first)
+    assert await send_state(pool, lone_first) == ("failed", "M_TOO_LARGE")
+    assert await send_state(pool, lone_second) == ("failed", "M_TOO_LARGE")
+    assert await active_binding(pool, R2) is None
 
 
 async def test_settle_sent_and_failed(sender, tracker, pool, hs, matrix):

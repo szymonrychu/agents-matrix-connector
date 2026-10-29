@@ -6,6 +6,7 @@ inbound rows and send statuses with plain SQL, as the bot worker would.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import secrets
@@ -15,6 +16,7 @@ from datetime import datetime
 import httpx
 import pytest
 from api_helpers import BOT, make_settings
+from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector.api import agent as agent_api
 from agents_matrix_connector.api.agent import CHAT_PREFIX, create_agent_app, valid_key
@@ -337,8 +339,9 @@ async def test_room_choice(agent, conn):
     assert row["room_id"] == flagged and row["reply_to"] == ref
     assert row["ref_event_id"] == event_id
 
-    # The referenced message's room wins over the session's bound room, and is then checked.
-    refused(await say(agent, bound, "elsewhere", reply_to=ref), 409, "session_bound")
+    # The referenced message's room wins over the session's bound room, and is then checked; a
+    # room that is not the session's own is answered as an unusable reference.
+    refused(await say(agent, bound, "elsewhere", reply_to=ref), 422, "bad_reference")
     home_ref, _ = await add_inbound(conn, home)
     in_home = accepted(await say(agent, bound, "home reply", reply_to=home_ref))
     assert (await send_row(conn, in_home))["room_id"] == home
@@ -451,21 +454,25 @@ async def test_derived_room_authorised(agent, conn):
     s_home = await add_send(conn, bound, home)
     before_sends, before_bindings = await count_sends(conn), await bindings_snapshot(conn)
 
-    cases = [
-        (unbound, m_denied, 403, "room_not_allowed"),
-        (unbound, m_other, 409, "room_bound"),
-        (bound, m_other, 409, "room_bound"),
-        (unbound, m_unflagged, 403, "room_not_authorised"),
-        (bound, m_flagged, 409, "session_bound"),
-    ]
-    for session, ref, status, error in cases:
-        refused(await say(agent, session, "reply", reply_to=ref), status, error)
-        refused(await react(agent, session, ref), status, error)
+    # A reference into a room that is not the session's own answers like an unknown id.
+    for session, ref in (
+        (unbound, m_denied),
+        (unbound, m_other),
+        (bound, m_other),
+        (unbound, m_unflagged),
+        (bound, m_flagged),
+    ):
+        refused(await say(agent, session, "reply", reply_to=ref), 422, "bad_reference")
+        refused(await react(agent, session, ref), 422, "bad_reference")
 
-    # A room that turns denied refuses replies and reactions to the session's own sent send.
+    # The session's own room keeps its informative refusal: a room that turns denied refuses
+    # replies and reactions to the session's own sent send and to an inbound message of it.
+    m_home, _ = await add_inbound(conn, home)
     await add_rule(conn, "deny", "room", home)
     refused(await say(agent, bound, "reply", reply_to=s_home), 403, "room_not_allowed")
     refused(await react(agent, bound, s_home), 403, "room_not_allowed")
+    refused(await say(agent, bound, "reply", reply_to=m_home), 403, "room_not_allowed")
+    refused(await react(agent, bound, m_home), 403, "room_not_allowed")
 
     assert await count_sends(conn) == before_sends
     assert await bindings_snapshot(conn) == before_bindings
@@ -650,6 +657,220 @@ async def test_rate_limit(agent_for, conn):
     await age_sends(conn, session)
     accepted(await say(agent, session, "three"))
     assert await count_sends(conn, session) == 4
+
+
+async def test_parallel_sends_respect_rate_limit(agent_for, conn):
+    agent = agent_for(agent_rate_per_minute=3)
+    home = "!home:x"
+    await add_room(conn, home)
+    await allow_room(conn, home)
+    session = uuid.uuid4()
+    await bind(conn, home, session)
+
+    results = await asyncio.gather(*(say(agent, session, f"parallel {n}") for n in range(6)))
+
+    assert sorted(r.status_code for r in results) == [202, 202, 202, 429, 429, 429]
+    for r in results:
+        if r.status_code == 429:
+            assert code(r) == "rate_limited"
+    assert await count_sends(conn, session) == 3
+
+
+def rendezvous(monkeypatch, name: str, parties: int) -> None:
+    """Make the first `parties` calls of `directory.<name>` wait for each other, so every
+    request is at that call at the same moment: a request that still holds a pool connection
+    there is then holding one while all the others do too."""
+    real = getattr(agent_api.directory, name)
+    barrier = asyncio.Barrier(parties)
+    arrived = 0
+
+    async def wrapper(*args, **kwargs):
+        nonlocal arrived
+        arrived += 1
+        if arrived <= parties:
+            await asyncio.wait_for(barrier.wait(), timeout=5)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(agent_api.directory, name, wrapper)
+
+
+async def test_concurrent_requests_do_not_exhaust_pool(url, conn, monkeypatch):
+    size = 4
+    small = AsyncConnectionPool(url, min_size=size, max_size=size, timeout=3, open=False)
+    await small.open(wait=True)
+    try:
+        client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app=create_agent_app(small, make_settings(agent_token_sha256=DIGEST))
+            ),
+            base_url="http://agents" + CHAT_PREFIX,
+        )
+        sessions = [uuid.uuid4() for _ in range(size)]
+        for n, session in enumerate(sessions):
+            home = f"!home{n}:x"
+            await add_room(conn, home, flag=False)
+            await allow_room(conn, home)
+            await bind(conn, home, session)
+        await add_room(conn, "!open:x", flag=True)
+        await allow_room(conn, "!open:x")
+
+        # N requests, pool of N: every request is at the room read holding no second connection.
+        rendezvous(monkeypatch, "get_room", size)
+        sent = await asyncio.gather(*(say(client, s, "hi") for s in sessions))
+        assert [r.status_code for r in sent] == [202] * size, [r.text for r in sent]
+
+        rendezvous(monkeypatch, "list_rooms", size)
+        listings = await asyncio.gather(*(client.get("/rooms", headers=as_(s)) for s in sessions))
+        assert [r.status_code for r in listings] == [200] * size, [r.text for r in listings]
+        for n, response in enumerate(listings):
+            assert [room["room_id"] for room in response.json()["rooms"]] == [f"!home{n}:x"]
+        await client.aclose()
+    finally:
+        await small.close()
+
+
+async def test_room_hourly_chunk_cap(agent_for, conn):
+    agent = agent_for(agent_room_chunks_per_hour=5, reply_chunk_chars=100)
+    home, other_home = "!home:x", "!otherhome:x"
+    for room in (home, other_home):
+        await add_room(conn, room)
+        await allow_room(conn, room)
+    session, other = uuid.uuid4(), uuid.uuid4()
+    await bind(conn, home, session)
+    await bind(conn, other_home, other)
+    m_home, _ = await add_inbound(conn, home)
+
+    accepted(await say(agent, session, "a" * 250))  # 3 chunks
+    before = await count_sends(conn, session)
+    r = await say(agent, session, "b" * 250)  # 3 more would make 6
+    refused(r, 429, "room_chunk_limit")
+    assert "5 chunks" in r.json()["error"]["message"]
+    refused(await say(agent, session, "b" * 250, room=home), 429, "room_chunk_limit")
+    assert await count_sends(conn, session) == before
+
+    accepted(await say(agent, session, "c" * 150))  # 2 chunks: exactly the cap
+    refused(await say(agent, session, "d"), 429, "room_chunk_limit")
+    refused(await react(agent, session, m_home), 429, "room_chunk_limit")  # a reaction is 1
+    accepted(await say(agent, other, "a" * 250))  # another room has its own budget
+
+    # A duplicate of an accepted send is still answered at the cap.
+    assert (await say(agent, session, "c" * 150)).status_code == 202
+
+    await age_sends(conn, session, 3601)
+    accepted(await say(agent, session, "b" * 250))
+
+
+async def test_room_chunk_cap_counts_failed_not_refused(agent_for, conn):
+    agent = agent_for(agent_room_chunks_per_hour=2)
+    home = "!home:x"
+    await add_room(conn, home)
+    await allow_room(conn, home)
+    session = uuid.uuid4()
+    await bind(conn, home, session)
+
+    first = accepted(await say(agent, session, "one"))
+    second = accepted(await say(agent, session, "two"))
+    await set_send(conn, first, status="failed", reason="forbidden")
+    refused(await say(agent, session, "three"), 429, "room_chunk_limit")
+    await set_send(conn, second, status="refused", reason="room_bound")
+    accepted(await say(agent, session, "three"))
+
+
+async def test_parallel_sessions_respect_room_chunk_cap(agent_for, conn):
+    agent = agent_for(agent_room_chunks_per_hour=3)
+    room = "!flag:x"
+    await add_room(conn, room, flag=True)
+    await allow_room(conn, room)
+    sessions = [uuid.uuid4() for _ in range(6)]
+
+    results = await asyncio.gather(*(say(agent, s, "hi", room=room) for s in sessions))
+
+    assert sorted(r.status_code for r in results) == [202, 202, 202, 429, 429, 429]
+    for r in results:
+        if r.status_code == 429:
+            assert code(r) == "room_chunk_limit"
+    assert await count_sends(conn) == 3
+
+
+@pytest.mark.parametrize(
+    "slug",
+    [
+        "Upper",
+        "has space",
+        "-lead",
+        "trail-",
+        "under_score",
+        "a.b",
+        "a/b",
+        "orchestrator",
+        "orchestrator-x",
+        "a" * 41,
+        "a" * 5000,
+    ],
+)
+async def test_invalid_slug_header_rejected(agent, conn, slug):
+    home = "!home:x"
+    await add_room(conn, home)
+    await allow_room(conn, home)
+    session = uuid.uuid4()
+    await bind(conn, home, session)
+    m_home, _ = await add_inbound(conn, home)
+
+    headers = as_(session, slug=slug)
+    r = await agent.post("/messages", json={"text": "hi"}, headers=headers)
+    refused(r, 400, "invalid_slug")
+    r = await agent.post("/reactions", json={"to": m_home, "key": "\U0001f44d"}, headers=headers)
+    refused(r, 400, "invalid_slug")
+    refused(await agent.get("/rooms", headers=headers), 400, "invalid_slug")
+    assert await count_sends(conn) == 0
+
+    # The session identity is checked first.
+    r = await agent.post(
+        "/messages", json={"text": "hi"}, headers={**headers, "X-Orch-Session": "nope"}
+    )
+    refused(r, 401, "unauthorized")
+
+
+async def test_valid_slugs_stored(agent, conn):
+    home = "!home:x"
+    await add_room(conn, home)
+    await allow_room(conn, home)
+    session = uuid.uuid4()
+    await bind(conn, home, session)
+
+    for n, slug in enumerate(("a", "mx-12", "orchestrators", "a" * 40, "0-9")):
+        r = await agent.post("/messages", json={"text": f"hi {n}"}, headers=as_(session, slug=slug))
+        assert (await send_row(conn, accepted(r)))["slug"] == slug
+
+
+async def test_foreign_reference_errors_are_uniform(agent, conn):
+    bound_elsewhere, denied, unflagged, own = "!other:x", "!denied:x", "!unflagged:x", "!own:x"
+    await add_room(conn, bound_elsewhere, flag=True)
+    await add_room(conn, denied, flag=True)
+    await add_rule(conn, "deny", "room", denied)
+    await add_room(conn, unflagged, flag=False)
+    await add_room(conn, own, flag=False)
+    for room in (bound_elsewhere, unflagged, own):
+        await allow_room(conn, room)
+    stranger, bound, other = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await bind(conn, bound_elsewhere, other)
+    await bind(conn, own, bound)
+    foreign = [
+        (await add_inbound(conn, room))[0] for room in (bound_elsewhere, denied, unflagged)
+    ] + ["m999999"]
+    before = await count_sends(conn)
+
+    for session in (stranger, bound):
+        answers = []
+        for ref in foreign:
+            message = await say(agent, session, "probe", reply_to=ref)
+            reaction = await react(agent, session, ref)
+            refused(message, 422, "bad_reference")
+            refused(reaction, 422, "bad_reference")
+            answers.append(message.json()["error"]["message"].split(": ", 1)[1])
+            answers.append(reaction.json()["error"]["message"].split(": ", 1)[1])
+        assert len(set(answers)) == 1
+    assert await count_sends(conn) == before
 
 
 async def test_validation(agent, conn):
@@ -840,6 +1061,7 @@ async def test_listing_matches_send_checks(agent, conn):
                 await reserve(conn, room_id)
             targets[room_id], _ = await add_inbound(conn, room_id)
 
+    own_room = {callers[policy]: room_of[(policy, "caller")] for policy in policies}
     allowed = {"room_rule", "member_rule"}
     expected = {
         unbound: {room_of[(p, "flagged")] for p in allowed},
@@ -855,9 +1077,12 @@ async def test_listing_matches_send_checks(agent, conn):
             message = await say(agent, session, f"{session} {room_id}", room=room_id)
             reaction = await react(agent, session, target)
             assert (message.status_code == 202) == (room_id in listing), (room_id, message.text)
-            assert reaction.status_code == message.status_code, (room_id, reaction.text)
-            if message.status_code != 202:
-                assert code(reaction) == code(message)
+            if message.status_code == 202:
+                assert reaction.status_code == 202, (room_id, reaction.text)
+            elif room_id == own_room.get(session):
+                assert code(reaction) == code(message)  # the session's own room is explained
+            else:
+                refused(reaction, 422, "bad_reference")  # another room's message is not visible
 
 
 async def test_status_own_sends_only(agent, conn):

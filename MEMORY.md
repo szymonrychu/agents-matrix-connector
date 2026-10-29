@@ -4,6 +4,49 @@ Lessons that outlive a session. Newest first.
 
 ## 2026-10-28 decisions
 
+- One pool connection per request, binding kept after a later delivery (2026-10-29, epic
+  matrix-connector-agent-initi, epic review Consider 1 and 2):
+  - A `/chat/v1` request holds at most one pool connection at a time. `queue` and `list_rooms`
+    used to read the room through `directory.get_room(pool)` while the route held a connection,
+    so as many simultaneous requests as the pool size (10, shared with the UI api) each held
+    one and waited for a second until the pool timeout, then all answered 503. The routes now
+    release their connection before `queue` runs, `queue` reads the room first and then takes
+    its own connection, and `list_rooms` reads the directory before taking one. The room read
+    and the checks are no longer one snapshot, which is fine: the room checks are advisory and
+    the bot's claim re-checks them. Do not call a pool-taking helper inside `pool.connection()`.
+  - `sender.release_initiation` replaces the plain `bindings.release_for_send` for a send that
+    ended `failed` or `refused` with no sent row: it keeps the binding when a later send
+    (higher id) of the same session reached the same room (an outbound row `sent`). Why: with
+    m1 and m2 queued before the claim, m1 binds the room and m2 is "already"; if m1 failed and m2
+    landed, releasing the binding made the user's reply to m2 start a new `mx-` session instead
+    of reaching the agent that wrote to them. A later send that has not been delivered yet does
+    not count, so a binding with nothing delivered is still released.
+
+- Agent outbound limits (2026-10-28, epic matrix-connector-agent-initi, security review MEDIUM 2
+  and LOW 2/3; outbound messages reach a real Messenger user, so abuse limits must hold):
+  - The duplicate lookup, the per-session rate count (`MATRIX_AGENT_RATE_PER_MINUTE`, 20 per 60 s)
+    and the new per-room cap now run in one transaction under `pg_advisory_xact_lock` on the
+    session id and then on the room id (always in that order, so no lock cycle), before the
+    insert. Why: counting and inserting in separate statements let parallel requests exceed the
+    limit. The room-check (b) stays advisory; the bot's claim re-checks it.
+  - New `MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR`, default 60 chunks per hour (>= 1): at most that many per room
+    in the last hour, summed over all sessions. A message counts `len(chunks.split(text,
+    MATRIX_REPLY_CHUNK_CHARS))` (one 16000-character send is 4 chunks at 4000), a reaction 1,
+    `refused` sends 0. Why chunks and not sends: the rate limit alone let a session push about 80
+    Messenger messages a minute (20 sends of 4 chunks). 60 per hour is one a minute on average,
+    conservative for a person's DM. Refusal is 429 `room_chunk_limit`, distinct from
+    `rate_limited`; a send that would pass the cap is refused whole.
+  - `X-Orch-Slug` is validated with the orchestrator's session slug rules (DNS-1123 label, at
+    most 40 characters, not `orchestrator` or `orchestrator-*`) and answers 400 `invalid_slug`;
+    absent or empty stays NULL. Why: it was stored unvalidated and unbounded. The session
+    check (401) still comes first.
+  - A reply or reaction to an `m<n>` whose room check fails now answers 422 `bad_reference`, the
+    same as an unknown id, unless that room is the session's own bound room. Why: 409
+    `room_bound` for a room bound elsewhere versus 422 for an unknown id let a session probe
+    which ids exist in other rooms. In its own room the specific refusal (for example 403
+    `room_not_allowed` after the room turned denied) is kept, because the session already knows
+    that room. Replies to `s<n>` keep their codes: those are the session's own sends.
+
 - A whitespace-only message text is refused at the api (2026-10-28, epic
   matrix-connector-agent-initi, found by mxc-bot-sends-delivery): `POST /chat/v1/messages`
   answers 422 `invalid_text` and queues nothing when the text has no non-whitespace character

@@ -16,6 +16,7 @@ a send re-checks the room and is the binding step (D9).
 import hashlib
 import hmac
 import logging
+import re
 import unicodedata
 import uuid
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from agents_matrix_connector.api.app import (
 )
 from agents_matrix_connector.api.rooms import agent_room_decision
 from agents_matrix_connector.api.schemas import ApiError
+from agents_matrix_connector.chunks import split
 from agents_matrix_connector.db import bindings, directory, rules, sends
 from agents_matrix_connector.settings import ApiSettings, ConnectorSettings
 
@@ -49,6 +51,10 @@ MAX_TEXT_CHARS = 16000
 MAX_KEY_CODE_POINTS = 16
 DUPLICATE_SECONDS = 60
 RATE_WINDOW_SECONDS = 60
+ROOM_WINDOW_SECONDS = 3600
+SLUG_MAX = 40
+_SLUG_RE = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", re.ASCII)
+_UNUSABLE_REFERENCE = "not a message id (m<n> or s<n>) this session can reference"
 
 Verdict = Literal["ok", "room_not_allowed", "room_bound", "room_not_authorised", "session_bound"]
 _REFUSALS: dict[str, tuple[int, str]] = {
@@ -217,16 +223,61 @@ def caller(
         str | None, Header(alias="X-Orch-Slug", description="the calling session's slug")
     ] = None,
 ) -> Caller:
-    """The session the orchestrator calls for; a missing or malformed uuid is 401."""
+    """The session the orchestrator calls for; a missing or malformed uuid is 401 and an
+    invalid slug 400."""
     try:
         session_id = uuid.UUID(session or "")
     except ValueError:
         raise ApiError(401, "unauthorized", "X-Orch-Session: a session uuid is required") from None
+    if slug and not valid_slug(slug):
+        raise ApiError(
+            400,
+            "invalid_slug",
+            f"X-Orch-Slug: a session slug (lowercase letters, digits and hyphens, at most "
+            f"{SLUG_MAX} characters, not orchestrator or orchestrator-*) is required when sent",
+        )
     return Caller(session_id, slug or None)
+
+
+def valid_slug(slug: str) -> bool:
+    """The orchestrator's session slug rules: a DNS-1123 label of at most 40 characters that is
+    not `orchestrator` or `orchestrator-*` (`agents_orchestrator.spec.validate_slug`)."""
+    return (
+        len(slug) <= SLUG_MAX
+        and _SLUG_RE.fullmatch(slug) is not None
+        and slug != "orchestrator"
+        and not slug.startswith("orchestrator-")
+    )
 
 
 def _bad_reference(field: str, why: str) -> ApiError:
     return ApiError(422, "bad_reference", f"{field}: {why}")
+
+
+def _chunk_count(kind: str, text: str | None, chunk_chars: int) -> int:
+    """Matrix events one send puts into its room: a reaction is one, a message one per chunk."""
+    return 1 if kind == "reaction" else max(1, len(split(text or "", chunk_chars)))
+
+
+async def _room_chunks_last_hour(
+    conn: psycopg.AsyncConnection, room_id: str, chunk_chars: int
+) -> int:
+    """Chunks sent or queued to the room in the last hour, by any session; a refused send
+    delivered nothing and does not count."""
+    cur = await conn.execute(
+        "SELECT kind, text FROM sends WHERE room_id = %s AND status <> 'refused'"
+        " AND created_at > now() - make_interval(secs => %s)",
+        (room_id, ROOM_WINDOW_SECONDS),
+    )
+    return sum(_chunk_count(kind, text, chunk_chars) for kind, text in await cur.fetchall())
+
+
+async def _lock(conn: psycopg.AsyncConnection, kind: str, key: str) -> None:
+    """Hold a transaction-scoped advisory lock on `kind:key` until the transaction ends."""
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (f"agents-matrix-connector:sends:{kind}:{key}",),
+    )
 
 
 async def _resolve(
@@ -238,9 +289,9 @@ async def _resolve(
     """
     resolved = await sends.resolve(conn, ref)
     if resolved is None or (resolved.source == "send" and resolved.session_id != who.session_id):
-        raise _bad_reference(field, "not a message id (m<n> or s<n>) this session can reference")
+        raise _bad_reference(field, _UNUSABLE_REFERENCE)
     if room is not None and resolved.room_id != room:
-        raise _bad_reference(field, "not a message id (m<n> or s<n>) this session can reference")
+        raise _bad_reference(field, _UNUSABLE_REFERENCE)
     if resolved.kind == "reaction":
         raise _bad_reference(field, "a reaction cannot be replied or reacted to")
     if resolved.source == "send" and (resolved.status != "sent" or resolved.event_id is None):
@@ -250,14 +301,9 @@ async def _resolve(
 
 def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRouter:
     router = APIRouter(prefix=CHAT_PREFIX)
-    send_errors = _errors(401, 403, 409, 422, 429, 503)
-
-    async def verdict(conn: psycopg.AsyncConnection, who: Caller, room_id: str) -> Verdict:
-        room = await directory.get_room(pool, room_id)
-        return await may_post(conn, who.session_id, room, await rules.list_rules(conn), settings)
+    send_errors = _errors(400, 401, 403, 409, 422, 429, 503)
 
     async def queue(
-        conn: psycopg.AsyncConnection,
         who: Caller,
         *,
         kind: str,
@@ -266,63 +312,96 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
         key: str | None,
         reply_to: str | None,
         ref_event_id: str | None,
+        masked_field: str | None = None,
     ) -> SendAccepted:
-        """The room checks, the duplicate and the rate limit, in that order; then the insert.
+        """The room checks, then, under the session's and the room's advisory locks, the
+        duplicate, the per-session rate limit and the per-room hourly chunk cap; then the insert.
 
-        All three are advisory: they are not atomic with the insert, and the bot's claim
-        re-checks the room (design D5, D9).
+        A request holds at most one pool connection at a time: the room is read before this
+        request takes its connection, and the callers release theirs before calling.
+
+        The room checks are advisory: the bot's claim re-checks the room (design D5, D9). The
+        locks make the two limits atomic with the insert, so parallel requests cannot exceed
+        them. The session lock is always taken before the room lock, so two requests never
+        wait on each other in a cycle. A room refusal for an inbound message of a room that is
+        not the session's own answers `bad_reference` on `masked_field` like an unknown id, so
+        a session cannot probe which ids exist in other rooms.
         """
-        outcome = await verdict(conn, who, room_id)
-        if outcome != "ok":
-            status, message = _REFUSALS[outcome]
-            log.info("agent send refused session=%s code=%s", who.session_id, outcome)
-            raise ApiError(status, outcome, message)
-        duplicate = await sends.find_duplicate(
-            conn,
-            session_id=who.session_id,
-            room_id=room_id,
-            kind=kind,
-            text=text,
-            key=key,
-            reply_to=reply_to,
-            seconds=DUPLICATE_SECONDS,
-        )
-        if duplicate is not None:
-            log.info("agent send duplicate session=%s id=s%s", who.session_id, duplicate.id)
-            return SendAccepted(id=f"s{duplicate.id}", status=duplicate.status)
-        recent = await sends.count_recent(conn, who.session_id, RATE_WINDOW_SECONDS)
-        if recent >= settings.agent_rate_per_minute:
-            log.info("agent send refused session=%s code=rate_limited", who.session_id)
-            raise ApiError(
-                429,
-                "rate_limited",
-                f"at most {settings.agent_rate_per_minute} sends per session in 60 s",
+        room = await directory.get_room(pool, room_id)
+        async with pool.connection() as conn:
+            outcome = await may_post(
+                conn, who.session_id, room, await rules.list_rules(conn), settings
             )
-        send_id = await sends.insert(
-            conn,
-            session_id=who.session_id,
-            slug=who.slug,
-            kind=kind,
-            room_id=room_id,
-            text=text,
-            key=key,
-            reply_to=reply_to,
-            ref_event_id=ref_event_id,
-        )
-        log.info("agent send queued session=%s id=s%s kind=%s", who.session_id, send_id, kind)
-        return SendAccepted(id=f"s{send_id}", status="queued")
+            if outcome != "ok":
+                log.info("agent send refused session=%s code=%s", who.session_id, outcome)
+                if masked_field is not None:
+                    own = await bindings.active_for_session(conn, who.session_id)
+                    if own is None or own.room_id != room_id:
+                        raise _bad_reference(masked_field, _UNUSABLE_REFERENCE)
+                status, message = _REFUSALS[outcome]
+                raise ApiError(status, outcome, message)
+            async with conn.transaction():
+                await _lock(conn, "session", str(who.session_id))
+                await _lock(conn, "room", room_id)
+                duplicate = await sends.find_duplicate(
+                    conn,
+                    session_id=who.session_id,
+                    room_id=room_id,
+                    kind=kind,
+                    text=text,
+                    key=key,
+                    reply_to=reply_to,
+                    seconds=DUPLICATE_SECONDS,
+                )
+                if duplicate is not None:
+                    log.info("agent send duplicate session=%s id=s%s", who.session_id, duplicate.id)
+                    return SendAccepted(id=f"s{duplicate.id}", status=duplicate.status)
+                recent = await sends.count_recent(conn, who.session_id, RATE_WINDOW_SECONDS)
+                if recent >= settings.agent_rate_per_minute:
+                    log.info("agent send refused session=%s code=rate_limited", who.session_id)
+                    raise ApiError(
+                        429,
+                        "rate_limited",
+                        f"at most {settings.agent_rate_per_minute} sends per session in 60 s",
+                    )
+                cap = settings.agent_room_chunks_per_hour
+                chunks = _chunk_count(kind, text, settings.reply_chunk_chars)
+                if (
+                    await _room_chunks_last_hour(conn, room_id, settings.reply_chunk_chars) + chunks
+                    > cap
+                ):
+                    log.info("agent send refused session=%s code=room_chunk_limit", who.session_id)
+                    raise ApiError(
+                        429, "room_chunk_limit", f"room: at most {cap} chunks per hour to one room"
+                    )
+                send_id = await sends.insert(
+                    conn,
+                    session_id=who.session_id,
+                    slug=who.slug,
+                    kind=kind,
+                    room_id=room_id,
+                    text=text,
+                    key=key,
+                    reply_to=reply_to,
+                    ref_event_id=ref_event_id,
+                )
+            log.info("agent send queued session=%s id=s%s kind=%s", who.session_id, send_id, kind)
+            return SendAccepted(id=f"s{send_id}", status="queued")
 
-    @router.get("/rooms", response_model=ChatRooms, responses=_errors(401, 503))
+    @router.get("/rooms", response_model=ChatRooms, responses=_errors(400, 401, 503))
     async def list_rooms(who: Annotated[Caller, Depends(caller)]) -> ChatRooms:
         """The rooms this session may post to: its bound room, else the unbound flagged rooms."""
+        # The directory is read before the connection is taken: one pool connection at a time.
+        directory_rooms = []
+        for listed in await directory.list_rooms(pool):
+            room = await directory.get_room(pool, listed.room_id)
+            if room is not None:  # else forgotten since the listing
+                directory_rooms.append(room)
         found = []
         async with pool.connection() as conn:
             rule_list = await rules.list_rules(conn)
             own = await bindings.active_for_session(conn, who.session_id)
-            for listed in await directory.list_rooms(pool):
-                room = await directory.get_room(pool, listed.room_id)
-                if room is None:  # forgotten since the listing
-                    continue
+            for room in directory_rooms:
                 if await may_post(conn, who.session_id, room, rule_list, settings) != "ok":
                     continue
                 setting = await rules.get_room_settings(conn, room.room_id)
@@ -362,16 +441,16 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
                         422, "room_required", "room: required, this session is bound to no room"
                     )
                 room_id = own.room_id
-            return await queue(
-                conn,
-                who,
-                kind="message",
-                room_id=room_id,
-                text=body.text,
-                key=None,
-                reply_to=body.reply_to,
-                ref_event_id=ref.event_id if ref else None,
-            )
+        return await queue(
+            who,
+            kind="message",
+            room_id=room_id,
+            text=body.text,
+            key=None,
+            reply_to=body.reply_to,
+            ref_event_id=ref.event_id if ref else None,
+            masked_field="reply_to" if ref is not None and ref.source == "inbound" else None,
+        )
 
     @router.post("/reactions", status_code=202, response_model=SendAccepted, responses=send_errors)
     async def send_reaction(
@@ -386,18 +465,18 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
             )
         async with pool.connection() as conn:
             ref = await _resolve(conn, who, "to", body.to, None)
-            return await queue(
-                conn,
-                who,
-                kind="reaction",
-                room_id=ref.room_id,
-                text=None,
-                key=body.key,
-                reply_to=body.to,
-                ref_event_id=ref.event_id,
-            )
+        return await queue(
+            who,
+            kind="reaction",
+            room_id=ref.room_id,
+            text=None,
+            key=body.key,
+            reply_to=body.to,
+            ref_event_id=ref.event_id,
+            masked_field="to" if ref.source == "inbound" else None,
+        )
 
-    @router.get("/messages/{id}", response_model=SendStatus, responses=_errors(401, 404, 503))
+    @router.get("/messages/{id}", response_model=SendStatus, responses=_errors(400, 401, 404, 503))
     async def send_status(who: Annotated[Caller, Depends(caller)], id: str) -> SendStatus:
         """One of this session's sends; any other id is 404."""
         parsed = sends.parse_ref(id)
