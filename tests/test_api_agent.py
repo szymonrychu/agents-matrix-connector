@@ -16,6 +16,7 @@ from datetime import datetime
 import httpx
 import pytest
 from api_helpers import BOT, make_settings
+from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector.api import agent as agent_api
 from agents_matrix_connector.api.agent import CHAT_PREFIX, create_agent_app, valid_key
@@ -673,6 +674,59 @@ async def test_parallel_sends_respect_rate_limit(agent_for, conn):
         if r.status_code == 429:
             assert code(r) == "rate_limited"
     assert await count_sends(conn, session) == 3
+
+
+def rendezvous(monkeypatch, name: str, parties: int) -> None:
+    """Make the first `parties` calls of `directory.<name>` wait for each other, so every
+    request is at that call at the same moment: a request that still holds a pool connection
+    there is then holding one while all the others do too."""
+    real = getattr(agent_api.directory, name)
+    barrier = asyncio.Barrier(parties)
+    arrived = 0
+
+    async def wrapper(*args, **kwargs):
+        nonlocal arrived
+        arrived += 1
+        if arrived <= parties:
+            await asyncio.wait_for(barrier.wait(), timeout=5)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(agent_api.directory, name, wrapper)
+
+
+async def test_concurrent_requests_do_not_exhaust_pool(url, conn, monkeypatch):
+    size = 4
+    small = AsyncConnectionPool(url, min_size=size, max_size=size, timeout=3, open=False)
+    await small.open(wait=True)
+    try:
+        client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app=create_agent_app(small, make_settings(agent_token_sha256=DIGEST))
+            ),
+            base_url="http://agents" + CHAT_PREFIX,
+        )
+        sessions = [uuid.uuid4() for _ in range(size)]
+        for n, session in enumerate(sessions):
+            home = f"!home{n}:x"
+            await add_room(conn, home, flag=False)
+            await allow_room(conn, home)
+            await bind(conn, home, session)
+        await add_room(conn, "!open:x", flag=True)
+        await allow_room(conn, "!open:x")
+
+        # N requests, pool of N: every request is at the room read holding no second connection.
+        rendezvous(monkeypatch, "get_room", size)
+        sent = await asyncio.gather(*(say(client, s, "hi") for s in sessions))
+        assert [r.status_code for r in sent] == [202] * size, [r.text for r in sent]
+
+        rendezvous(monkeypatch, "list_rooms", size)
+        listings = await asyncio.gather(*(client.get("/rooms", headers=as_(s)) for s in sessions))
+        assert [r.status_code for r in listings] == [200] * size, [r.text for r in listings]
+        for n, response in enumerate(listings):
+            assert [room["room_id"] for room in response.json()["rooms"]] == [f"!home{n}:x"]
+        await client.aclose()
+    finally:
+        await small.close()
 
 
 async def test_room_hourly_chunk_cap(agent_for, conn):
