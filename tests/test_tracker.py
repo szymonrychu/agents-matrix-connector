@@ -460,14 +460,18 @@ async def test_failure_and_timeout_notice(tracker, pool, orch, orch_client, hs, 
         assert hs.typing_state(room) is False
 
 
-async def test_command_completed_handled_without_reply(
-    tracker, pool, orch, orch_client, hs, matrix
-):
+async def test_command_completed_posts_confirmation(tracker, pool, orch, orch_client, hs):
     """A slash message (stored as a command message, `sent` with no turn) that completes
-    finishes handled with reason `command` and posts nothing."""
+    finishes handled with reason `command` and posts one notice naming the command (the
+    first token of the message text)."""
     cases = []
-    for room, result in ((ROOM, "ok"), ("!b:hs", "dismissed"), ("!c:hs", "skipped_cache")):
+    for room, result, text in (
+        (ROOM, "ok", "/x"),
+        ("!b:hs", "dismissed", "/x with  some args"),
+        ("!c:hs", "skipped_cache", "  /x\nsecond line"),
+    ):
         run_id, message_id, _ = await seed(pool, orch, orch_client, room=room, bodies=("/x", "y"))
+        orch.messages[message_id]["text"] = text
         cases.append((run_id, message_id, room, result))
     await tracker.tick()
     assert all(hs.typing_state(room) for _, _, room, _ in cases)
@@ -479,10 +483,30 @@ async def test_command_completed_handled_without_reply(
     for run_id, _, room, _ in cases:
         assert await run_state(pool, run_id) == ("handled", "command")
         assert await row_states(pool, room) == [("handled", "command", run_id)] * 2
-        assert await outbound_rows(pool, room) == []
-        assert bodies(hs, room) == []
+        assert await outbound_rows(pool, room) == [
+            ("notice", "Command /x was run.", f"mxc-{run_id}-notice", "sent", None, True)
+        ]
+        assert bodies(hs, room) == ["Command /x was run."]
         assert hs.typing_state(room) is False
-    assert matrix.sends == []
+
+
+async def test_command_completed_confirmation_without_text(tracker, pool, orch, orch_client, hs):
+    """A completed command whose message text is missing or blank posts the generic
+    confirmation."""
+    cases = []
+    for room, text in ((ROOM, None), ("!b:hs", "   ")):
+        run_id, message_id, _ = await seed(pool, orch, orch_client, room=room)
+        orch.messages[message_id]["text"] = text
+        orch.complete_command(message_id, "ok")
+        cases.append((run_id, room))
+    await tracker.tick()
+    await tracker.tick()
+    for run_id, room in cases:
+        assert await run_state(pool, run_id) == ("handled", "command")
+        assert await outbound_rows(pool, room) == [
+            ("notice", "The command was run.", f"mxc-{run_id}-notice", "sent", None, True)
+        ]
+        assert bodies(hs, room) == ["The command was run."]
 
 
 async def test_command_failed_or_cancelled_posts_notice(tracker, pool, orch, orch_client, hs):

@@ -72,6 +72,13 @@ class _Outcome:
 _SESSION_GONE = _Outcome("failed", SESSION_GONE, requeue=True)
 
 
+def _command_confirmation(text: str | None) -> str:
+    """The notice for a completed command: its name is the first whitespace-delimited token
+    of the message text; a missing or blank text gets the generic wording."""
+    name = text.split(None, 1) if text else []
+    return f"Command {name[0]} was run." if name else "The command was run."
+
+
 def _failed(reason: str) -> _Outcome:
     return _Outcome("failed", reason, kind="notice", chunks=[NOTICE])
 
@@ -115,9 +122,10 @@ class Tracker:
 
         A turn decides the run. A command message (a slash message, `sent` with no turn) is
         decided by its command outcome (design D20): completed is handled with reason
-        `command` and posts nothing, failed is `command_<error>` (`command_failed` without
-        one) and cancelled is `command_cancelled`, both with the notice. A command promoted
-        to a turn (result `turn`) and one with no outcome yet wait for the turn or the
+        `command` and posts a confirmation notice naming the command, failed is
+        `command_<error>` (`command_failed` without one) and cancelled is
+        `command_cancelled`, both with the notice. A command promoted to a turn (result
+        `turn`) and one with no outcome yet wait for the turn or the
         timeout."""
         assert run.message_id is not None
         try:
@@ -155,7 +163,12 @@ class Tracker:
             if command.state != "completed":
                 return _failed(f"command_{command.error or 'failed'}")
             if command.result != "turn":
-                return _Outcome("handled", COMMAND)
+                return _Outcome(
+                    "handled",
+                    COMMAND,
+                    kind="notice",
+                    chunks=[_command_confirmation(message.text)],
+                )
         return self._timed_out(run)
 
     async def _send_match(self, run: runs.RunRow, final_text: str) -> str | None:
