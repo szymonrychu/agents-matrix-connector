@@ -4,6 +4,24 @@ Lessons that outlive a session. Newest first.
 
 ## 2026-10-28 decisions
 
+- One pool connection per request, binding kept after a later delivery (2026-10-29, epic
+  matrix-connector-agent-initi, epic review Consider 1 and 2):
+  - A `/chat/v1` request holds at most one pool connection at a time. `queue` and `list_rooms`
+    used to read the room through `directory.get_room(pool)` while the route held a connection,
+    so as many simultaneous requests as the pool size (10, shared with the UI api) each held
+    one and waited for a second until the pool timeout, then all answered 503. The routes now
+    release their connection before `queue` runs, `queue` reads the room first and then takes
+    its own connection, and `list_rooms` reads the directory before taking one. The room read
+    and the checks are no longer one snapshot, which is fine: the room checks are advisory and
+    the bot's claim re-checks them. Do not call a pool-taking helper inside `pool.connection()`.
+  - `sender.release_initiation` replaces the plain `bindings.release_for_send` for a send that
+    ended `failed` or `refused` with no sent row: it keeps the binding when a later send
+    (higher id) of the same session reached the same room (an outbound row `sent`). Why: with
+    m1 and m2 queued before the claim, m1 binds the room and m2 is "already"; if m1 failed and m2
+    landed, releasing the binding made the user's reply to m2 start a new `mx-` session instead
+    of reaching the agent that wrote to them. A later send that has not been delivered yet does
+    not count, so a binding with nothing delivered is still released.
+
 - Agent outbound limits (2026-10-28, epic matrix-connector-agent-initi, security review MEDIUM 2
   and LOW 2/3; outbound messages reach a real Messenger user, so abuse limits must hold):
   - The duplicate lookup, the per-session rate count (`MATRIX_AGENT_RATE_PER_MINUTE`, 20 per 60 s)

@@ -12,7 +12,8 @@ send gets no outbound row and changes no binding.
 The tick then settles every sending send whose rows have all ended: `sent` with the first row's
 event id when all were sent, else `failed` with the first failed row's reason. A send that ends
 `failed` or `refused` with none of its rows sent releases the binding it created
-(`send_failed`), in the transaction that ends it. Sends never wait for a room's chat run.
+(`send_failed`), in the transaction that ends it, unless a later send of the same session
+reached the same room (the user can already reply there). Sends never wait for a room's chat run.
 """
 
 from __future__ import annotations
@@ -106,6 +107,27 @@ class RoomPolicy:
         return self._refusals[room_id]
 
 
+async def release_initiation(conn: psycopg.AsyncConnection, send_id: int) -> bool:
+    """Release the binding a send with no sent row created, unless a later send of the same
+    session reached the same room: the user may already have a message to reply to there, and
+    the reply must still go to that session. False when the binding stays or there is none."""
+    cur = await conn.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM sends s
+            JOIN sends later ON later.session_id = s.session_id AND later.room_id = s.room_id
+                            AND later.id > s.id
+            JOIN outbound o ON o.send_id = later.id AND o.status = 'sent'
+            WHERE s.id = %s
+        )
+        """,
+        (send_id,),
+    )
+    if (await cur.fetchone())[0]:
+        return False
+    return await bindings.release_for_send(conn, send_id, SEND_FAILED)
+
+
 async def refuse_sending(conn: psycopg.AsyncConnection, send_id: int, reason: str) -> bool:
     """At send time: fail the send's pending rows, move it `sending -> refused` and, when none
     of its rows was sent, release the binding it created. The caller owns the transaction."""
@@ -113,7 +135,7 @@ async def refuse_sending(conn: psycopg.AsyncConnection, send_id: int, reason: st
     if not await sends.mark_refused(conn, send_id, reason):
         return False
     if await runs.count_sent_of_send(conn, send_id) == 0:
-        await bindings.release_for_send(conn, send_id, SEND_FAILED)
+        await release_initiation(conn, send_id)
     return True
 
 
@@ -196,5 +218,5 @@ class Sender:
                 reason = done.first_failed_reason or SEND_FAILED
                 await sends.mark_failed(conn, done.id, reason)
                 if done.sent == 0:
-                    await bindings.release_for_send(conn, done.id, SEND_FAILED)
+                    await release_initiation(conn, done.id)
                 log.info("send s%s failed: %s", done.id, reason)
