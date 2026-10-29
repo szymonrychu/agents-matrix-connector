@@ -49,6 +49,8 @@ ALREADY_SENT = "already_sent"
 FORBIDDEN = "forbidden"
 MESSAGE_FAILED = "message_failed"
 MESSAGE_CANCELLED = "message_cancelled"
+COMMAND = "command"
+COMMAND_CANCELLED = "command_cancelled"
 _MESSAGE_REASONS = {"failed": MESSAGE_FAILED, "cancelled": MESSAGE_CANCELLED}
 NOTICE = "Sorry, the agent could not answer that message."
 TYPING_TIMEOUT_MS = 30000
@@ -109,7 +111,14 @@ class Tracker:
             await self._typing(run.room_id, False)
 
     async def _outcome(self, run: runs.RunRow) -> _Outcome | None:
-        """The run's outcome from its message, or None while it is still running."""
+        """The run's outcome from its message, or None while it is still running.
+
+        A turn decides the run. A command message (a slash message, `sent` with no turn) is
+        decided by its command outcome (design D20): completed is handled with reason
+        `command` and posts nothing, failed is `command_<error>` (`command_failed` without
+        one) and cancelled is `command_cancelled`, both with the notice. A command promoted
+        to a turn (result `turn`) and one with no outcome yet wait for the turn or the
+        timeout."""
         assert run.message_id is not None
         try:
             message = await self._orchestrator.get_message(int(run.message_id))
@@ -139,6 +148,14 @@ class Tracker:
             if turn is None and run.kind == "follow":
                 return _SESSION_GONE
             return _failed(_MESSAGE_REASONS[message.status])
+        command = message.command
+        if turn is None and command is not None:
+            if command.state == "cancelled":
+                return _failed(COMMAND_CANCELLED)
+            if command.state != "completed":
+                return _failed(f"command_{command.error or 'failed'}")
+            if command.result != "turn":
+                return _Outcome("handled", COMMAND)
         return self._timed_out(run)
 
     async def _send_match(self, run: runs.RunRow, final_text: str) -> str | None:

@@ -103,6 +103,11 @@ when not plain handled:
 - `message_failed`: failed, the orchestrator message failed
 - `message_cancelled`: failed, the orchestrator message was cancelled
 - `timeout`: failed, no result within `MATRIX_RUN_TIMEOUT_SECONDS`
+- `command`: handled, a slash message (an orchestrator command message) completed; nothing is
+  posted back
+- `command_<error>`: failed, the slash command failed with that error code (for example
+  `command_unknown_command`, `command_dialog_stuck`; `command_failed` when it carries none)
+- `command_cancelled`: failed, the slash command was cancelled
 - `empty_reply`: handled, the agent answered with no text
 - `already_sent`: handled, the turn's final answer equals (stripped) a message the agent sent
   with the send tool during the run, so it is not posted a second time
