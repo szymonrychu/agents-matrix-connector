@@ -17,12 +17,15 @@ from agents_matrix_connector.api.schemas import (
     ApiError,
     MessageView,
     RuleIn,
+    RulePatch,
     RulesView,
     RuleView,
     SettingsIn,
     SettingsView,
 )
 from agents_matrix_connector.db import inbound, rules
+from agents_matrix_connector.prompt import DEFAULT_PREAMBLE
+from agents_matrix_connector.templates import check_preamble
 
 log = logging.getLogger(__name__)
 
@@ -34,12 +37,25 @@ def _rule_view(row: rules.RuleRow) -> RuleView:
         kind=row.kind,
         value=row.value,
         note=row.note,
+        preamble=row.preamble,
         created_at=row.created_at,
     )
 
 
 def build_rules_router(pool: AsyncConnectionPool, orchestrator) -> APIRouter:
     router = APIRouter()
+
+    async def _settings_view() -> SettingsView:
+        return SettingsView(
+            default_preset_id=await rules.get_default_preset(pool),
+            preamble=await rules.get_preamble(pool),
+            default_preamble=DEFAULT_PREAMBLE,
+        )
+
+    def _check(preamble: str | None) -> None:
+        error = check_preamble(preamble)
+        if error is not None:
+            raise ApiError(422, "invalid_template", f"preamble: {error}")
 
     @router.get("/rules", response_model=RulesView)
     async def list_rules() -> RulesView:
@@ -51,8 +67,11 @@ def build_rules_router(pool: AsyncConnectionPool, orchestrator) -> APIRouter:
 
     @router.post("/rules", response_model=RuleView, status_code=201)
     async def create_rule(body: RuleIn) -> RuleView:
+        _check(body.preamble)
         try:
-            rule = await rules.add_rule(pool, body.list, body.kind, body.value, body.note)
+            rule = await rules.add_rule(
+                pool, body.list, body.kind, body.value, body.note, body.preamble
+            )
         except ValueError as exc:
             raise ApiError(422, "invalid_rule", str(exc)) from None
         except rules.RuleExists as exc:
@@ -62,6 +81,16 @@ def build_rules_router(pool: AsyncConnectionPool, orchestrator) -> APIRouter:
                 return _rule_view(row)
         raise ApiError(404, "not_found", f"rule {rule.id} not found")
 
+    @router.patch("/rules/{rule_id}", response_model=RuleView)
+    async def patch_rule(rule_id: int, body: RulePatch) -> RuleView:
+        _check(body.preamble)
+        if not await rules.set_rule_preamble(pool, rule_id, body.preamble):
+            raise ApiError(404, "not_found", f"rule {rule_id} not found")
+        for row in await rules.list_rule_rows(pool):
+            if row.id == rule_id:
+                return _rule_view(row)
+        raise ApiError(404, "not_found", f"rule {rule_id} not found")
+
     @router.delete("/rules/{rule_id}", status_code=204)
     async def delete_rule(rule_id: int) -> Response:
         if not await rules.delete_rule(pool, rule_id):
@@ -70,11 +99,13 @@ def build_rules_router(pool: AsyncConnectionPool, orchestrator) -> APIRouter:
 
     @router.get("/settings", response_model=SettingsView)
     async def get_settings() -> SettingsView:
-        return SettingsView(default_preset_id=await rules.get_default_preset(pool))
+        return await _settings_view()
 
     @router.put("/settings", response_model=SettingsView)
     async def put_settings(body: SettingsIn) -> SettingsView:
-        if body.default_preset_id is not None:
+        if "preamble" in body.model_fields_set:
+            _check(body.preamble)
+        if "default_preset_id" in body.model_fields_set and body.default_preset_id is not None:
             try:
                 await orchestrator.get_preset(body.default_preset_id)
             except NotFound:
@@ -88,8 +119,11 @@ def build_rules_router(pool: AsyncConnectionPool, orchestrator) -> APIRouter:
             except OrchestratorError as exc:
                 log.warning("orchestrator get_preset failed: %s", exc)
                 raise ApiError(502, "orchestrator_error", "orchestrator request failed") from None
-        await rules.set_default_preset(pool, body.default_preset_id)
-        return SettingsView(default_preset_id=body.default_preset_id)
+        if "default_preset_id" in body.model_fields_set:
+            await rules.set_default_preset(pool, body.default_preset_id)
+        if "preamble" in body.model_fields_set:
+            await rules.set_preamble(pool, body.preamble)
+        return await _settings_view()
 
     @router.get("/messages", response_model=list[MessageView])
     async def global_messages(

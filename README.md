@@ -172,20 +172,31 @@ default 100). 200; 422 `invalid_request`.
 
 ### `GET /matrix/api/v1/rules`
 
-All rules, `{"allow": [...], "deny": [...]}`; each has `id`, `list`, `kind`, `value`, `note`
-and `created_at`. 200.
+All rules, `{"allow": [...], "deny": [...]}`; each has `id`, `list`, `kind`, `value`, `note`,
+`preamble` (a Jinja template or null) and `created_at`. 200.
 
     curl -s http://localhost:8000/matrix/api/v1/rules
 
 ### `POST /matrix/api/v1/rules`
 
 Body `{"list": "allow"|"deny", "kind": "user"|"facebook"|"room"|"alias"|"display_name",
-"value": "...", "note": "..."|null}` (`display_name` is deny only; see `rule_kinds` in
-`/meta`). 201 rule; 409 `rule_exists`; 422 `invalid_rule` or `invalid_request`.
+"value": "...", "note": "..."|null, "preamble": "..."|null}` (`display_name` is deny only; see
+`rule_kinds` in `/meta`). 201 rule; 409 `rule_exists`; 422 `invalid_rule`, `invalid_template` or
+`invalid_request`.
 
     curl -s -X POST -H 'content-type: application/json' \
       -d '{"list": "allow", "kind": "facebook", "value": "100012345"}' \
       http://localhost:8000/matrix/api/v1/rules
+
+### `PATCH /matrix/api/v1/rules/{rule_id}`
+
+Body `{"preamble": "..."|null}`: the first-prompt preamble for chats this rule allows (null
+clears it; the global preamble, then the built-in default, apply). 200 rule; 404 `not_found`;
+422 `invalid_template` (syntax error or a variable outside `room_name`, `room_id`, `sender`,
+`rule_name`, `now`).
+
+    curl -s -X PATCH -H 'content-type: application/json' \
+      -d '{"preamble": "Chat with {{ sender }}"}' http://localhost:8000/matrix/api/v1/rules/3
 
 ### `DELETE /matrix/api/v1/rules/{rule_id}`
 
@@ -195,17 +206,31 @@ Body `{"list": "allow"|"deny", "kind": "user"|"facebook"|"room"|"alias"|"display
 
 ### `GET /matrix/api/v1/settings`
 
-`{"default_preset_id": uuid|null}`, the preset used by rooms without their own. 200.
+`{"default_preset_id": uuid|null, "preamble": string|null, "default_preamble": string}`: the
+preset used by rooms without their own, the global preamble template (null means the built-in
+`default_preamble`). 200.
 
     curl -s http://localhost:8000/matrix/api/v1/settings
 
 ### `PUT /matrix/api/v1/settings`
 
-Body `{"default_preset_id": uuid|null}`. 200; 422 `unknown_preset` or `invalid_request`; 503
+Body `{"default_preset_id": uuid|null, "preamble": string|null}`; a field left out keeps its
+stored value. 200; 422 `unknown_preset`, `invalid_template` or `invalid_request`; 503
 `unavailable`; 502 `orchestrator_error`.
 
     curl -s -X PUT -H 'content-type: application/json' \
       -d '{"default_preset_id": null}' http://localhost:8000/matrix/api/v1/settings
+
+### `POST /matrix/api/v1/templates/preview`
+
+Body `{"template": "...", "context": {...}|null}`; the sample context (`room_name`, `room_id`,
+`sender`, `rule_name`, `now`) is overlaid with `context`. 200 `{"rendered": string|null,
+"error": {"line", "message"}|null, "variables": [...]}`; template errors are data, not HTTP
+errors. 422 `invalid_request`.
+
+    curl -s -X POST -H 'content-type: application/json' \
+      -d '{"template": "Chat {{ room_name }}"}' \
+      http://localhost:8000/matrix/api/v1/templates/preview
 
 ### `GET /matrix/api/v1/messages`
 

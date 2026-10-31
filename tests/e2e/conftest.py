@@ -388,7 +388,7 @@ class Stack:
     def set_default_preset(self) -> None:
         r = self.http.put(f"{self.api}/settings", json={"default_preset_id": self.preset_id})
         assert r.status_code == 200, r.text
-        assert r.json() == {"default_preset_id": self.preset_id}
+        assert r.json()["default_preset_id"] == self.preset_id
 
     def flag_room(self, room_id: str) -> None:
         """Let agents start a chat in the room (`agents_may_initiate`)."""

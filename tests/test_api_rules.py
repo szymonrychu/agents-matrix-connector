@@ -18,7 +18,7 @@ async def test_rules_crud_changes_access(api, conn):
     created = await api.post("/rules", json={"list": "allow", "kind": "room", "value": ROOM_X})
     assert created.status_code == 201
     rule = created.json()
-    assert set(rule) == {"id", "list", "kind", "value", "note", "created_at"}
+    assert set(rule) == {"id", "list", "kind", "value", "note", "preamble", "created_at"}
     assert rule["list"] == "allow" and rule["value"] == ROOM_X and rule["note"] is None
     access = (await api.get("/rooms")).json()[0]["access"]
     assert access == {"state": "allowed", "reason": None, "rule_id": rule["id"]}
@@ -75,21 +75,21 @@ async def test_duplicate_and_unknown(api):
 
 
 async def test_default_preset_setting(api, fake, conn):
-    assert (await api.get("/settings")).json() == {"default_preset_id": None}
+    assert (await api.get("/settings")).json()["default_preset_id"] is None
     preset = fake.add_preset("chat")
     put = await api.put("/settings", json={"default_preset_id": str(preset.id)})
     assert put.status_code == 200
-    assert put.json() == {"default_preset_id": str(preset.id)}
-    assert (await api.get("/settings")).json() == {"default_preset_id": str(preset.id)}
+    assert put.json()["default_preset_id"] == str(preset.id)
+    assert (await api.get("/settings")).json()["default_preset_id"] == str(preset.id)
 
     unknown = await api.put("/settings", json={"default_preset_id": str(uuid.uuid4())})
     assert unknown.status_code == 422
     assert unknown.json()["error"]["code"] == "unknown_preset"
-    assert (await api.get("/settings")).json() == {"default_preset_id": str(preset.id)}
+    assert (await api.get("/settings")).json()["default_preset_id"] == str(preset.id)
 
     cleared = await api.put("/settings", json={"default_preset_id": None})
-    assert cleared.json() == {"default_preset_id": None}
-    assert (await api.get("/settings")).json() == {"default_preset_id": None}
+    assert cleared.json()["default_preset_id"] is None
+    assert (await api.get("/settings")).json()["default_preset_id"] is None
 
 
 async def test_global_messages(api, conn):
@@ -132,3 +132,43 @@ async def test_orchestrator_error_message_is_generic(api, fake):
     assert error["code"] == "orchestrator_error"
     assert error["message"] == "orchestrator request failed"
     assert "injected" not in res.text
+
+
+async def test_rule_preamble_create_patch_and_validate(api):
+    ok = await api.post(
+        "/rules",
+        json={"list": "allow", "kind": "room", "value": ROOM_X, "preamble": "Hi {{ room_name }}"},
+    )
+    assert ok.status_code == 201 and ok.json()["preamble"] == "Hi {{ room_name }}"
+    rule_id = ok.json()["id"]
+
+    patched = await api.patch(f"/rules/{rule_id}", json={"preamble": "Hello {{ sender }}"})
+    assert patched.status_code == 200 and patched.json()["preamble"] == "Hello {{ sender }}"
+    cleared = await api.patch(f"/rules/{rule_id}", json={"preamble": None})
+    assert cleared.json()["preamble"] is None
+
+    syntax = await api.patch(f"/rules/{rule_id}", json={"preamble": "{% if %}"})
+    assert syntax.status_code == 422 and syntax.json()["error"]["code"] == "invalid_template"
+    unknown = await api.patch(f"/rules/{rule_id}", json={"preamble": "{{ nope }}"})
+    assert unknown.status_code == 422 and "nope" in unknown.json()["error"]["message"]
+    bad_create = await api.post(
+        "/rules", json={"list": "deny", "kind": "user", "value": BOB, "preamble": "{{ nope }}"}
+    )
+    assert bad_create.status_code == 422
+    assert (await api.patch("/rules/9999", json={"preamble": None})).status_code == 404
+
+
+async def test_global_preamble_setting(api):
+    first = (await api.get("/settings")).json()
+    assert first["preamble"] is None and "Messenger" in first["default_preamble"]
+
+    put = await api.put("/settings", json={"preamble": "Global {{ room_id }}"})
+    assert put.status_code == 200 and put.json()["preamble"] == "Global {{ room_id }}"
+    assert (await api.get("/settings")).json()["preamble"] == "Global {{ room_id }}"
+
+    # An omitted field keeps the stored value; null resets to the default.
+    assert (await api.put("/settings", json={})).json()["preamble"] == "Global {{ room_id }}"
+    assert (await api.put("/settings", json={"preamble": None})).json()["preamble"] is None
+
+    bad = await api.put("/settings", json={"preamble": "{{ nope }}"})
+    assert bad.status_code == 422 and bad.json()["error"]["code"] == "invalid_template"

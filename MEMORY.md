@@ -2,6 +2,22 @@
 
 Lessons that outlive a session. Newest first.
 
+## 2026-10-31 decisions
+
+- The hard-coded preamble is now the Jinja template `DEFAULT_PREAMBLE` (user decision). Lookup
+  order: the allowing rule's `access_rules.preamble`, then `settings.preamble`, then the default.
+  Variables: `room_name`, `room_id`, `sender`, `rule_name` (the rule's note), `now`. Why a
+  nullable column per level: NULL means "inherit", so clearing an override is one update.
+- `inbound.rule_id` (written by sync, no foreign key) records the deciding rule, because the
+  worker renders later and re-evaluating the policy there would need the sync loop's room
+  context. A deleted rule simply stops contributing its preamble.
+- A stored template that fails to render at send time falls back to the default with a warning
+  instead of failing the run: a bad edit must not stall a chat. Writes are validated (syntax
+  and variable names, 422 `invalid_template`), so this only guards drift.
+- agents-common `render` runs in a child process, so the worker calls it through
+  `asyncio.to_thread`. `PUT /settings` now keeps a field that is left out (it used to require
+  `default_preset_id`).
+
 ## 2026-10-28 decisions
 
 - Release job (2026-10-28, epic semver-image-tags-at-the-end D1-D8): every green main build ends

@@ -24,13 +24,14 @@ first run's session fills the reservation in the same transaction; a first run t
 session releases it (`run_failed`). The calls themselves go through agents-common's `dispatch`
 and `deliver`, which skip every step whose id is stored and adopt a posted message carrying the
 run's marker, so a retry creates no second session and posts no second prompt. A follow run into
-a session that has no other run in the room gets the PREAMBLE, like a first prompt. A delivery
+a session that has no other run in the room gets the preamble, like a first prompt. A delivery
 whose session is gone fails the run `session_gone`, releases the binding and returns its rows to
 `new`, so the next tick starts a new session. The worker never deletes sessions.
 """
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import re
@@ -50,6 +51,7 @@ from agents_common.orchestrator import (
     OrchestratorUnavailable,
     Session,
 )
+from agents_common.templating import TemplateError
 from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector import discovery, prompt
@@ -341,7 +343,7 @@ class Worker:
         await self._delivered(batch)
 
     async def _deliver(self, batch: _Batch) -> None:
-        """Post the batch into the room's running session, with the PREAMBLE when the session
+        """Post the batch into the room's running session, with the preamble when the session
         has no other run in the room (also on a retry through `_resume`); a gone session sends
         the rows back to `new` for a new session on the next tick."""
         session_id = batch.ref.session_id
@@ -410,7 +412,33 @@ class Worker:
             batch.rows,
             first=first,
             facebook_id=self._facebook_id,
+            preamble=await self._preamble(batch, room.name if room else None) if first else "",
         )
+
+    async def _preamble(self, batch: _Batch, room_name: str | None) -> str:
+        """The rendered first-prompt preamble: the deciding rule's template, else the global
+        one, else the default; a stored template that no longer renders falls back to the
+        default so a bad edit never stalls the chat."""
+        rule_id = next((row.rule_id for row in batch.rows if row.rule_id is not None), None)
+        rule = None if rule_id is None else await rules.get_rule_preamble(self._pool, rule_id)
+        template = (rule[1] if rule else None) or await rules.get_preamble(self._pool)
+        if template is None:
+            return prompt.DEFAULT_PREAMBLE
+        first = batch.rows[0] if batch.rows else None
+        context = prompt.preamble_context(
+            room_name,
+            batch.room_id,
+            (first.sender_name or first.sender) if first else "",
+            (rule[0] or "") if rule else "",
+            self._now(),
+        )
+        try:
+            return await asyncio.to_thread(prompt.render_preamble, template, context)
+        except TemplateError as exc:
+            log.warning(
+                "room %s: preamble does not render, using the default: %s", batch.room_id, exc
+            )
+            return prompt.DEFAULT_PREAMBLE
 
     def _facebook_id(self, user_id: str) -> str | None:
         return discovery.facebook_id(user_id, self._puppet, self._bridge_server)

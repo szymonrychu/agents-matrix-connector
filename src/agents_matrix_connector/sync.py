@@ -511,11 +511,12 @@ class SyncLoop:
         sender_name, sender_facebook_id = row if row else (None, self._facebook_id(parsed.sender))
         body: str | None = None
         mentioned = False
+        rule_id: int | None = None
         if isinstance(parsed, discovery.Unsupported):
             status, reason = "ignored", UNSUPPORTED_CONTENT
         else:
             mentioned = discovery.mentions_self(parsed, self._self_ids, room.self_names)
-            status, reason = await self._decide(
+            status, reason, rule_id = await self._decide(
                 conn, room_id, parsed, room, rule_list, sender_name, sender_facebook_id, mentioned
             )
             if _stores_body(reason):
@@ -531,6 +532,7 @@ class SyncLoop:
             origin_ts=_timestamp(event),
             status=status,
             reason=reason,
+            rule_id=rule_id,
         )
 
     async def _decide(
@@ -543,7 +545,7 @@ class SyncLoop:
         sender_name: str | None,
         sender_facebook_id: str | None,
         mentioned: bool,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, int | None]:
         subject = policy.Subject(
             room_id=room_id,
             room_alias=room.alias,
@@ -555,12 +557,12 @@ class SyncLoop:
         )
         decision = policy.evaluate(subject, rule_list, self._settings.default_policy)
         if not decision.allowed:
-            return "ignored", decision.reason
+            return "ignored", decision.reason, decision.rule_id
         trigger = discovery.effective_trigger(
             room.kind or "", room.member_count, room.trigger, self._settings.group_trigger
         )
         if trigger == "mention" and not mentioned:
-            return "ignored", NOT_MENTIONED
+            return "ignored", NOT_MENTIONED, decision.rule_id
         if await inbound.count_new(conn, room_id) >= self._settings.max_queued_per_room:
-            return "ignored", QUEUE_FULL
-        return "new", None
+            return "ignored", QUEUE_FULL, decision.rule_id
+        return "new", None, decision.rule_id

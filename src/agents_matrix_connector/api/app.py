@@ -19,6 +19,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from agents_matrix_connector.api.rooms import build_rooms_router
 from agents_matrix_connector.api.rules import build_rules_router
 from agents_matrix_connector.api.schemas import ApiError
+from agents_matrix_connector.api.templates import build_templates_router
 from agents_matrix_connector.settings import ApiSettings
 
 log = logging.getLogger(__name__)
@@ -124,6 +125,7 @@ def create_api_app(
     )
     app.include_router(build_rooms_router(pool, orchestrator, settings), prefix=PREFIX)
     app.include_router(build_rules_router(pool, orchestrator), prefix=PREFIX)
+    app.include_router(build_templates_router(), prefix=PREFIX)
     app.add_middleware(SourceAllowlist, networks=settings.api_networks())
     add_error_handlers(app)
     add_probes(app, pool)

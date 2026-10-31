@@ -21,7 +21,7 @@ TABLES = {
     "sends",
     "room_bindings",
 }
-MIGRATIONS = ["0001_init.sql", "0002_agent_sends.sql"]
+MIGRATIONS = ["0001_init.sql", "0002_agent_sends.sql", "0003_preamble.sql"]
 
 
 @pytest.fixture
@@ -365,3 +365,10 @@ def test_binding_backfill(pg_url):
         ("!e", s_shared, "mx-shared", "inbound", e_follow, None, None),
         ("!h", s_h, None, "inbound", h_follow, None, None),
     ]
+
+
+def test_preamble_columns(db):
+    with psycopg.connect(db) as conn:
+        assert _columns(conn, "settings")["preamble"] == ("text", "YES")
+        assert _columns(conn, "access_rules")["preamble"] == ("text", "YES")
+        assert _columns(conn, "inbound")["rule_id"] == ("bigint", "YES")
