@@ -38,7 +38,7 @@ def export() -> str:
 
 def export_agent() -> str:
     """The agent listener's OpenAPI document (`/chat/v1`), in the same form as `export`."""
-    return _document(create_agent_app(None, _settings()))  # type: ignore[arg-type]
+    return _document(create_agent_app(None, None, _settings()))  # type: ignore[arg-type]
 
 
 def main(argv: list[str] | None = None) -> None:

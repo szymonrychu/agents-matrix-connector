@@ -93,7 +93,7 @@ def _cmd_api(settings: ApiSettings) -> int:
         ui = create_api_app(pool, client, settings)
         servers = [serve_asgi(ui, settings.http_host, settings.http_port, grace, stop)]
         if settings.agent_token_sha256.get_secret_value():
-            agent = create_agent_app(pool, settings)
+            agent = create_agent_app(pool, client, settings)
             servers.append(serve_asgi(agent, settings.http_host, settings.agent_port, grace, stop))
         await _serve_all(servers, stop)
 

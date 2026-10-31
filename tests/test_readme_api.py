@@ -48,7 +48,7 @@ def app_routes() -> set[str]:
 
 
 def agent_app_routes() -> set[str]:
-    app = create_agent_app(None, make_settings())  # type: ignore[arg-type]
+    app = create_agent_app(None, None, make_settings())  # type: ignore[arg-type]
     out = set()
     for path, methods in _walk(app):
         if path.startswith(CHAT_PREFIX):
@@ -145,6 +145,11 @@ def test_readme_lists_every_agent_route() -> None:
         f"POST {CHAT_PREFIX}/messages",
         f"POST {CHAT_PREFIX}/reactions",
         f"GET {CHAT_PREFIX}/messages/{{id}}",
+        f"GET {CHAT_PREFIX}/admin/rooms",
+        f"PUT {CHAT_PREFIX}/admin/rooms/{{room_id}}/settings",
+        f"GET {CHAT_PREFIX}/admin/rules",
+        f"POST {CHAT_PREFIX}/admin/rules",
+        f"DELETE {CHAT_PREFIX}/admin/rules/{{rule_id}}",
     }
     agent = section("Agent API")
     assert readme_routes("Agent API", CHAT_PREFIX) == expected

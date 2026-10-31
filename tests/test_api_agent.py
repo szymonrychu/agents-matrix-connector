@@ -176,7 +176,7 @@ async def agent_for(pool):
     clients = []
 
     def make(**extra) -> httpx.AsyncClient:
-        app = create_agent_app(pool, make_settings(agent_token_sha256=DIGEST, **extra))
+        app = create_agent_app(pool, None, make_settings(agent_token_sha256=DIGEST, **extra))
         client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://agents" + CHAT_PREFIX
         )
@@ -701,7 +701,7 @@ async def test_concurrent_requests_do_not_exhaust_pool(url, conn, monkeypatch):
     try:
         client = httpx.AsyncClient(
             transport=httpx.ASGITransport(
-                app=create_agent_app(small, make_settings(agent_token_sha256=DIGEST))
+                app=create_agent_app(small, None, make_settings(agent_token_sha256=DIGEST))
             ),
             base_url="http://agents" + CHAT_PREFIX,
         )
