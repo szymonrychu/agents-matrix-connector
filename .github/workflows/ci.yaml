@@ -92,3 +92,53 @@ jobs:
         run: helm package chart/agents-matrix-connector --version "$VERSION" --app-version "$SHA7"
       - name: Push
         run: helm push "agents-matrix-connector-$VERSION.tgz" "$CHART_REPO"
+
+  release:
+    needs: [lint, test, chart, images, chart-publish]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    env:
+      HARBOR_URL: harbor.szymonrichert.pl
+      IMAGE: harbor.szymonrichert.pl/containers/agents-matrix-connector
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      # Prints nothing when HEAD is already in a vX.Y.Z tag; every later step then skips.
+      - name: Compute version
+        id: version
+        run: echo "version=$(python3 scripts/next_version.py)" >> "$GITHUB_OUTPUT"
+      - uses: regclient/actions/regctl-installer@dd58ad94f76adb73d8ac1bf75ed25f01545d5b32 # main as of 2026-10-25
+        if: steps.version.outputs.version != ''
+      - name: Login to Harbor
+        if: steps.version.outputs.version != ''
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: echo "$HARBOR_PASSWORD" | regctl registry login "$HARBOR_URL" -u "$HARBOR_USERNAME" --pass-stdin
+      # Copying within one repository sends only the manifest under the new tag.
+      - name: Tag image
+        if: steps.version.outputs.version != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          SHORTSHA="${GITHUB_SHA::7}"
+          VERSION_MINOR="${VERSION%.*}"
+          VERSION_MAJOR="${VERSION%%.*}"
+          regctl image copy "$IMAGE:$SHORTSHA" "$IMAGE:$VERSION"
+          regctl image copy "$IMAGE:$SHORTSHA" "$IMAGE:$VERSION_MINOR"
+          regctl image copy "$IMAGE:$SHORTSHA" "$IMAGE:$VERSION_MAJOR"
+      # Last, so a failure before it leaves no tag and a re-run repeats the idempotent copies.
+      - name: Push git tag
+        if: steps.version.outputs.version != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git tag "v$VERSION" "$GITHUB_SHA"
+          git push origin "refs/tags/v$VERSION"
