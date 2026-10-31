@@ -2,6 +2,22 @@
 
 Lessons that outlive a session. Newest first.
 
+## 2026-10-29 decisions
+
+- Slash messages finish by their command outcome (2026-10-29, epic slash-commands-from-chat,
+  user decision F2 and design D20): a Messenger message such as "/compact" is stored by the
+  orchestrator as a command message that stays `sent` with no turn, so the tracker, which
+  decided only by the turn and the message status, ended it `timeout` with the notice.
+  `_outcome` now reads `Message.command` (agents-common v0.4.0) after the turn and message
+  status checks and before the timeout: completed (result `ok`, `dismissed`,
+  `skipped_cache`) finishes `handled` with reason `command` and posts nothing; failed finishes
+  `failed` with reason `command_<error>` (`command_failed` without an error) and cancelled
+  with `command_cancelled`, both with the usual notice; completed with result `turn` (a
+  command promoted to a turn) is decided by the turn as before. Posting nothing on success is
+  the architect's call in design D20 (Open questions Q4, the user's answer pending); an answer
+  that wants a confirmation message changes this. A command whose outcome never arrives (the
+  wrapper lost its record) still ends `timeout`.
+
 ## 2026-10-28 decisions
 
 - Release job (2026-10-28, epic semver-image-tags-at-the-end D1-D8): every green main build ends

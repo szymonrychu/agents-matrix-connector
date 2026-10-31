@@ -460,6 +460,111 @@ async def test_failure_and_timeout_notice(tracker, pool, orch, orch_client, hs, 
         assert hs.typing_state(room) is False
 
 
+async def test_command_completed_posts_confirmation(tracker, pool, orch, orch_client, hs):
+    """A slash message (stored as a command message, `sent` with no turn) that completes
+    finishes handled with reason `command` and posts one notice naming the command (the
+    first token of the message text)."""
+    cases = []
+    for room, result, text in (
+        (ROOM, "ok", "/x"),
+        ("!b:hs", "dismissed", "/x with  some args"),
+        ("!c:hs", "skipped_cache", "  /x\nsecond line"),
+    ):
+        run_id, message_id, _ = await seed(pool, orch, orch_client, room=room, bodies=("/x", "y"))
+        orch.messages[message_id]["text"] = text
+        cases.append((run_id, message_id, room, result))
+    await tracker.tick()
+    assert all(hs.typing_state(room) for _, _, room, _ in cases)
+
+    for _, message_id, _, result in cases:
+        orch.complete_command(message_id, result)
+    await tracker.tick()
+    await tracker.tick()
+    for run_id, _, room, _ in cases:
+        assert await run_state(pool, run_id) == ("handled", "command")
+        assert await row_states(pool, room) == [("handled", "command", run_id)] * 2
+        assert await outbound_rows(pool, room) == [
+            ("notice", "Command /x was run.", f"mxc-{run_id}-notice", "sent", None, True)
+        ]
+        assert bodies(hs, room) == ["Command /x was run."]
+        assert hs.typing_state(room) is False
+
+
+async def test_command_completed_confirmation_without_text(tracker, pool, orch, orch_client, hs):
+    """A completed command whose message text is missing or blank posts the generic
+    confirmation."""
+    cases = []
+    for room, text in ((ROOM, None), ("!b:hs", "   ")):
+        run_id, message_id, _ = await seed(pool, orch, orch_client, room=room)
+        orch.messages[message_id]["text"] = text
+        orch.complete_command(message_id, "ok")
+        cases.append((run_id, room))
+    await tracker.tick()
+    await tracker.tick()
+    for run_id, room in cases:
+        assert await run_state(pool, run_id) == ("handled", "command")
+        assert await outbound_rows(pool, room) == [
+            ("notice", "The command was run.", f"mxc-{run_id}-notice", "sent", None, True)
+        ]
+        assert bodies(hs, room) == ["The command was run."]
+
+
+async def test_command_failed_or_cancelled_posts_notice(tracker, pool, orch, orch_client, hs):
+    unknown, unknown_message, _ = await seed(pool, orch, orch_client, room=ROOM)
+    cancelled, cancelled_message, _ = await seed(pool, orch, orch_client, room="!b:hs")
+    no_error, no_error_message, _ = await seed(pool, orch, orch_client, room="!c:hs")
+    await tracker.tick()
+
+    orch.fail_command(unknown_message, "unknown_command")
+    orch.fail_command(cancelled_message, None, state="cancelled")
+    orch.fail_command(no_error_message, None)
+    await tracker.tick()
+    await tracker.tick()
+
+    for run_id, room, reason in (
+        (unknown, ROOM, "command_unknown_command"),
+        (cancelled, "!b:hs", "command_cancelled"),
+        (no_error, "!c:hs", "command_failed"),
+    ):
+        assert await run_state(pool, run_id) == ("failed", reason)
+        assert await row_states(pool, room) == [("failed", reason, run_id)]
+        assert await outbound_rows(pool, room) == [
+            ("notice", NOTICE, f"mxc-{run_id}-notice", "sent", None, True)
+        ]
+        assert bodies(hs, room) == [NOTICE]
+        assert hs.typing_state(room) is False
+
+
+async def test_promoted_command_relays_turn(tracker, pool, orch, orch_client, hs, clock):
+    """A command completed with result `turn` became a turn: the turn decides the run."""
+    relayed, relayed_message, _ = await seed(pool, orch, orch_client, room=ROOM)
+    stalled, stalled_message, _ = await seed(pool, orch, orch_client, room="!b:hs")
+    orch.complete_command(relayed_message, "turn", turn_id="t-1")
+    orch.complete_command(stalled_message, "turn", turn_id="t-2")
+    for _ in range(2):
+        await tracker.tick()
+        for run_id, room in ((relayed, ROOM), (stalled, "!b:hs")):
+            assert await run_state(pool, run_id) == ("in-progress", None)
+            assert await row_states(pool, room) == [("in-progress", None, run_id)]
+            assert await outbound_rows(pool, room) == []
+            assert hs.typing_state(room) is True
+
+    orch.complete_turn(relayed_message, "Compacted the conversation.")
+    await tracker.tick()
+    assert await run_state(pool, relayed) == ("handled", None)
+    assert await outbound_rows(pool) == [
+        ("reply", "Compacted the conversation.", f"mxc-{relayed}-1", "sent", None, True)
+    ]
+    assert bodies(hs) == ["Compacted the conversation."]
+    assert hs.typing_state(ROOM) is False
+    assert await run_state(pool, stalled) == ("in-progress", None)
+
+    clock.at = T0 + timedelta(seconds=601)
+    await tracker.tick()
+    assert await run_state(pool, stalled) == ("failed", "timeout")
+    assert bodies(hs, "!b:hs") == [NOTICE]
+
+
 async def test_first_run_message_not_found_fails_with_notice(tracker, pool, orch, orch_client, hs):
     run_id, _, session_id = await seed(pool, orch, orch_client)
     orch.remove_session(session_id)
