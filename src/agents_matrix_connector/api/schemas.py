@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -118,6 +118,7 @@ class RuleIn(BaseModel):
     kind: str
     value: str
     note: str | None = None
+    preamble: str | None = None
 
 
 class RuleView(BaseModel):
@@ -126,6 +127,7 @@ class RuleView(BaseModel):
     kind: str
     value: str
     note: str | None
+    preamble: str | None
     created_at: datetime
 
 
@@ -134,9 +136,34 @@ class RulesView(BaseModel):
     deny: list[RuleView]
 
 
+class RulePatch(BaseModel):
+    preamble: str | None
+
+
 class SettingsIn(BaseModel):
-    default_preset_id: uuid.UUID | None
+    """A field left out keeps its stored value; null clears it."""
+
+    default_preset_id: uuid.UUID | None = None
+    preamble: str | None = None
+
+
+class TemplatePreviewIn(BaseModel):
+    template: str
+    context: dict[str, Any] | None = None
+
+
+class TemplatePreviewError(BaseModel):
+    line: int | None
+    message: str
+
+
+class TemplatePreviewView(BaseModel):
+    rendered: str | None
+    error: TemplatePreviewError | None
+    variables: list[str]
 
 
 class SettingsView(BaseModel):
     default_preset_id: uuid.UUID | None
+    preamble: str | None
+    default_preamble: str

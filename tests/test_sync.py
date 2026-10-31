@@ -749,3 +749,12 @@ async def test_canonical_alias_verified(fake, client, pool, caplog):
         ("four", "new", None),
         ("five", "ignored", "not_allowed"),
     ]
+
+
+async def test_inbound_row_records_the_deciding_rule(fake, client, pool):
+    loop = await joined_and_synced(fake, client, pool)
+    rule = await rules.add_rule(pool, "allow", "room", DM, None)
+
+    fake.post(DM, ALICE, text("hello"))
+    await loop.run_once()
+    assert await fetch(pool, "SELECT rule_id FROM inbound") == [(rule.id,)]

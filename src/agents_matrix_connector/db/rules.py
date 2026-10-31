@@ -33,6 +33,7 @@ class RuleRow:
     kind: str
     value: str
     note: str | None
+    preamble: str | None
     created_at: datetime
 
 
@@ -53,15 +54,20 @@ async def _conn(source: Source) -> AsyncIterator[psycopg.AsyncConnection]:
 
 
 async def add_rule(
-    pool: AsyncConnectionPool, list_: str, kind: str, value: str, note: str | None
+    pool: AsyncConnectionPool,
+    list_: str,
+    kind: str,
+    value: str,
+    note: str | None,
+    preamble: str | None = None,
 ) -> policy.Rule:
     list_, kind, value = policy.validate_rule(list_, kind, value)
     try:
         async with pool.connection() as conn:
             cur = await conn.execute(
-                "INSERT INTO access_rules (list, kind, value, note) VALUES (%s, %s, %s, %s)"
-                " RETURNING id",
-                (list_, kind, value, note),
+                "INSERT INTO access_rules (list, kind, value, note, preamble)"
+                " VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (list_, kind, value, note, preamble),
             )
             rule_id = (await cur.fetchone())[0]
     except errors.UniqueViolation as exc:
@@ -84,7 +90,7 @@ async def list_rules(source: Source) -> list[policy.Rule]:
 async def list_rule_rows(pool: AsyncConnectionPool) -> list[RuleRow]:
     async with pool.connection() as conn:
         cur = await conn.cursor(row_factory=dict_row).execute(
-            "SELECT id, list, kind, value, note, created_at FROM access_rules ORDER BY id"
+            "SELECT id, list, kind, value, note, preamble, created_at FROM access_rules ORDER BY id"
         )
         return [RuleRow(**row) for row in await cur.fetchall()]
 
@@ -141,4 +147,35 @@ async def set_default_preset(pool: AsyncConnectionPool, preset_id: uuid.UUID | N
         await conn.execute(
             "UPDATE settings SET default_preset_id = %s, updated_at = now() WHERE id = 1",
             (preset_id,),
+        )
+
+
+async def set_rule_preamble(pool: AsyncConnectionPool, rule_id: int, preamble: str | None) -> bool:
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "UPDATE access_rules SET preamble = %s WHERE id = %s", (preamble, rule_id)
+        )
+        return cur.rowcount == 1
+
+
+async def get_rule_preamble(source: Source, rule_id: int) -> tuple[str | None, str | None] | None:
+    """`(note, preamble)` of the rule, None when it no longer exists."""
+    async with _conn(source) as conn:
+        cur = await conn.execute(
+            "SELECT note, preamble FROM access_rules WHERE id = %s", (rule_id,)
+        )
+        row = await cur.fetchone()
+    return None if row is None else (row[0], row[1])
+
+
+async def get_preamble(source: Source) -> str | None:
+    async with _conn(source) as conn:
+        cur = await conn.execute("SELECT preamble FROM settings WHERE id = 1")
+        return (await cur.fetchone())[0]
+
+
+async def set_preamble(pool: AsyncConnectionPool, preamble: str | None) -> None:
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE settings SET preamble = %s, updated_at = now() WHERE id = 1", (preamble,)
         )

@@ -5,7 +5,7 @@ description = "Matrix connector service for the agents platform"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "agents-common @ git+https://github.com/szymonrychu/agents-common@v0.3.0",
+    "agents-common @ git+https://github.com/szymonrychu/agents-common@v0.5.0",
     "fastapi",
     "uvicorn[standard]",
     "httpx",
@@ -16,7 +16,7 @@ agents-matrix-connector = "agents_matrix_connector.cli:main"
 
 [dependency-groups]
 dev = [
-    "agents-common[testing] @ git+https://github.com/szymonrychu/agents-common@v0.3.0",
+    "agents-common[testing] @ git+https://github.com/szymonrychu/agents-common@v0.5.0",
     "ruff",
     "pytest",
     "pytest-asyncio",

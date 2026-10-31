@@ -673,6 +673,17 @@
             ],
             "title": "Note"
           },
+          "preamble": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preamble"
+          },
           "value": {
             "title": "Value",
             "type": "string"
@@ -684,6 +695,26 @@
           "value"
         ],
         "title": "RuleIn",
+        "type": "object"
+      },
+      "RulePatch": {
+        "properties": {
+          "preamble": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preamble"
+          }
+        },
+        "required": [
+          "preamble"
+        ],
+        "title": "RulePatch",
         "type": "object"
       },
       "RuleView": {
@@ -716,6 +747,17 @@
             ],
             "title": "Note"
           },
+          "preamble": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preamble"
+          },
           "value": {
             "title": "Value",
             "type": "string"
@@ -727,6 +769,7 @@
           "kind",
           "value",
           "note",
+          "preamble",
           "created_at"
         ],
         "title": "RuleView",
@@ -795,6 +838,7 @@
         "type": "object"
       },
       "SettingsIn": {
+        "description": "A field left out keeps its stored value; null clears it.",
         "properties": {
           "default_preset_id": {
             "anyOf": [
@@ -807,16 +851,28 @@
               }
             ],
             "title": "Default Preset Id"
+          },
+          "preamble": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preamble"
           }
         },
-        "required": [
-          "default_preset_id"
-        ],
         "title": "SettingsIn",
         "type": "object"
       },
       "SettingsView": {
         "properties": {
+          "default_preamble": {
+            "title": "Default Preamble",
+            "type": "string"
+          },
           "default_preset_id": {
             "anyOf": [
               {
@@ -828,10 +884,23 @@
               }
             ],
             "title": "Default Preset Id"
+          },
+          "preamble": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preamble"
           }
         },
         "required": [
-          "default_preset_id"
+          "default_preset_id",
+          "preamble",
+          "default_preamble"
         ],
         "title": "SettingsView",
         "type": "object"
@@ -860,6 +929,95 @@
           "healthy"
         ],
         "title": "SyncView",
+        "type": "object"
+      },
+      "TemplatePreviewError": {
+        "properties": {
+          "line": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "line",
+          "message"
+        ],
+        "title": "TemplatePreviewError",
+        "type": "object"
+      },
+      "TemplatePreviewIn": {
+        "properties": {
+          "context": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context"
+          },
+          "template": {
+            "title": "Template",
+            "type": "string"
+          }
+        },
+        "required": [
+          "template"
+        ],
+        "title": "TemplatePreviewIn",
+        "type": "object"
+      },
+      "TemplatePreviewView": {
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemplatePreviewError"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rendered": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rendered"
+          },
+          "variables": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Variables",
+            "type": "array"
+          }
+        },
+        "required": [
+          "rendered",
+          "error",
+          "variables"
+        ],
+        "title": "TemplatePreviewView",
         "type": "object"
       },
       "UserView": {
@@ -1420,6 +1578,53 @@
           }
         },
         "summary": "Delete Rule"
+      },
+      "patch": {
+        "operationId": "patch_rule_matrix_api_v1_rules__rule_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "title": "Rule Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RulePatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuleView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Rule"
       }
     },
     "/matrix/api/v1/settings": {
@@ -1474,6 +1679,44 @@
           }
         },
         "summary": "Put Settings"
+      }
+    },
+    "/matrix/api/v1/templates/preview": {
+      "post": {
+        "operationId": "preview_template_matrix_api_v1_templates_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TemplatePreviewIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplatePreviewView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Template"
       }
     },
     "/matrix/api/v1/users": {

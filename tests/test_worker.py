@@ -16,7 +16,7 @@ from agents_matrix_connector.db import bindings, inbound, runs
 from agents_matrix_connector.db.bindings import BindingRow
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
 from agents_matrix_connector.matrix import MatrixClient
-from agents_matrix_connector.prompt import PREAMBLE
+from agents_matrix_connector.prompt import DEFAULT_PREAMBLE
 from agents_matrix_connector.settings import BotSettings
 from agents_matrix_connector.worker import Worker, binding_state, check_action
 
@@ -230,7 +230,7 @@ async def test_first_dispatch_batches_room(conn, fake, preset, make_worker):
     [message] = session_messages(fake, session_id)
     assert str(message["id"]) == message_id
     text = message["text"]
-    assert text.startswith(PREAMBLE)
+    assert text.startswith(DEFAULT_PREAMBLE)
     assert f'<chat room="Alice" kind="dm" room_id="{DM}">' in text
     assert text.index("hello one") < text.index("hello &lt;two&gt;")
     assert 'facebook_id="111"' in text
@@ -271,7 +271,7 @@ async def test_reuse_running_session_bypasses_cap(conn, fake, preset, make_worke
     text = messages[1]["text"]
     assert str(messages[1]["id"]) == message_id
     assert text.startswith("New messages in the chat:")
-    assert PREAMBLE not in text
+    assert DEFAULT_PREAMBLE not in text
     assert "three" in text and "one" not in text
     assert text.endswith(marker(follow_id))
     assert (await room_rows(conn, DM))[2] == ("three", "in-progress", None, follow_id)
@@ -309,7 +309,7 @@ async def test_session_gone_falls_back(conn, fake, orchestrator, preset, make_wo
     assert new_session != old_session
     assert fake.sessions[str(new_session)]["slug"] == f"mx-{new_id}"
     [message] = session_messages(fake, new_session)
-    assert message["text"].startswith(PREAMBLE)
+    assert message["text"].startswith(DEFAULT_PREAMBLE)
     assert message["text"].index("two") < message["text"].index("three")
     assert (await room_rows(conn, DM))[1:] == [
         ("two", "in-progress", None, new_id),
@@ -823,7 +823,7 @@ async def test_gone_bound_session_released(conn, fake, make_worker):
         ("agent", None, uuid.UUID(gone), f"slug-{gone[:4]}", True, "session_gone"),
         ("inbound", run_id, session_id, f"mx-{run_id}", False, None),
     ]
-    assert session_messages(fake, session_id)[0]["text"].startswith(PREAMBLE)
+    assert session_messages(fake, session_id)[0]["text"].startswith(DEFAULT_PREAMBLE)
     # OTHER has no preset: released, the rows ignored and the room stays unbound.
     assert await room_runs(conn, OTHER) == []
     assert await room_rows(conn, OTHER) == [("nobody", "ignored", "no_preset", None)]
@@ -1018,7 +1018,7 @@ async def test_preamble_for_session_new_to_room(conn, fake, make_worker):
 
     [(run_id, *_)] = await room_runs(conn, DM)
     [message] = session_messages(fake, leader)
-    assert message["text"].startswith(PREAMBLE)
+    assert message["text"].startswith(DEFAULT_PREAMBLE)
     assert f'<chat room="Alice" kind="dm" room_id="{DM}">' in message["text"]
     assert "first answer" in message["text"]
 
@@ -1028,7 +1028,7 @@ async def test_preamble_for_session_new_to_room(conn, fake, make_worker):
     await worker.tick()
     [_, second] = session_messages(fake, leader)
     assert second["text"].startswith("New messages in the chat:")
-    assert PREAMBLE not in second["text"] and "second answer" in second["text"]
+    assert DEFAULT_PREAMBLE not in second["text"] and "second answer" in second["text"]
 
     # A session whose earlier runs are in another room is new to this one.
     other = add_session(fake, "hive-other")
@@ -1037,7 +1037,7 @@ async def test_preamble_for_session_new_to_room(conn, fake, make_worker):
     await queue(conn, THIRD, "hello")
     await worker.tick()
     [message] = session_messages(fake, other)
-    assert message["text"].startswith(PREAMBLE)
+    assert message["text"].startswith(DEFAULT_PREAMBLE)
 
 
 async def test_resume_keeps_preamble_for_session_new_to_room(conn, fake, make_worker):
@@ -1046,7 +1046,7 @@ async def test_resume_keeps_preamble_for_session_new_to_room(conn, fake, make_wo
     await bind_agent(conn, DM, leader)
     worker = make_worker()
 
-    # The first delivery fails; the retry through Worker._resume keeps the PREAMBLE, the run
+    # The first delivery fails; the retry through Worker._resume keeps the DEFAULT_PREAMBLE, the run
     # itself not counting as an earlier run of the session in the room.
     await queue(conn, DM, "one")
     fake.fail_next("post_message", 503)
@@ -1056,11 +1056,11 @@ async def test_resume_keeps_preamble_for_session_new_to_room(conn, fake, make_wo
     assert session_messages(fake, leader) == []
     await worker.tick()
     [message] = session_messages(fake, leader)
-    assert message["text"].startswith(PREAMBLE) and message["text"].endswith(marker(run_id))
+    assert message["text"].startswith(DEFAULT_PREAMBLE) and message["text"].endswith(marker(run_id))
     [(_, _, _, _, message_id, *_)] = await room_runs(conn, DM)
     assert message_id == str(message["id"])
 
-    # A resumed follow run into a session with an earlier run in the room: no PREAMBLE.
+    # A resumed follow run into a session with an earlier run in the room: no DEFAULT_PREAMBLE.
     await finish_handled(conn, run_id)
     await queue(conn, DM, "two")
     fake.fail_next("post_message", 503)
@@ -1070,4 +1070,67 @@ async def test_resume_keeps_preamble_for_session_new_to_room(conn, fake, make_wo
     await worker.tick()
     [_, resumed] = session_messages(fake, leader)
     assert resumed["text"].startswith("New messages in the chat:")
-    assert PREAMBLE not in resumed["text"] and resumed["text"].endswith(marker(follow_id))
+    assert DEFAULT_PREAMBLE not in resumed["text"] and resumed["text"].endswith(marker(follow_id))
+
+
+async def _first_text(conn, fake, make_worker, rule_id=None):
+    await add_room(conn, DM)
+    [event_id] = await queue(conn, DM, "hello")
+    await conn.execute("UPDATE inbound SET rule_id = %s WHERE event_id = %s", (rule_id, event_id))
+    await make_worker().tick()
+    [(_, _, _, session_id, *_)] = await room_runs(conn, DM)
+    [message] = session_messages(fake, session_id)
+    return message["text"]
+
+
+async def test_preamble_default_when_nothing_overrides(conn, fake, make_worker, preset):
+    await preset()
+    text = await _first_text(conn, fake, make_worker)
+    assert text.startswith(DEFAULT_PREAMBLE + "\n\n<chat")
+
+
+async def test_global_preamble_replaces_default_and_renders_variables(
+    conn, fake, make_worker, preset
+):
+    await preset()
+    await conn.execute(
+        "UPDATE settings SET preamble = %s WHERE id = 1",
+        ("Global for {{ room_name }} {{ room_id }} from {{ sender }} at {{ now }}",),
+    )
+    text = await _first_text(conn, fake, make_worker)
+    assert text.startswith(f"Global for Alice {DM} from Alice A at {T0.isoformat()}\n\n<chat")
+
+
+async def test_rule_preamble_beats_global(conn, fake, make_worker, preset):
+    await preset()
+    await conn.execute("UPDATE settings SET preamble = 'Global' WHERE id = 1")
+    [(rule_id,)] = await (
+        await conn.execute(
+            "INSERT INTO access_rules (list, kind, value, note, preamble)"
+            " VALUES ('allow', 'room', %s, 'family', 'Rule {{ rule_name }}') RETURNING id",
+            (DM,),
+        )
+    ).fetchall()
+    text = await _first_text(conn, fake, make_worker, rule_id)
+    assert text.startswith("Rule family\n\n<chat")
+
+
+async def test_rule_without_preamble_falls_to_global(conn, fake, make_worker, preset):
+    await preset()
+    await conn.execute("UPDATE settings SET preamble = 'Global' WHERE id = 1")
+    [(rule_id,)] = await (
+        await conn.execute(
+            "INSERT INTO access_rules (list, kind, value)"
+            " VALUES ('allow', 'room', %s) RETURNING id",
+            (DM,),
+        )
+    ).fetchall()
+    text = await _first_text(conn, fake, make_worker, rule_id)
+    assert text.startswith("Global\n\n<chat")
+
+
+async def test_broken_stored_preamble_falls_back_to_default(conn, fake, make_worker, preset):
+    await preset()
+    await conn.execute("UPDATE settings SET preamble = '{{ nope }}' WHERE id = 1")
+    text = await _first_text(conn, fake, make_worker)
+    assert text.startswith(DEFAULT_PREAMBLE + "\n\n<chat")

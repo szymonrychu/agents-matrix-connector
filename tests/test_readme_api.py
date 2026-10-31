@@ -106,6 +106,7 @@ def test_readme_lists_every_reason() -> None:
     for code in (
         "invalid_request",
         "invalid_rule",
+        "invalid_template",
         "rule_exists",
         "unknown_preset",
         "not_found",

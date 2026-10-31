@@ -17,7 +17,7 @@ from psycopg_pool import AsyncConnectionPool
 
 _COLUMNS = (
     "id, event_id, room_id, sender, sender_name, body, mentioned, origin_ts, received_at,"
-    " status, reason, run_id"
+    " status, reason, run_id, rule_id"
 )
 
 
@@ -35,6 +35,7 @@ class InboundRow:
     status: str
     reason: str | None
     run_id: int | None
+    rule_id: int | None = None
 
 
 async def insert(
@@ -49,17 +50,29 @@ async def insert(
     origin_ts: datetime | None,
     status: str,
     reason: str | None,
+    rule_id: int | None = None,
 ) -> bool:
     if status not in ("new", "ignored"):
         raise ValueError(f"insert status must be new or ignored, got {status!r}")
     cur = await conn.execute(
         """
         INSERT INTO inbound (event_id, room_id, sender, sender_name, body, mentioned, origin_ts,
-                             status, reason)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                             status, reason, rule_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (event_id) DO NOTHING
         """,
-        (event_id, room_id, sender, sender_name, body, mentioned, origin_ts, status, reason),
+        (
+            event_id,
+            room_id,
+            sender,
+            sender_name,
+            body,
+            mentioned,
+            origin_ts,
+            status,
+            reason,
+            rule_id,
+        ),
     )
     return cur.rowcount == 1
 
