@@ -244,7 +244,7 @@ Inbound messages across all rooms, newest first. Query: `status` (`new`, `in-pro
 
 The agent listener of the `api` subcommand, called by agents-orchestrator on behalf of a session
 leader (the `orchestrator_chat_*` tools). With `MATRIX_AGENT_TOKEN_SHA256` set, the `api`
-subcommand also binds `MATRIX_AGENT_PORT`, which serves only `/chat/v1/*`, `/healthz` and
+subcommand also binds `MATRIX_AGENT_PORT`, which serves only `/chat/v1/*` (the chat routes and the five `/chat/v1/admin` routes), `/healthz` and
 `/readyz`. Base path `/chat/v1`; the OpenAPI document is committed as `openapi-agent.json`
 (regenerate with `uv run python -m agents_matrix_connector.api.openapi --agent >
 openapi-agent.json`) and served at `/chat/v1/openapi.json`.
@@ -385,6 +385,32 @@ session's send included; 401 `unauthorized`.
 
     curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
       http://localhost:8001/chat/v1/messages/s7
+
+### Admin routes (`/chat/v1/admin`)
+
+The same handlers as the UI app, behind the same bearer, for the orchestrator's superleader
+relay. They take no `X-Orch-Session`. Request and response bodies, status codes and error codes
+are those of the UI routes of the same name.
+
+### `GET /chat/v1/admin/rooms`
+
+As `GET /matrix/api/v1/rooms`.
+
+### `PUT /chat/v1/admin/rooms/{room_id}/settings`
+
+As `PUT /matrix/api/v1/rooms/{room_id}/settings`.
+
+### `GET /chat/v1/admin/rules`
+
+As `GET /matrix/api/v1/rules`.
+
+### `POST /chat/v1/admin/rules`
+
+As `POST /matrix/api/v1/rules`.
+
+### `DELETE /chat/v1/admin/rules/{rule_id}`
+
+As `DELETE /matrix/api/v1/rules/{rule_id}`.
 
 ## Operations
 

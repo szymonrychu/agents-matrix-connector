@@ -41,7 +41,7 @@ def make_token() -> tuple[str, str]:
 
 
 def agent_client(digest: str, client=POD_PEER) -> httpx.AsyncClient:
-    app = create_agent_app(fake_pool(), make_settings(agent_token_sha256=digest))
+    app = create_agent_app(fake_pool(), None, make_settings(agent_token_sha256=digest))
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app, client=client), base_url="http://agents"
     )

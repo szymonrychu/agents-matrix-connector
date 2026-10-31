@@ -1,6 +1,97 @@
 {
   "components": {
     "schemas": {
+      "AccessView": {
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "rule_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule Id"
+          },
+          "state": {
+            "enum": [
+              "allowed",
+              "denied",
+              "default"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "reason",
+          "rule_id"
+        ],
+        "title": "AccessView",
+        "type": "object"
+      },
+      "BindingView": {
+        "description": "The room's active binding; a reservation by a first run in progress has no session yet.",
+        "properties": {
+          "origin": {
+            "enum": [
+              "inbound",
+              "agent"
+            ],
+            "title": "Origin",
+            "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "since": {
+            "format": "date-time",
+            "title": "Since",
+            "type": "string"
+          },
+          "slug": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slug"
+          }
+        },
+        "required": [
+          "session_id",
+          "slug",
+          "origin",
+          "since"
+        ],
+        "title": "BindingView",
+        "type": "object"
+      },
       "ChatRoom": {
         "properties": {
           "agents_may_initiate": {
@@ -107,6 +198,52 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "MemberView": {
+        "properties": {
+          "access": {
+            "$ref": "#/components/schemas/AccessView"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "facebook_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Facebook Id"
+          },
+          "membership": {
+            "title": "Membership",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "display_name",
+          "facebook_id",
+          "membership",
+          "access"
+        ],
+        "title": "MemberView",
+        "type": "object"
+      },
       "MessageIn": {
         "additionalProperties": false,
         "properties": {
@@ -162,6 +299,497 @@
           "key"
         ],
         "title": "ReactionIn",
+        "type": "object"
+      },
+      "RoomDetail": {
+        "properties": {
+          "access": {
+            "$ref": "#/components/schemas/AccessView"
+          },
+          "agents_may_initiate": {
+            "title": "Agents May Initiate",
+            "type": "boolean"
+          },
+          "alias": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Alias"
+          },
+          "binding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BindingView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "effective_trigger": {
+            "enum": [
+              "all",
+              "mention"
+            ],
+            "title": "Effective Trigger",
+            "type": "string"
+          },
+          "encrypted": {
+            "title": "Encrypted",
+            "type": "boolean"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "last_event_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Event At"
+          },
+          "member_count": {
+            "title": "Member Count",
+            "type": "integer"
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/MemberView"
+            },
+            "title": "Members",
+            "type": "array"
+          },
+          "membership": {
+            "title": "Membership",
+            "type": "string"
+          },
+          "message_request": {
+            "title": "Message Request",
+            "type": "boolean"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "preset_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preset Id"
+          },
+          "queued": {
+            "title": "Queued",
+            "type": "integer"
+          },
+          "room_id": {
+            "title": "Room Id",
+            "type": "string"
+          },
+          "session": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "trigger": {
+            "anyOf": [
+              {
+                "enum": [
+                  "all",
+                  "mention"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger"
+          }
+        },
+        "required": [
+          "room_id",
+          "name",
+          "alias",
+          "kind",
+          "encrypted",
+          "message_request",
+          "membership",
+          "member_count",
+          "access",
+          "preset_id",
+          "trigger",
+          "effective_trigger",
+          "agents_may_initiate",
+          "session",
+          "binding",
+          "last_event_at",
+          "queued",
+          "members"
+        ],
+        "title": "RoomDetail",
+        "type": "object"
+      },
+      "RoomSettingsIn": {
+        "properties": {
+          "agents_may_initiate": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agents May Initiate"
+          },
+          "preset_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preset Id"
+          },
+          "trigger": {
+            "anyOf": [
+              {
+                "enum": [
+                  "all",
+                  "mention"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger"
+          }
+        },
+        "title": "RoomSettingsIn",
+        "type": "object"
+      },
+      "RoomView": {
+        "properties": {
+          "access": {
+            "$ref": "#/components/schemas/AccessView"
+          },
+          "agents_may_initiate": {
+            "title": "Agents May Initiate",
+            "type": "boolean"
+          },
+          "alias": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Alias"
+          },
+          "binding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BindingView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "effective_trigger": {
+            "enum": [
+              "all",
+              "mention"
+            ],
+            "title": "Effective Trigger",
+            "type": "string"
+          },
+          "encrypted": {
+            "title": "Encrypted",
+            "type": "boolean"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "last_event_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Event At"
+          },
+          "member_count": {
+            "title": "Member Count",
+            "type": "integer"
+          },
+          "membership": {
+            "title": "Membership",
+            "type": "string"
+          },
+          "message_request": {
+            "title": "Message Request",
+            "type": "boolean"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "preset_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preset Id"
+          },
+          "queued": {
+            "title": "Queued",
+            "type": "integer"
+          },
+          "room_id": {
+            "title": "Room Id",
+            "type": "string"
+          },
+          "session": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "trigger": {
+            "anyOf": [
+              {
+                "enum": [
+                  "all",
+                  "mention"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger"
+          }
+        },
+        "required": [
+          "room_id",
+          "name",
+          "alias",
+          "kind",
+          "encrypted",
+          "message_request",
+          "membership",
+          "member_count",
+          "access",
+          "preset_id",
+          "trigger",
+          "effective_trigger",
+          "agents_may_initiate",
+          "session",
+          "binding",
+          "last_event_at",
+          "queued"
+        ],
+        "title": "RoomView",
+        "type": "object"
+      },
+      "RuleIn": {
+        "properties": {
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "list": {
+            "title": "List",
+            "type": "string"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "preamble": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preamble"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "list",
+          "kind",
+          "value"
+        ],
+        "title": "RuleIn",
+        "type": "object"
+      },
+      "RuleView": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "list": {
+            "title": "List",
+            "type": "string"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "preamble": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preamble"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "list",
+          "kind",
+          "value",
+          "note",
+          "preamble",
+          "created_at"
+        ],
+        "title": "RuleView",
+        "type": "object"
+      },
+      "RulesView": {
+        "properties": {
+          "allow": {
+            "items": {
+              "$ref": "#/components/schemas/RuleView"
+            },
+            "title": "Allow",
+            "type": "array"
+          },
+          "deny": {
+            "items": {
+              "$ref": "#/components/schemas/RuleView"
+            },
+            "title": "Deny",
+            "type": "array"
+          }
+        },
+        "required": [
+          "allow",
+          "deny"
+        ],
+        "title": "RulesView",
         "type": "object"
       },
       "SendAccepted": {
@@ -257,6 +885,44 @@
         "title": "SendStatus",
         "type": "object"
       },
+      "SessionView": {
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "slug": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slug"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "slug",
+          "status"
+        ],
+        "title": "SessionView",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -305,6 +971,218 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/chat/v1/admin/rooms": {
+      "get": {
+        "operationId": "list_rooms_chat_v1_admin_rooms_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "dm",
+                    "group",
+                    "matrix",
+                    "infrastructure"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "access",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "allowed",
+                    "denied",
+                    "default"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Access"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RoomView"
+                  },
+                  "title": "Response List Rooms Chat V1 Admin Rooms Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Rooms"
+      }
+    },
+    "/chat/v1/admin/rooms/{room_id}/settings": {
+      "put": {
+        "operationId": "put_settings_chat_v1_admin_rooms__room_id__settings_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "room_id",
+            "required": true,
+            "schema": {
+              "title": "Room Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoomSettingsIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoomDetail"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Settings"
+      }
+    },
+    "/chat/v1/admin/rules": {
+      "get": {
+        "operationId": "list_rules_chat_v1_admin_rules_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RulesView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Rules"
+      },
+      "post": {
+        "operationId": "create_rule_chat_v1_admin_rules_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuleIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuleView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Rule"
+      }
+    },
+    "/chat/v1/admin/rules/{rule_id}": {
+      "delete": {
+        "operationId": "delete_rule_chat_v1_admin_rules__rule_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "title": "Rule Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Rule"
+      }
+    },
     "/chat/v1/messages": {
       "post": {
         "description": "Queue a message, optionally a quoted reply.",

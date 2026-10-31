@@ -4,6 +4,16 @@ Lessons that outlive a session. Newest first.
 
 ## 2026-10-31 decisions
 
+- Superleader admin surface (M1): the connector's token-gated agent listener (`MATRIX_AGENT_PORT`,
+  `AgentGate`) now also serves the five routes the orchestrator relay (O9) needs, under
+  `/chat/v1/admin`, reusing the UI handlers (`build_admin_router` filters the rooms and rules
+  routers): `GET /chat/v1/admin/rooms`, `PUT /chat/v1/admin/rooms/{room_id}/settings`,
+  `GET /chat/v1/admin/rules`, `POST /chat/v1/admin/rules`, `DELETE /chat/v1/admin/rules/{rule_id}`.
+  Bodies and errors equal the UI routes (`/matrix/api/v1`). No `X-Orch-Session` needed. Before
+  this the UI routes sat only behind the CIDR allowlist, unreachable with the bearer. Rule PATCH,
+  settings, users and room detail are deliberately not exposed. `create_agent_app` now takes the
+  orchestrator client (the room settings route validates `preset_id`).
+
 - The hard-coded preamble is now the Jinja template `DEFAULT_PREAMBLE` (user decision). Lookup
   order: the allowing rule's `access_rules.preamble`, then `settings.preamble`, then the default.
   Variables: `room_name`, `room_id`, `sender`, `rule_name` (the rule's note), `now`. Why a

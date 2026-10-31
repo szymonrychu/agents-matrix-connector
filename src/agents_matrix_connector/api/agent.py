@@ -36,7 +36,8 @@ from agents_matrix_connector.api.app import (
     add_probes,
     error_response,
 )
-from agents_matrix_connector.api.rooms import agent_room_decision
+from agents_matrix_connector.api.rooms import agent_room_decision, build_rooms_router
+from agents_matrix_connector.api.rules import build_rules_router
 from agents_matrix_connector.api.schemas import ApiError
 from agents_matrix_connector.chunks import split
 from agents_matrix_connector.db import bindings, directory, rules, sends
@@ -45,6 +46,16 @@ from agents_matrix_connector.settings import ApiSettings, ConnectorSettings
 log = logging.getLogger(__name__)
 
 CHAT_PREFIX = "/chat/v1"
+ADMIN_PREFIX = CHAT_PREFIX + "/admin"
+_ADMIN_ROUTES = frozenset(
+    {
+        ("/rooms", "GET"),
+        ("/rooms/{room_id}/settings", "PUT"),
+        ("/rules", "GET"),
+        ("/rules", "POST"),
+        ("/rules/{rule_id}", "DELETE"),
+    }
+)
 HEALTH_METHODS = frozenset({"GET", "HEAD"})
 
 MAX_TEXT_CHARS = 16000
@@ -499,7 +510,26 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
     return router
 
 
-def create_agent_app(pool: AsyncConnectionPool, settings: ApiSettings) -> FastAPI:
+def build_admin_router(
+    pool: AsyncConnectionPool, orchestrator: Any, settings: ApiSettings
+) -> APIRouter:
+    """The UI handlers for rules and rooms, narrowed to the five routes the superleader needs."""
+    admin = APIRouter()
+    for router in (
+        build_rooms_router(pool, orchestrator, settings),
+        build_rules_router(pool, orchestrator),
+    ):
+        admin.routes.extend(
+            route
+            for route in router.routes
+            if any((route.path, m) in _ADMIN_ROUTES for m in getattr(route, "methods", ()))
+        )
+    return admin
+
+
+def create_agent_app(
+    pool: AsyncConnectionPool, orchestrator: Any, settings: ApiSettings
+) -> FastAPI:
     app = FastAPI(
         title="agents-matrix-connector agent API",
         openapi_url=f"{CHAT_PREFIX}/openapi.json",
@@ -507,6 +537,7 @@ def create_agent_app(pool: AsyncConnectionPool, settings: ApiSettings) -> FastAP
         redoc_url=None,
     )
     app.include_router(build_chat_router(pool, settings))
+    app.include_router(build_admin_router(pool, orchestrator, settings), prefix=ADMIN_PREFIX)
     app.add_middleware(AgentGate, token_sha256=settings.agent_token_sha256.get_secret_value())
     add_error_handlers(app)
     add_probes(app, pool)
