@@ -20,8 +20,9 @@ TABLES = {
     "outbound",
     "sends",
     "room_bindings",
+    "room_holds",
 }
-MIGRATIONS = ["0001_init.sql", "0002_agent_sends.sql", "0003_preamble.sql"]
+MIGRATIONS = ["0001_init.sql", "0002_agent_sends.sql", "0003_preamble.sql", "0004_room_holds.sql"]
 
 
 @pytest.fixture
@@ -64,6 +65,7 @@ def test_writer_comments(db):
         "outbound": "writer: bot worker",
         "sends": "queue: inserted by api, transitions by bot worker",
         "room_bindings": "writer: bot worker",
+        "room_holds": "writer: bot worker",
     }
     with psycopg.connect(db) as conn:
         for table, comment in expected.items():
@@ -71,6 +73,7 @@ def test_writer_comments(db):
             assert got.fetchone()[0].startswith(comment), table
         assert _columns(conn, "sends") == SENDS_COLUMNS
         assert _columns(conn, "room_bindings") == ROOM_BINDINGS_COLUMNS
+        assert _columns(conn, "room_holds") == ROOM_HOLDS_COLUMNS
 
 
 SENDS_COLUMNS = {
@@ -101,6 +104,12 @@ ROOM_BINDINGS_COLUMNS = {
     "created_at": ("timestamp with time zone", "NO"),
     "released_at": ("timestamp with time zone", "YES"),
     "release_reason": ("text", "YES"),
+}
+ROOM_HOLDS_COLUMNS = {
+    "room_id": ("text", "NO"),
+    "until": ("timestamp with time zone", "NO"),
+    "reason": ("text", "NO"),
+    "updated_at": ("timestamp with time zone", "NO"),
 }
 
 
