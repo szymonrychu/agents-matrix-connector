@@ -12,7 +12,7 @@ from agents_common.orchestrator import (
     Session,
 )
 
-from agents_matrix_connector.db import bindings, inbound, runs
+from agents_matrix_connector.db import bindings, holds, inbound, runs
 from agents_matrix_connector.db.bindings import BindingRow
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
 from agents_matrix_connector.matrix import MatrixClient
@@ -729,6 +729,118 @@ async def test_failed_first_run_releases_reservation(conn, fake, preset, make_wo
             ("inbound", failed_run, None, None, True, "run_failed"),
             ("inbound", new_run, session_id, slug, False, None),
         ]
+
+
+async def room_hold(conn, room_id: str) -> tuple | None:
+    rows = await fetch(conn, "SELECT until, reason FROM room_holds WHERE room_id = %s", room_id)
+    return rows[0] if rows else None
+
+
+async def test_usage_quota_refusal_holds_room(conn, fake, preset, make_worker, clock, caplog):
+    caplog.set_level(logging.INFO, logger="agents_matrix_connector.worker")
+    await preset()
+    await add_room(conn, DM)
+    await queue(conn, DM, "one")
+    resets_at = T0 + timedelta(hours=2)
+    fake.refuse_usage(resets_at)
+    worker = make_worker()
+
+    await worker.tick()
+
+    [(run_id, kind, _, session_id, message_id, status, reason, _)] = await room_runs(conn, DM)
+    assert (kind, session_id, message_id) == ("first", None, None)
+    assert (status, reason) == ("failed", "usage_quota")
+    assert await room_rows(conn, DM) == [("one", "new", None, None)]
+    assert await room_bindings(conn, DM) == [("inbound", run_id, None, None, True, "run_failed")]
+    until = resets_at + timedelta(seconds=60)
+    assert await room_hold(conn, DM) == (until, "usage_quota")
+    assert fake.sessions == {}
+    assert any("usage_quota" in r.getMessage() and DM in r.getMessage() for r in caplog.records)
+
+    # Messages arriving during the hold stay new, and nothing is asked of the orchestrator.
+    posts = sum(r.method == "POST" for r in fake.requests)
+    await queue(conn, DM, "two")
+    clock.at = until - timedelta(seconds=1)
+    await worker.tick()
+    assert len(await room_runs(conn, DM)) == 1
+    assert [r[:2] for r in await room_rows(conn, DM)] == [("one", "new"), ("two", "new")]
+    assert sum(r.method == "POST" for r in fake.requests) == posts
+
+    # At `until` the room is ready again: one new first run carries both messages.
+    clock.at = until
+    await worker.tick()
+    _, (new_id, kind, _, new_session, _, status, *_) = await room_runs(conn, DM)
+    assert (kind, status) == ("first", "in-progress") and new_session is not None
+    assert [r[:2] for r in await room_rows(conn, DM)] == [
+        ("one", "in-progress"),
+        ("two", "in-progress"),
+    ]
+    assert (await active_binding(conn, DM))[1] == new_id
+
+
+async def test_second_usage_quota_refusal_moves_hold(conn, fake, preset, make_worker, clock):
+    await preset()
+    await add_room(conn, DM)
+    await queue(conn, DM, "one")
+    fake.refuse_usage(T0 + timedelta(hours=1), times=2)
+    worker = make_worker()
+
+    await worker.tick()
+    first_until = T0 + timedelta(hours=1, seconds=60)
+    assert await room_hold(conn, DM) == (first_until, "usage_quota")
+
+    clock.at = first_until
+    await worker.tick()
+
+    assert [r[5:7] for r in await room_runs(conn, DM)] == [
+        ("failed", "usage_quota"),
+        ("failed", "usage_quota"),
+    ]
+    [(until, reason)] = await fetch(conn, "SELECT until, reason FROM room_holds")
+    assert until > first_until and reason == "usage_quota"
+    assert await fetch(conn, "SELECT count(*) FROM room_holds WHERE room_id = %s", DM) == [(1,)]
+    assert (await room_rows(conn, DM))[0][1] == "new"
+
+
+async def test_hold_does_not_affect_other_rooms(conn, fake, preset, make_worker, clock):
+    await preset()
+    for room in (DM, OTHER):
+        await add_room(conn, room)
+    await holds.hold(conn, DM, T0 + timedelta(hours=1), "usage_quota")
+    leader = add_session(fake, "hive-lead")
+    await bind_agent(conn, OTHER, leader)
+    await queue(conn, DM, "held")
+    await queue(conn, OTHER, "follow me")
+
+    await make_worker().tick()
+
+    assert await room_runs(conn, DM) == []
+    assert await room_rows(conn, DM) == [("held", "new", None, None)]
+    [(_, kind, _, session_id, message_id, status, *_)] = await room_runs(conn, OTHER)
+    assert (kind, str(session_id), status) == ("follow", leader, "in-progress")
+    assert message_id is not None
+
+
+async def test_unposted_run_refused_for_usage_quota_holds_room(
+    conn, fake, preset, make_worker, clock
+):
+    await preset()
+    await add_room(conn, DM)
+    await queue(conn, DM, "one")
+    worker = make_worker()
+    fake.fail_next("create_session", 503)
+    await worker.tick()
+    [(run_id, *_, status, _, _)] = await room_runs(conn, DM)
+    assert status == "in-progress"
+
+    # The retry through `_resume` is refused for the usage quota: the run is released too.
+    fake.refuse_usage(T0 + timedelta(hours=1))
+    await worker.tick()
+
+    assert [r[5:7] for r in await room_runs(conn, DM)] == [("failed", "usage_quota")]
+    assert await room_rows(conn, DM) == [("one", "new", None, None)]
+    assert await room_bindings(conn, DM) == [("inbound", run_id, None, None, True, "run_failed")]
+    assert (await room_hold(conn, DM))[1] == "usage_quota"
 
 
 async def test_bound_session_gets_batch_without_preset(conn, fake, make_worker):

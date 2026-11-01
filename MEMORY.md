@@ -2,6 +2,27 @@
 
 Lessons that outlive a session. Newest first.
 
+## 2026-11-01 decisions
+
+- Usage quota holds (epic claude-usage-monitor E4, agents-common v0.5.0 to v0.7.0; v0.6.0 only
+  added `service_gate`, nothing to adapt here). The orchestrator now refuses a new session with
+  409 `usage_quota` when the Claude plan usage is at its limit. The worker catches
+  `UsageQuotaRefused` (before `OrchestratorError`) in `_dispatch` only: a follow run posts into an
+  existing session and never creates one. In one transaction the run fails `usage_quota`, its rows
+  return to `new`, the reservation is released (`run_failed`) and `room_holds` gets
+  `until = exc.retry_at(now)` (reset plus 60 s, at least a minute away, 300 s without a reset).
+  Why a hold and not just requeue: without it the room would be retried every tick, hitting the
+  orchestrator and the usage gate several times a second for every held chat. Why per room and not
+  global: the connector does not know the gate state, and the next room's first run is refused
+  once and held the same way. `rooms_ready(conn, now)` skips a room whose hold `until > now`
+  (the hold ends exactly at `until`); a second refusal upserts a later `until`. `room_holds` has
+  one writer (the worker), one row per room, and is never pruned (a stale row is inert and the
+  count is bounded by the number of rooms).
+- `_fail_and_requeue` is the one place that fails a run and returns its rows to `new`, shared by
+  `_session_gone` and `_quota_hold`; the two differ only in how the binding is released (the
+  session's binding vs the first run's reservation). Dispatch of an unposted run through `_resume`
+  can be refused too and is held the same way.
+
 ## 2026-10-31 decisions
 
 - Superleader admin surface (M1): the connector's token-gated agent listener (`MATRIX_AGENT_PORT`,

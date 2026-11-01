@@ -26,7 +26,11 @@ and `deliver`, which skip every step whose id is stored and adopt a posted messa
 run's marker, so a retry creates no second session and posts no second prompt. A follow run into
 a session that has no other run in the room gets the preamble, like a first prompt. A delivery
 whose session is gone fails the run `session_gone`, releases the binding and returns its rows to
-`new`, so the next tick starts a new session. The worker never deletes sessions.
+`new`, so the next tick starts a new session. A first run the orchestrator refuses for the Claude
+usage quota (`UsageQuotaRefused`) fails `usage_quota`, returns its rows to `new`, releases the
+reservation and holds the room (`room_holds`) until the refusal's `retry_at`; `rooms_ready`
+skips a held room, so its messages stay `new` until the hold has passed. The worker never deletes
+sessions.
 """
 
 from __future__ import annotations
@@ -50,13 +54,14 @@ from agents_common.orchestrator import (
     OrchestratorError,
     OrchestratorUnavailable,
     Session,
+    UsageQuotaRefused,
 )
 from agents_common.templating import TemplateError
 from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector import discovery, prompt
 from agents_matrix_connector.clock import utcnow
-from agents_matrix_connector.db import bindings, directory, inbound, rules, runs
+from agents_matrix_connector.db import bindings, directory, holds, inbound, rules, runs
 from agents_matrix_connector.db.bindings import BindingRow
 from agents_matrix_connector.db.inbound import InboundRow
 from agents_matrix_connector.matrix import MatrixClient, MatrixError
@@ -69,6 +74,7 @@ RUN_KIND = "matrix"
 NO_PRESET = "no_preset"
 TYPING_TIMEOUT_MS = 30000
 RUN_FAILED = "run_failed"
+USAGE_QUOTA = "usage_quota"
 LOG_INTERVAL = timedelta(minutes=1)
 SWEEP_INTERVAL = timedelta(seconds=60)
 
@@ -171,7 +177,7 @@ class Worker:
             await self._resume(run)
         await self._sweep()
         async with self._pool.connection() as conn:
-            ready = await inbound.rooms_ready(conn)
+            ready = await inbound.rooms_ready(conn, self._now())
         for room_id in ready:
             await self._room(room_id)
 
@@ -336,6 +342,9 @@ class Worker:
         except NotFound as exc:  # dispatch finished the run and its rows
             log.warning("run %s: %s %s", batch.ref.id, exc.status, exc.code)
             return
+        except UsageQuotaRefused as exc:  # dispatch finished nothing
+            await self._quota_hold(batch, exc)
+            return
         except OrchestratorError as exc:
             log.warning("run %s refused: %s %s", batch.ref.id, exc.status, exc.code)
             await self._store.finish(batch.ref.id, "failed", exc.code)
@@ -369,11 +378,44 @@ class Worker:
             return
         await self._delivered(batch)
 
+    @staticmethod
+    async def _fail_and_requeue(
+        conn: psycopg.AsyncConnection, batch: _Batch, reason: str
+    ) -> int | None:
+        """Finish the run failed with `reason` and send its rows back to `new`; the number of
+        rows, or None when the run was no longer in progress (nothing is changed then)."""
+        if not await runs.finish(conn, int(batch.ref.id), "failed", reason):
+            return None
+        return await inbound.requeue_run_rows(conn, int(batch.ref.id))
+
+    async def _quota_hold(self, batch: _Batch, exc: UsageQuotaRefused) -> None:
+        """The orchestrator refused the first run's session for the Claude usage quota: fail the
+        run, send its rows back to `new`, release the room's reservation and hold the room until
+        the window resets, all in one transaction. Messages arriving meanwhile stay `new`."""
+        until = exc.retry_at(self._now())
+        async with self._pool.connection() as conn, conn.transaction():
+            requeued = await self._fail_and_requeue(conn, batch, USAGE_QUOTA)
+            if requeued is None:
+                return
+            await bindings.release_reservation(conn, int(batch.ref.id), RUN_FAILED)
+            await holds.hold(conn, batch.room_id, until, USAGE_QUOTA)
+        log.info(
+            "run %s refused (usage_quota, %s %s%% of %s%%): room %s held until %s, %s messages "
+            "back to new",
+            batch.ref.id,
+            exc.metric,
+            exc.percent,
+            exc.limit,
+            batch.room_id,
+            until.isoformat(),
+            requeued,
+        )
+
     async def _session_gone(self, batch: _Batch) -> None:
         async with self._pool.connection() as conn, conn.transaction():
-            if not await runs.finish(conn, int(batch.ref.id), "failed", SESSION_GONE):
+            requeued = await self._fail_and_requeue(conn, batch, SESSION_GONE)
+            if requeued is None:
                 return
-            requeued = await inbound.requeue_run_rows(conn, int(batch.ref.id))
             if batch.ref.session_id is not None:
                 binding = await bindings.active_for_session(conn, uuid.UUID(batch.ref.session_id))
                 if binding is not None:

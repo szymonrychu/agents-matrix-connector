@@ -84,17 +84,21 @@ async def count_new(conn: psycopg.AsyncConnection, room_id: str) -> int:
     return (await cur.fetchone())[0]
 
 
-async def rooms_ready(conn: psycopg.AsyncConnection) -> list[str]:
-    """Rooms with new rows and no run in progress, by their oldest new row."""
+async def rooms_ready(conn: psycopg.AsyncConnection, now: datetime) -> list[str]:
+    """Rooms with new rows, no run in progress and no hold running past `now`, by their oldest
+    new row."""
     cur = await conn.execute(
         """
         SELECT i.room_id FROM inbound i
         WHERE i.status = 'new'
           AND NOT EXISTS (SELECT 1 FROM runs r
                            WHERE r.room_id = i.room_id AND r.status = 'in-progress')
+          AND NOT EXISTS (SELECT 1 FROM room_holds h
+                           WHERE h.room_id = i.room_id AND h.until > %s)
         GROUP BY i.room_id
         ORDER BY min(i.id)
-        """
+        """,
+        (now,),
     )
     return [row[0] for row in await cur.fetchall()]
 

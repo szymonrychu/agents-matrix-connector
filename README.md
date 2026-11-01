@@ -483,6 +483,18 @@ release the binding (a deny rule still stops every agent send and every inbound 
 session check the orchestrator refuses keeps the binding and the messages `new`; an unavailable
 orchestrator is retried on the next tick.
 
+### Rooms held for the Claude usage quota
+
+When the orchestrator refuses a new session because the Claude plan usage is at its limit (409
+`usage_quota`), the first run fails with `usage_quota`, its messages go back to `new`, the room's
+reservation is released (`run_failed`) and the room is held (`room_holds`, written only by the
+worker) until the window resets plus a 60 s margin (never earlier than a minute from now; five
+minutes when the orchestrator names no reset). The worker skips a held room, so no session is
+asked for, while the room's later messages stay `new`; when the hold has passed, one new first run
+carries them all, and a second refusal moves the hold on. A hold only keeps the room from
+starting a session: a follow run into an already bound running session never creates one and is
+unaffected, and so are all other rooms until the orchestrator refuses them too.
+
 ### Let agents start chats in a room
 
 Agents may post only to policy-allowed rooms that are bound to their session, or that are

@@ -4,7 +4,7 @@ import psycopg
 import pytest
 from agents_common.db.pool import open_pool
 
-from agents_matrix_connector.db import inbound
+from agents_matrix_connector.db import holds, inbound
 
 PACKAGE = "agents_matrix_connector"
 T0 = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
@@ -73,10 +73,29 @@ async def test_rooms_ready(conn):
     await put(conn, "$c1", room="!c:x")
     await put(conn, "$b2", room="!b:x")
     await put(conn, "$d1", room="!d:x", status="ignored", reason="x")
-    assert await inbound.rooms_ready(conn) == ["!b:x", "!a:x", "!c:x"]
+    assert await inbound.rooms_ready(conn, T0) == ["!b:x", "!a:x", "!c:x"]
     await new_run(conn, "!a:x")
     await new_run(conn, "!c:x", status="handled")
-    assert await inbound.rooms_ready(conn) == ["!b:x", "!c:x"]
+    assert await inbound.rooms_ready(conn, T0) == ["!b:x", "!c:x"]
+
+
+async def test_rooms_ready_skips_held_rooms(conn):
+    await put(conn, "$a1", room="!a:x")
+    await put(conn, "$b1", room="!b:x")
+    await holds.hold(conn, "!a:x", T0 + timedelta(minutes=10), "usage_quota")
+    assert await inbound.rooms_ready(conn, T0) == ["!b:x"]
+    assert await inbound.rooms_ready(conn, T0 + timedelta(minutes=9)) == ["!b:x"]
+    # A hold ends at its `until`, and a hold on a room without new rows changes nothing.
+    assert await inbound.rooms_ready(conn, T0 + timedelta(minutes=10)) == ["!a:x", "!b:x"]
+    await holds.hold(conn, "!z:x", T0 + timedelta(days=1), "usage_quota")
+    assert await inbound.rooms_ready(conn, T0 + timedelta(minutes=11)) == ["!a:x", "!b:x"]
+
+
+async def test_hold_upserts_and_moves_until(conn):
+    await holds.hold(conn, "!a:x", T0 + timedelta(minutes=10), "usage_quota")
+    await holds.hold(conn, "!a:x", T0 + timedelta(hours=2), "usage_quota")
+    cur = await conn.execute("SELECT room_id, until, reason FROM room_holds")
+    assert await cur.fetchall() == [("!a:x", T0 + timedelta(hours=2), "usage_quota")]
 
 
 async def test_claim_room(conn):
