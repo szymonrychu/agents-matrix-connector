@@ -10,6 +10,8 @@ to agents-orchestrator sessions.
 
 ## Development
 
+Run `pre-commit install` once per clone to enable the gitleaks hook.
+
 - `mise run test` runs the test suite.
 - `mise run lint` runs ruff check and format check.
 - DB tests need Docker (testcontainers).
