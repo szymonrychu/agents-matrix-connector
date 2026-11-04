@@ -180,3 +180,38 @@ async def test_get_room_and_list_users(conn, pool):
     assert [u.user_id for u in await directory.list_users(pool, "facebook_111", 10)] == [alice]
     assert len(await directory.list_users(pool, None, 1)) == 1
     assert await directory.list_users(pool, "zzz", 10) == []
+
+
+async def test_find_users_by_name_exact_casefold(conn):
+    await directory.upsert_room(conn, "!a:x", membership="join", at=T0)
+    await directory.upsert_members(
+        conn,
+        "!a:x",
+        {
+            "@facebook_2:example.org": ("Jane Doe", "join"),
+            "@facebook_1:example.org": ("jane doe", "join"),
+            "@facebook_3:example.org": ("Jane Doe Jr", "join"),
+            "@other:example.org": (None, "join"),
+        },
+        fb,
+        T0,
+    )
+    found = await directory.find_users_by_name(conn, "JANE DOE", frozenset())
+    assert [u.user_id for u in found] == ["@facebook_1:example.org", "@facebook_2:example.org"]
+    assert found[0].facebook_id == "1"
+    assert found[0].display_name == "jane doe"
+    assert await directory.find_users_by_name(conn, "Jane", frozenset()) == []
+    assert await directory.find_users_by_name(conn, "Jane_Doe", frozenset()) == []
+
+
+async def test_find_users_by_name_excludes_self(conn):
+    await directory.upsert_room(conn, "!a:x", membership="join", at=T0)
+    await directory.upsert_members(
+        conn,
+        "!a:x",
+        {"@me:example.org": ("Szymon", "join"), "@facebook_5:example.org": ("Szymon", "join")},
+        fb,
+        T0,
+    )
+    found = await directory.find_users_by_name(conn, "szymon", frozenset({"@me:example.org"}))
+    assert [u.user_id for u in found] == ["@facebook_5:example.org"]

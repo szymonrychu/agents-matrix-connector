@@ -304,6 +304,27 @@ async def list_users(pool: AsyncConnectionPool, q: str | None, limit: int) -> li
         return [UserRow(**row) for row in await cur.fetchall()]
 
 
+async def find_users_by_name(
+    conn: psycopg.AsyncConnection, name: str, exclude: frozenset[str]
+) -> list[UserRow]:
+    """Users whose display name equals `name` ignoring case, except `exclude`, by user id."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT u.user_id, u.display_name, u.facebook_id,
+                   COALESCE((SELECT array_agg(m.room_id ORDER BY m.room_id)
+                               FROM room_members m
+                              WHERE m.user_id = u.user_id AND m.membership = 'join'),
+                            '{}') AS room_ids
+            FROM users u
+            WHERE lower(u.display_name) = lower(%s) AND NOT (u.user_id = ANY(%s))
+            ORDER BY u.user_id
+            """,
+            (name, list(exclude)),
+        )
+        return [UserRow(**row) for row in await cur.fetchall()]
+
+
 async def room_exists(pool: AsyncConnectionPool, room_id: str) -> bool:
     async with pool.connection() as conn:
         cur = await conn.execute("SELECT 1 FROM rooms WHERE room_id = %s", (room_id,))
