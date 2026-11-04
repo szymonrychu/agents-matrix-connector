@@ -4,8 +4,9 @@
 `MatrixClient` makes, with Matrix-shaped JSON and errors, for one bot user and its token.
 Drive it through `httpx.ASGITransport(app=fake.app)` or serve it with uvicorn; the helpers
 (`add_room`, `add_alias`, `invite`, `post`, `set_state`, `set_member`, `encrypt`,
-`limit_timeline`, `fail_next`, `revoke_token`) change its state and `sent` /
-`typing_state` / `receipts` read back what the bot did.
+`limit_timeline`, `fail_next`, `revoke_token`) change its state and `sent` / `sent_events` /
+`typing_state` / `receipts` / `created_rooms` / `invites` / `account_data` / `membership_of`
+read back what the bot did.
 
 Sync tokens are `s<n>` and pagination tokens `t<n>`, both meaning "after the n-th event";
 `/messages` accepts either. A sync timeline holding more events than its limit (the
@@ -41,6 +42,10 @@ ROUTES = (
     "typing",
     "receipt",
     "resolve_alias",
+    "create_room",
+    "invite",
+    "get_account_data",
+    "set_account_data",
 )
 DEFAULT_ERRCODES = {
     400: "M_UNKNOWN",
@@ -109,6 +114,10 @@ class FakeHomeserver:
         self._filters: dict[str, dict] = {}
         self._txns: dict[tuple[str, str, str, str], str] = {}
         self._sent: dict[str, list[dict]] = {}
+        self._sent_events: dict[str, list[tuple[str, dict]]] = {}
+        self._created: list[dict] = []
+        self._invites: list[tuple[str, str]] = []
+        self._account_data: dict[str, dict] = {}
         self._typing: dict[str, bool] = {}
         self._receipts: list[tuple[str, str, str]] = []
         self._timeline_limit: int | None = None
@@ -130,6 +139,20 @@ class FakeHomeserver:
                 self._receipt_route,
             ),
             ("GET", ("directory", "room", None), "resolve_alias", self._resolve_alias),
+            ("POST", ("createRoom",), "create_room", self._create_room),
+            ("POST", ("rooms", None, "invite"), "invite", self._invite_route),
+            (
+                "GET",
+                ("user", None, "account_data", None),
+                "get_account_data",
+                self._get_account_data,
+            ),
+            (
+                "PUT",
+                ("user", None, "account_data", None),
+                "set_account_data",
+                self._set_account_data,
+            ),
         ]
         self.app = _AsgiApp(self._asgi)
 
@@ -201,6 +224,25 @@ class FakeHomeserver:
     def sent(self, room_id: str) -> list[dict]:
         """Contents the bot sent into the room, in order, one per distinct transaction."""
         return copy.deepcopy(self._sent.get(room_id, []))
+
+    def sent_events(self, room_id: str) -> list[tuple[str, dict]]:
+        """`(event type, content)` the bot sent into the room, in order."""
+        return copy.deepcopy(self._sent_events.get(room_id, []))
+
+    def created_rooms(self) -> list[dict]:
+        """Every createRoom call: the new `room_id` and the request body."""
+        return copy.deepcopy(self._created)
+
+    def invites(self) -> list[tuple[str, str]]:
+        """`(room_id, user_id)` of every invite the bot sent."""
+        return list(self._invites)
+
+    def account_data(self, event_type: str) -> dict | None:
+        return copy.deepcopy(self._account_data.get(event_type))
+
+    def membership_of(self, room_id: str, user_id: str) -> str | None:
+        member = self._room(room_id).state.get(("m.room.member", user_id))
+        return member[1]["content"]["membership"] if member else None
 
     def typing_state(self, room_id: str) -> bool:
         return self._typing.get(room_id, False)
@@ -570,7 +612,57 @@ class FakeHomeserver:
         event = self._append(room, event_type, self.user_id, content)
         self._txns[key] = event["event_id"]
         self._sent.setdefault(room_id, []).append(copy.deepcopy(content))
+        self._sent_events.setdefault(room_id, []).append((event_type, copy.deepcopy(content)))
         return JSONResponse({"event_id": event["event_id"]})
+
+    async def _create_room(self, request: Request, params: list[str]) -> Response:
+        body = await _json_body(request)
+        if not isinstance(body, dict):
+            return matrix_error(400, "M_NOT_JSON", "Content not JSON")
+        room_id = f"!new{len(self._created) + 1}:{self.server_name}"
+        room = _Room(room_id, self.user_id)
+        self._rooms[room_id] = room
+        self._append(room, "m.room.create", self.user_id, {"creator": self.user_id}, "")
+        self._member_event(room, self.user_id, "join")
+        self._append(room, "m.room.join_rules", self.user_id, {"join_rule": "invite"}, "")
+        for user_id in body.get("invite", []):
+            self._member_event(room, user_id, "invite", sender=self.user_id)
+        self._created.append({"room_id": room_id, **copy.deepcopy(body)})
+        return JSONResponse({"room_id": room_id})
+
+    async def _invite_route(self, request: Request, params: list[str]) -> Response:
+        room = self._joined_room(params[0])
+        if isinstance(room, Response):
+            return room
+        body = await _json_body(request)
+        if not isinstance(body, dict) or not isinstance(body.get("user_id"), str):
+            return matrix_error(400, "M_BAD_JSON", "Missing user_id")
+        self._member_event(room, body["user_id"], "invite", sender=self.user_id)
+        self._invites.append((room.room_id, body["user_id"]))
+        return JSONResponse({})
+
+    def _own_account(self, user_id: str) -> Response | None:
+        if user_id != self.user_id:
+            return matrix_error(403, "M_FORBIDDEN", "Cannot access another user's account data")
+        return None
+
+    async def _get_account_data(self, request: Request, params: list[str]) -> Response:
+        user_id, event_type = params
+        if (refused := self._own_account(user_id)) is not None:
+            return refused
+        if event_type not in self._account_data:
+            return matrix_error(404, "M_NOT_FOUND", "Account data not found")
+        return JSONResponse(copy.deepcopy(self._account_data[event_type]))
+
+    async def _set_account_data(self, request: Request, params: list[str]) -> Response:
+        user_id, event_type = params
+        if (refused := self._own_account(user_id)) is not None:
+            return refused
+        body = await _json_body(request)
+        if not isinstance(body, dict):
+            return matrix_error(400, "M_NOT_JSON", "Content not JSON")
+        self._account_data[event_type] = copy.deepcopy(body)
+        return JSONResponse({})
 
     async def _resolve_alias(self, request: Request, params: list[str]) -> Response:
         [alias] = params

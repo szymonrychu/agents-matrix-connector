@@ -613,3 +613,59 @@ async def test_send_receipt(fake, recorder, client):
 
     with pytest.raises(MatrixNotFound):
         await client.send_receipt("!nope:hs", "$ev3:hs")
+
+
+async def test_create_room_sends_direct_invite(fake, recorder, client):
+    room_id = await client.create_room(invite=[ALICE], is_direct=True)
+    [request] = recorder.requests
+    assert request.method == "POST"
+    assert request.url.raw_path.decode() == f"{API}/createRoom"
+    assert json.loads(request.content) == {
+        "invite": [ALICE],
+        "is_direct": True,
+        "preset": "trusted_private_chat",
+    }
+    assert room_id.startswith("!") and room_id.endswith(":hs")
+    assert fake.created_rooms() == [
+        {"room_id": room_id, "invite": [ALICE], "is_direct": True, "preset": "trusted_private_chat"}
+    ]
+    assert fake.membership_of(room_id, BOT) == "join"
+    assert fake.membership_of(room_id, ALICE) == "invite"
+
+    fake.fail_next("create_room", 400, "M_UNKNOWN")
+    with pytest.raises(MatrixError) as exc:
+        await client.create_room(invite=[ALICE], is_direct=True)
+    assert exc.value.status == 400
+
+
+async def test_invite(fake, recorder, client):
+    fake.add_room(ROOM, [], {BOT: "Bot", ALICE: "Alice"})
+    recorder.requests.clear()
+    await client.invite(ROOM, "@carol:hs")
+    [request] = recorder.requests
+    assert request.method == "POST"
+    assert request.url.raw_path.decode() == f"{API}/rooms/%21a%3Ahs/invite"
+    assert json.loads(request.content) == {"user_id": "@carol:hs"}
+    assert fake.invites() == [(ROOM, "@carol:hs")]
+    assert fake.membership_of(ROOM, "@carol:hs") == "invite"
+    with pytest.raises(MatrixNotFound):
+        await client.invite("!nope:hs", "@carol:hs")
+    fake.fail_next("invite", 403, "M_FORBIDDEN")
+    with pytest.raises(MatrixForbidden):
+        await client.invite(ROOM, "@dave:hs")
+
+
+async def test_account_data_roundtrip(fake, recorder, client):
+    await client.set_account_data(BOT, "m.direct", {ALICE: ["!a:hs"]})
+    request = recorder.requests[-1]
+    assert request.method == "PUT"
+    assert request.url.raw_path.decode() == f"{API}/user/%40bot%3Ahs/account_data/m.direct"
+    assert await client.get_account_data(BOT, "m.direct") == {ALICE: ["!a:hs"]}
+    assert fake.account_data("m.direct") == {ALICE: ["!a:hs"]}
+
+
+async def test_account_data_missing_is_none(fake, client):
+    assert await client.get_account_data(BOT, "m.direct") is None
+    fake.fail_next("get_account_data", 502)
+    with pytest.raises(MatrixUnavailable):
+        await client.get_account_data(BOT, "m.direct")
