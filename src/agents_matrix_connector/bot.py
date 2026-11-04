@@ -14,7 +14,7 @@ from agents_common.runtime import LostLock, advisory_singleton, run_service
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
 
-from agents_matrix_connector.bridge import ProvisioningClient
+from agents_matrix_connector.bridge import BridgeError, ProvisioningClient
 from agents_matrix_connector.matrix import MatrixAuthError, MatrixClient
 from agents_matrix_connector.room_requests import RoomRequests
 from agents_matrix_connector.sender import Sender
@@ -196,6 +196,19 @@ async def run_bot(
     return exit_code if exit_code else code
 
 
+async def _management_room(bridge: ProvisioningClient | None) -> frozenset[str]:
+    """The bridge management room, joined on invite like an allowed room; none without a
+    bridge or when the bridge cannot say (the bot starts anyway)."""
+    if bridge is None:
+        return frozenset()
+    try:
+        room = (await bridge.whoami()).get("management_room")
+    except BridgeError as exc:
+        log.warning("bridge whoami failed (%s); the management room is not auto-joined", exc)
+        return frozenset()
+    return frozenset({room}) if isinstance(room, str) and room else frozenset()
+
+
 async def _main(settings, pool, orchestrator, matrix, stop, bridge=None) -> int:
     try:
         who = await matrix.whoami()
@@ -209,7 +222,7 @@ async def _main(settings, pool, orchestrator, matrix, stop, bridge=None) -> int:
             settings.user_id,
         )
         return EXIT_BAD_SETTINGS
-    sync = SyncLoop(matrix, pool, settings)
+    sync = SyncLoop(matrix, pool, settings, auto_join=await _management_room(bridge))
     worker = Worker(orchestrator, matrix, pool, settings)
     sender = Sender(pool, settings)
     tracker = Tracker(orchestrator, matrix, pool, settings)

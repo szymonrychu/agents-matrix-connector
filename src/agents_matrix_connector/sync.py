@@ -31,7 +31,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector import discovery, policy
 from agents_matrix_connector.clock import utcnow
-from agents_matrix_connector.db import directory, inbound, rules
+from agents_matrix_connector.db import directory, inbound, room_requests, rules
 from agents_matrix_connector.matrix import (
     MatrixAuthError,
     MatrixClient,
@@ -193,8 +193,10 @@ class SyncLoop:
         settings: BotSettings,
         *,
         now: Callable[[], datetime] = utcnow,
+        auto_join: frozenset[str] = frozenset(),
     ):
         self._matrix = matrix
+        self._auto_join = auto_join
         self._pool = pool
         self._settings = settings
         self._now = now
@@ -399,14 +401,29 @@ class SyncLoop:
             return {row[0] for row in await cur.fetchall()}
 
     async def _join_invites(self) -> None:
-        """Join every pending invite; a failed join stays pending and is retried next sync."""
+        """Join every approved pending invite; a failed join stays pending and is retried next
+        sync. Approved (user decision 2026-11-04, Q3): the room has an `allow/room` rule, the
+        bot opened it itself (an open room request in working or done), or it is in
+        `auto_join` (the bridge management room). Every other invite stays `invite`, listed
+        as pending until an allow call adds the rule."""
         async with self._pool.connection() as conn:
             cur = await conn.execute(
                 "SELECT room_id FROM rooms WHERE membership = 'invite'"
                 " ORDER BY discovered_at, room_id"
             )
             invited = [row[0] for row in await cur.fetchall()]
+            if not invited:
+                return
+            allowed = {
+                rule.value
+                for rule in await rules.list_rules(conn)
+                if rule.list == "allow" and rule.kind == "room"
+            }
+            own = await room_requests.joinable_room_ids(conn)
+        approved = allowed | own | self._auto_join
         for room_id in invited:
+            if room_id not in approved:
+                continue
             try:
                 await self._matrix.join(room_id)
             except MatrixAuthError:

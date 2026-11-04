@@ -157,3 +157,52 @@ async def test_work_loop_runs_room_requests():
         5,
     )
     assert order == ["worker", "sender", "tracker", "rooms"]
+
+
+def bridge_transport(answer):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/_matrix/provision/v3/whoami"
+        return answer()
+
+    return httpx.MockTransport(handler)
+
+
+async def test_management_room_is_auto_joined(pool, port, url, fake_hs):
+    fake_hs.add_room("!mgmt:x", [], {"@facebookbot:x": "bridge"})
+    fake_hs.invite("!mgmt:x", "@facebookbot:x")
+    fake_hs.add_room("!stranger:x", [], {"@facebook_5:x": "Stranger"})
+    fake_hs.invite("!stranger:x", "@facebookbot:x")
+    task = asyncio.create_task(
+        run_bot(
+            make_settings(url, port, bridge_provisioning_url="http://bridge/_matrix/provision"),
+            matrix_transport=httpx.ASGITransport(app=fake_hs.app),
+            orchestrator_transport=httpx.ASGITransport(app=FakeOrchestrator().app),
+            bridge_transport=bridge_transport(
+                lambda: httpx.Response(200, json={"management_room": "!mgmt:x"})
+            ),
+        )
+    )
+    try:
+        async with asyncio.timeout(15):
+            while fake_hs.membership_of("!mgmt:x", BOT) != "join":
+                await asyncio.sleep(0.05)
+        assert fake_hs.membership_of("!stranger:x", BOT) == "invite"
+    finally:
+        task.cancel()
+
+
+async def test_bridge_whoami_failure_still_starts(pool, port, url, fake_hs, caplog):
+    task = asyncio.create_task(
+        run_bot(
+            make_settings(url, port, bridge_provisioning_url="http://bridge/_matrix/provision"),
+            matrix_transport=httpx.ASGITransport(app=fake_hs.app),
+            orchestrator_transport=httpx.ASGITransport(app=FakeOrchestrator().app),
+            bridge_transport=bridge_transport(lambda: httpx.Response(502, json={})),
+        )
+    )
+    try:
+        await wait_status(port, "/readyz", 200)
+        assert "management room is not auto-joined" in caplog.text
+        assert TOKEN not in caplog.text
+    finally:
+        task.cancel()

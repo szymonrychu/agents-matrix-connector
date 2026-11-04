@@ -263,7 +263,12 @@ class Stack:
     ) -> str:
         """A bridged portal room of `room_type` with these puppets (user id to display name),
         created by the bridge bot, which invites the bot; returns the room id once the
-        connector lists it joined."""
+        connector lists it joined.
+
+        Invites are joined only when approved (Q3, 2026-11-04): the invite is first listed
+        as pending, then approved the way a portal the bot opened itself is (an `open` room
+        request for the room), which joins it without allowing it, so the room keeps the
+        default policy."""
         room_id = f"!{uuid.uuid4().hex[:12]}:{SERVER}"
         state = [bridge_state(room_type, name)]
         everyone = {BRIDGE_BOT: "Meta bridge bot", **members}
@@ -271,6 +276,16 @@ class Stack:
         if encrypted:
             self.hs_server.call(self.hs.encrypt, room_id)
         self.hs_server.call(self.hs.invite, room_id, BRIDGE_BOT)
+        wait_for(
+            lambda: (room := self.room(room_id)) and room["pending"]["invited"],
+            f"room {room_id} to be listed as a pending invite",
+        )
+        with psycopg.connect(self._env(0)["MATRIX_DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(
+                "INSERT INTO room_requests (action, status, target_kind, target, room_id)"
+                " VALUES ('open', 'done', 'matrix', %s, %s)",
+                (BRIDGE_BOT, room_id),
+            )
         wait_for(
             lambda: (room := self.room(room_id)) and room["membership"] == "join" and room["kind"],
             f"room {room_id} to be joined and classified",

@@ -124,6 +124,13 @@ async def joined_and_synced(fake, client, pool, **overrides) -> SyncLoop:
     return loop
 
 
+async def allow_room(pool, room_id: str) -> None:
+    async with pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO access_rules (list, kind, value) VALUES ('allow', 'room', %s)", (room_id,)
+        )
+
+
 async def test_invite_join_and_classify(fake, client, pool, monkeypatch, caplog):
     created: list[dict] = []
     real_create = client.create_filter
@@ -133,6 +140,7 @@ async def test_invite_join_and_classify(fake, client, pool, monkeypatch, caplog)
         return await real_create(user_id, definition)
 
     monkeypatch.setattr(client, "create_filter", spy_create)
+    await allow_room(pool, DM)  # Q3: only an approved invite is joined
     add_dm(fake, joined=False)
     fake.invite(DM, BRIDGE)
     fake.fail_next("join", 500)
@@ -758,3 +766,101 @@ async def test_inbound_row_records_the_deciding_rule(fake, client, pool):
     fake.post(DM, ALICE, text("hello"))
     await loop.run_once()
     assert await fetch(pool, "SELECT rule_id FROM inbound") == [(rule.id,)]
+
+
+async def membership(pool, room_id: str) -> str | None:
+    rows = await fetch(pool, "SELECT membership FROM rooms WHERE room_id = %s", room_id)
+    return rows[0][0] if rows else None
+
+
+class JoinSpy:
+    def __init__(self, client, monkeypatch):
+        self.joined: list[str] = []
+        real = client.join
+
+        async def spy(room_id):
+            self.joined.append(room_id)
+            return await real(room_id)
+
+        monkeypatch.setattr(client, "join", spy)
+
+
+async def test_unapproved_invite_stays_pending(fake, client, pool, monkeypatch):
+    spy = JoinSpy(client, monkeypatch)
+    add_dm(fake, joined=False)
+    fake.invite(DM, BRIDGE)
+    loop = make_loop(client, pool)
+    await loop.run_once()
+    await loop.run_once()
+    assert spy.joined == []
+    assert await membership(pool, DM) == "invite"
+    assert await fetch(pool, "SELECT inviter FROM rooms WHERE room_id = %s", DM) == [(BRIDGE,)]
+
+
+async def test_allowed_room_invite_joined(fake, client, pool, monkeypatch):
+    spy = JoinSpy(client, monkeypatch)
+    await allow_room(pool, DM)
+    add_dm(fake, joined=False)
+    fake.invite(DM, BRIDGE)
+    loop = make_loop(client, pool)
+    await loop.run_once()
+    assert spy.joined == [DM]
+    await loop.run_once()
+    assert await membership(pool, DM) == "join"
+
+
+async def test_allow_rule_of_other_kind_does_not_join(fake, client, pool, monkeypatch):
+    spy = JoinSpy(client, monkeypatch)
+    async with pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO access_rules (list, kind, value) VALUES ('allow', 'user', %s)", (BRIDGE,)
+        )
+        await conn.execute(
+            "INSERT INTO access_rules (list, kind, value) VALUES ('deny', 'room', %s)", (DM,)
+        )
+    add_dm(fake, joined=False)
+    fake.invite(DM, BRIDGE)
+    await make_loop(client, pool).run_once()
+    assert spy.joined == []
+
+
+async def test_own_request_room_joined(fake, client, pool, monkeypatch):
+    spy = JoinSpy(client, monkeypatch)
+    async with pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO room_requests (action, status, target_kind, target, room_id)"
+            " VALUES ('open', 'done', 'facebook', '1', %s)",
+            (DM,),
+        )
+    add_dm(fake, joined=False)
+    fake.invite(DM, BRIDGE)
+    loop = make_loop(client, pool)
+    await loop.run_once()
+    assert spy.joined == [DM]
+
+
+async def test_management_room_joined(fake, client, pool, monkeypatch):
+    spy = JoinSpy(client, monkeypatch)
+    add_dm(fake, joined=False, room_id="!mgmt:hs", state=[])
+    fake.invite("!mgmt:hs", BRIDGE)
+    add_dm(fake, joined=False)
+    fake.invite(DM, BRIDGE)
+    loop = SyncLoop(
+        client, pool, make_settings(), now=lambda: T0, auto_join=frozenset({"!mgmt:hs"})
+    )
+    await loop.run_once()
+    assert spy.joined == ["!mgmt:hs"]
+
+
+async def test_join_after_allow(fake, client, pool, monkeypatch):
+    spy = JoinSpy(client, monkeypatch)
+    add_dm(fake, joined=False)
+    fake.invite(DM, BRIDGE)
+    loop = make_loop(client, pool)
+    await loop.run_once()
+    assert spy.joined == [] and await membership(pool, DM) == "invite"
+    await allow_room(pool, DM)
+    await loop.run_once()
+    assert spy.joined == [DM]
+    await loop.run_once()
+    assert await membership(pool, DM) == "join"

@@ -549,6 +549,15 @@ by `room` for one chat. A deny rule always wins over an allow rule. Set a preset
 (`PUT /matrix/api/v1/settings`); an allowed unbound room with no preset is ignored with
 `no_preset` (see "One session per room, one room per session").
 
+Invites are approved, not auto-joined: the bot joins a Matrix invite only when the room has an
+`allow/room` rule (the allow route adds it), when the bot opened the room itself (an `open`
+room request, such as the portal `create_dm` returned) or when it is the bridge management room
+(from the provisioning `whoami`, read once at start when `MATRIX_BRIDGE_PROVISIONING_URL` is
+set). Every other invite stays at membership `invite` and is listed as pending (`pending.invited`,
+`pending.inviter`) until it is allowed; the next sync then joins it. A sender rule cannot apply
+to an invite (its inviter is the bridge bot), so a new portal of an already allowed person also
+waits for an allow call. Rooms already joined are unaffected.
+
 ### One session per room, one room per session
 
 A chat room and a session are bound one to one (`room_bindings`): a room has at most one bound
