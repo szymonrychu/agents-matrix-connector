@@ -8,6 +8,7 @@ MATRIX_DEVICE_ID: {{ $m.deviceId | quote }}
 MATRIX_SELF_IDENTITIES: {{ join "," ($m.selfIdentities | default list) | quote }}
 MATRIX_BRIDGE_BOTS: {{ join "," ($m.bridgeBots | default list) | quote }}
 MATRIX_PUPPET_PATTERN: {{ $m.puppetPattern | quote }}
+MATRIX_BRIDGE_PROVISIONING_URL: {{ $m.bridgeProvisioningUrl | default "" | quote }}
 MATRIX_DEFAULT_POLICY: {{ .Values.policy.default | quote }}
 MATRIX_GROUP_TRIGGER: {{ .Values.policy.groupTrigger | quote }}
 MATRIX_MAX_NEW_SESSIONS: {{ .Values.limits.maxNewSessions | int | toString | quote }}
@@ -20,6 +21,7 @@ MATRIX_SYNC_TIMEOUT_SECONDS: {{ .Values.limits.syncTimeoutSeconds | int | toStri
 MATRIX_RETENTION_DAYS: {{ .Values.limits.retentionDays | int | toString | quote }}
 MATRIX_AGENT_PORT: {{ .Values.agentApi.port | int | toString | quote }}
 MATRIX_AGENT_RATE_PER_MINUTE: {{ .Values.limits.agentRatePerMinute | int | toString | quote }}
+MATRIX_ROOM_REQUESTS_PER_HOUR: {{ .Values.limits.roomRequestsPerHour | int | toString | quote }}
 {{- range $k, $v := .Values.env }}
 {{- if not (hasPrefix "MATRIX_" $k) }}
 {{- fail (printf "agents-matrix-connector: env key %q must start with MATRIX_" $k) }}

@@ -334,3 +334,19 @@ def test_pod_annotations_per_component():
     deps = deployments(render({"components": {"api": {"podAnnotations": {"only/api": "1"}}}}))
     assert "only/api" in deps["api"]["spec"]["template"]["metadata"]["annotations"]
     assert "only/api" not in deps["bot"]["spec"]["template"]["metadata"]["annotations"]
+
+
+def _config(overrides=None):
+    return next(d for d in render(overrides) if d["kind"] == "ConfigMap")["data"]
+
+
+def test_config_bridge_provisioning_url():
+    assert _config()["MATRIX_BRIDGE_PROVISIONING_URL"] == ""
+    url = "http://mautrix-meta.messaging.svc.cluster.local:29328/_matrix/provision"
+    data = _config({"matrix": {"bridgeProvisioningUrl": url}})
+    assert data["MATRIX_BRIDGE_PROVISIONING_URL"] == url
+
+
+def test_config_room_requests_per_hour():
+    assert _config()["MATRIX_ROOM_REQUESTS_PER_HOUR"] == "10"
+    assert _config({"limits": {"roomRequestsPerHour": 4}})["MATRIX_ROOM_REQUESTS_PER_HOUR"] == "4"
