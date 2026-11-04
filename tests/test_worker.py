@@ -17,7 +17,7 @@ from agents_matrix_connector.db import bindings, holds, inbound, runs
 from agents_matrix_connector.db.bindings import BindingRow
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
 from agents_matrix_connector.matrix import MatrixClient
-from agents_matrix_connector.prompt import DEFAULT_PREAMBLE
+from agents_matrix_connector.prompt import ADMIN_TRUST_RULE, DEFAULT_PREAMBLE
 from agents_matrix_connector.settings import BotSettings
 from agents_matrix_connector.worker import Worker, binding_state, check_action
 
@@ -1199,7 +1199,7 @@ async def _first_text(conn, fake, make_worker, rule_id=None):
 async def test_preamble_default_when_nothing_overrides(conn, fake, make_worker, preset):
     await preset()
     text = await _first_text(conn, fake, make_worker)
-    assert text.startswith(DEFAULT_PREAMBLE + "\n\n<chat")
+    assert text.startswith(DEFAULT_PREAMBLE + "\n\n" + ADMIN_TRUST_RULE + "\n\n<chat")
 
 
 async def test_global_preamble_replaces_default_and_renders_variables(
@@ -1211,7 +1211,9 @@ async def test_global_preamble_replaces_default_and_renders_variables(
         ("Global for {{ room_name }} {{ room_id }} from {{ sender }} at {{ now }}",),
     )
     text = await _first_text(conn, fake, make_worker)
-    assert text.startswith(f"Global for Alice {DM} from Alice A at {T0.isoformat()}\n\n<chat")
+    assert text.startswith(
+        f"Global for Alice {DM} from Alice A at {T0.isoformat()}\n\n{ADMIN_TRUST_RULE}\n\n<chat"
+    )
 
 
 async def test_rule_preamble_beats_global(conn, fake, make_worker, preset):
@@ -1225,7 +1227,7 @@ async def test_rule_preamble_beats_global(conn, fake, make_worker, preset):
         )
     ).fetchall()
     text = await _first_text(conn, fake, make_worker, rule_id)
-    assert text.startswith("Rule family\n\n<chat")
+    assert text.startswith(f"Rule family\n\n{ADMIN_TRUST_RULE}\n\n<chat")
 
 
 async def test_rule_without_preamble_falls_to_global(conn, fake, make_worker, preset):
@@ -1239,14 +1241,14 @@ async def test_rule_without_preamble_falls_to_global(conn, fake, make_worker, pr
         )
     ).fetchall()
     text = await _first_text(conn, fake, make_worker, rule_id)
-    assert text.startswith("Global\n\n<chat")
+    assert text.startswith(f"Global\n\n{ADMIN_TRUST_RULE}\n\n<chat")
 
 
 async def test_broken_stored_preamble_falls_back_to_default(conn, fake, make_worker, preset):
     await preset()
     await conn.execute("UPDATE settings SET preamble = '{{ nope }}' WHERE id = 1")
     text = await _first_text(conn, fake, make_worker)
-    assert text.startswith(DEFAULT_PREAMBLE + "\n\n<chat")
+    assert text.startswith(DEFAULT_PREAMBLE + "\n\n" + ADMIN_TRUST_RULE + "\n\n<chat")
 
 
 async def add_member(conn, room_id: str, user_id: str, name: str, facebook_id=None) -> None:
@@ -1284,7 +1286,9 @@ async def test_anonymized_room_shows_pseudonyms_not_names(conn, fake, make_worke
     await preset()
     label = pseudonym(ALICE)
     text = await anonymized_first_text(conn, fake, make_worker, True)
-    assert text.startswith(f'{label} / {label}\n\n<chat room="{label}" kind="dm"')
+    assert text.startswith(
+        f'{label} / {label}\n\n{ADMIN_TRUST_RULE}\n\n<chat room="{label}" kind="dm"'
+    )
     assert f'from="{label}" facebook_id=""' in text
     assert ">I am Alice A</message>" in text
     assert 'from="Alice A"' not in text and "111" not in text
@@ -1298,8 +1302,22 @@ async def test_anonymized_admin_by_facebook_id(conn, fake, make_worker, preset):
     assert f'from="{label}"' in text
 
 
+async def test_admin_message_carries_role_in_plain_and_anonymized_rooms(
+    conn, fake, make_worker, preset
+):
+    await preset()
+    text = await anonymized_first_text(conn, fake, make_worker, False, anonymize_admins=["111"])
+    assert 'role="admin">I am Alice A</message>' in text
+
+
+async def test_non_admin_message_has_no_role(conn, fake, make_worker, preset):
+    await preset()
+    text = await anonymized_first_text(conn, fake, make_worker, True, anonymize_admins=["999"])
+    assert "role=" not in text.split("<chat", 1)[1]
+
+
 async def test_room_without_flag_keeps_names(conn, fake, make_worker, preset):
     await preset()
     text = await anonymized_first_text(conn, fake, make_worker, False)
-    assert text.startswith('Alice A / Alice A\n\n<chat room="Alice A"')
+    assert text.startswith(f'Alice A / Alice A\n\n{ADMIN_TRUST_RULE}\n\n<chat room="Alice A"')
     assert 'from="Alice A" facebook_id="111"' in text

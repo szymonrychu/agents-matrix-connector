@@ -468,6 +468,12 @@ class Worker:
             facebook_id=facebook_id,
             preamble=await self._preamble(batch, room_name, sender) if first else "",
             sender=sender,
+            is_admin=self._is_admin,
+        )
+
+    def _is_admin(self, row: InboundRow) -> bool:
+        return anonymize.is_admin(
+            row.sender, self._facebook_id(row.sender), self._settings.anonymize_admins
         )
 
     async def _preamble(

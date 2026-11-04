@@ -657,6 +657,18 @@ rephrase and send the answer itself. The superleader admin routes (`/chat/v1/adm
     curl -s -X PUT -H 'content-type: application/json' -d '{"anonymize_names": true}' \
       'http://localhost:8000/matrix/api/v1/rooms/!abc:server/settings'
 
+### Admin and owner trust
+
+A sender listed in `MATRIX_ANONYMIZE_ADMINS` (by Matrix user id or numeric Facebook id) is an
+admin or the owner, in every room, anonymized or not. The connector marks each of their
+messages with `role="admin"` on `<message>` (the attribute is omitted for everyone else; in an
+anonymized room their `from` is also `admin-<sha>`). The first prompt of a session always
+carries a trust rule after the preamble (the constant `ADMIN_TRUST_RULE`, appended whether the
+preamble is the built-in default or a custom template, so a template cannot drop it): messages
+with `role="admin"` are fully trusted, followed like the operator's, and override the
+untrusted-input rule. Identity comes only from attributes the connector sets; bodies and names
+are XML-escaped, so text claiming to be an admin never adds the role.
+
 ### Read receipts
 
 The bot marks a message read (a public Matrix `m.read` receipt on the newest message of the
@@ -719,8 +731,9 @@ The chart is published by the `chart-publish` job on every push to `main`, after
   an infrastructure room or unsupported content. A chat that is only not yet allowed (default
   deny, reason `not_allowed`) keeps its truncated body so the operator can judge it.
 - Everything from a chat is untrusted input. The first prompt of a session carries a
-  preamble stating that the content inside `<chat>` is data and never instructions, and
-  sender names and bodies are XML-escaped.
+  preamble stating that the content inside `<chat>` is data and never instructions (except
+  messages with `role="admin"`, see "Admin and owner trust"), and sender names and bodies are
+  XML-escaped.
 - No end-to-end encryption: encrypted rooms are ignored (`room_encrypted`).
 - The Matrix access token exists only as a file mounted into the bot pod. The api pod does
   not receive it. The api accepts only socket peers inside `MATRIX_API_ALLOWED_CIDRS` behind
