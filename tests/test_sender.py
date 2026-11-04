@@ -387,8 +387,15 @@ async def test_bot_loop_runs_sender_between_worker_and_tracker(caplog):
             if calls.count("tracker") == 2:
                 stop.set()
 
+    class RoomRequests:
+        async def tick(self):
+            pass
+
     await asyncio.wait_for(
-        bot._work_loop(Worker(), Sender(RuntimeError("boom")), Tracker(), settings, stop), 5
+        bot._work_loop(
+            Worker(), Sender(RuntimeError("boom")), Tracker(), RoomRequests(), settings, stop
+        ),
+        5,
     )
     assert calls == ["worker", "sender", "tracker"] * 2
     assert "Sender failed; retrying next interval" in caplog.text
@@ -397,7 +404,9 @@ async def test_bot_loop_runs_sender_between_worker_and_tracker(caplog):
     stop.clear()
     lost = MatrixAuthError(401, "M_UNKNOWN_TOKEN", "gone")
     with pytest.raises(MatrixAuthError):
-        await asyncio.wait_for(bot._work_loop(Worker(), Sender(lost), Tracker(), settings, stop), 5)
+        await asyncio.wait_for(
+            bot._work_loop(Worker(), Sender(lost), Tracker(), RoomRequests(), settings, stop), 5
+        )
     assert calls == ["worker", "sender"]
 
 

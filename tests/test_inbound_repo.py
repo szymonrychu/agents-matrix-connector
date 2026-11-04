@@ -193,3 +193,30 @@ async def test_list_and_prune(conn, pool):
     assert await inbound.prune(conn, T0) == 5
     left = await statuses(conn)
     assert left == {"$a5": "handled", "$new": "new", "$busy": "in-progress"}
+
+
+async def deny(conn, event_id, room, sender, name, reason, at):
+    await conn.execute(
+        "INSERT INTO inbound (event_id, room_id, sender, sender_name, body, status, reason,"
+        " received_at) VALUES (%s, %s, %s, %s, NULL, 'ignored', %s, %s)",
+        (event_id, room, sender, name, reason, at),
+    )
+
+
+async def test_denied_summary_groups_by_room(conn):
+    await deny(conn, "$1", "!a:x", "@s1:x", "S1", "not_allowed", T0)
+    await deny(conn, "$2", "!a:x", "@s2:x", "S2", "denied: user", T0 + timedelta(minutes=1))
+    await deny(conn, "$3", "!a:x", "@s1:x", "S1 new", "not_allowed", T0 + timedelta(minutes=2))
+    await deny(conn, "$4", "!b:x", "@s3:x", None, "not_allowed", T0)
+    await deny(conn, "$5", "!b:x", "@s4:x", "S4", "not_mentioned", T0 + timedelta(hours=1))
+    await put(conn, "$6", room="!c:x", status="new")
+    summary = await inbound.denied_summary(conn)
+    assert set(summary) == {"!a:x", "!b:x"}
+    a = summary["!a:x"]
+    assert a.count == 3
+    assert a.last_at == T0 + timedelta(minutes=2)
+    assert a.senders == [("@s1:x", "S1 new"), ("@s2:x", "S2")]
+    b = summary["!b:x"]
+    assert (b.count, b.last_at, b.senders) == (1, T0, [("@s3:x", None)])
+    only = await inbound.denied_summary(conn, ["!b:x", "!c:x"])
+    assert set(only) == {"!b:x"}

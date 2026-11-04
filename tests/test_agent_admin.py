@@ -32,6 +32,9 @@ async def test_admin_routes_need_the_bearer(admin):
         ("GET", "/rules", None),
         ("POST", "/rules", {"list": "allow", "kind": "room", "value": ROOM_X}),
         ("DELETE", "/rules/1", None),
+        ("GET", f"/rooms/{DM}", None),
+        ("GET", "/users", None),
+        ("POST", f"/rooms/{DM}/allow", {}),
     ]
     for method, path, body in calls:
         r = await client.request(method, path, json=body)
@@ -81,17 +84,42 @@ async def test_unknown_preset_goes_through_the_orchestrator(admin, conn):
     assert r.status_code == 422 and r.json()["error"]["code"] == "unknown_preset"
 
 
-async def test_only_the_five_admin_routes_are_served(admin):
+async def test_only_the_admin_routes_are_served(admin):
     client, headers = admin
     for method, path in [
         ("PATCH", "/rules/1"),
         ("GET", "/settings"),
         ("PUT", "/settings"),
-        ("GET", "/users"),
         ("GET", "/messages"),
-        ("GET", f"/rooms/{DM}"),
         ("GET", f"/rooms/{DM}/messages"),
         ("GET", "/meta"),
     ]:
         r = await client.request(method, path, headers=headers)
         assert r.status_code in (404, 405), (method, path, r.status_code)
+
+
+async def test_admin_room_detail_and_users_routes(admin, conn):
+    client, headers = admin
+    await seed(conn)
+    room = await client.get(f"/rooms/{DM}", headers=headers)
+    assert room.status_code == 200
+    body = room.json()
+    assert body["room_id"] == DM and body["members"] and "pending" in body
+    assert "effective_preset_id" in body
+    assert (await client.get("/rooms/!nope:x", headers=headers)).status_code == 404
+    users = await client.get("/users", params={"q": "bob"}, headers=headers)
+    assert users.status_code == 200
+    assert [u["display_name"] for u in users.json()] == ["Bob B"]
+    assert (await client.get(f"/rooms/{DM}")).status_code == 401
+    assert (await client.get("/users")).status_code == 401
+
+
+async def test_admin_allow_needs_bearer(admin, conn):
+    client, headers = admin
+    await seed(conn)
+    assert (await client.post(f"/rooms/{DM}/allow", json={})).status_code == 401
+    r = await client.post(
+        "/rooms/!grp:x/allow", json={"trigger": "all"}, headers={**headers, "X-Orch-Slug": "s-1"}
+    )
+    assert r.status_code == 200
+    assert r.json()["access"]["state"] == "allowed" and r.json()["rule_id"] > 0

@@ -36,6 +36,10 @@ from agents_matrix_connector.api.app import (
     add_probes,
     error_response,
 )
+from agents_matrix_connector.api.room_requests import (
+    build_internal_router,
+    build_room_requests_router,
+)
 from agents_matrix_connector.api.rooms import agent_room_decision, build_rooms_router
 from agents_matrix_connector.api.rules import build_rules_router
 from agents_matrix_connector.api.schemas import ApiError
@@ -47,13 +51,20 @@ log = logging.getLogger(__name__)
 
 CHAT_PREFIX = "/chat/v1"
 ADMIN_PREFIX = CHAT_PREFIX + "/admin"
+INTERNAL_PREFIX = CHAT_PREFIX + "/internal"
+"""Routes only the orchestrator calls (never relayed to agents): room request confirmation."""
 _ADMIN_ROUTES = frozenset(
     {
         ("/rooms", "GET"),
+        ("/rooms/{room_id}", "GET"),
+        ("/rooms/{room_id}/allow", "POST"),
         ("/rooms/{room_id}/settings", "PUT"),
+        ("/users", "GET"),
         ("/rules", "GET"),
         ("/rules", "POST"),
         ("/rules/{rule_id}", "DELETE"),
+        ("/room-requests", "POST"),
+        ("/room-requests/{request_id}", "GET"),
     }
 )
 HEALTH_METHODS = frozenset({"GET", "HEAD"})
@@ -513,11 +524,13 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
 def build_admin_router(
     pool: AsyncConnectionPool, orchestrator: Any, settings: ApiSettings
 ) -> APIRouter:
-    """The UI handlers for rules and rooms, narrowed to the five routes the superleader needs."""
+    """The UI handlers for rules, rooms and users plus the room request routes, narrowed to
+    the routes the superleader needs (`_ADMIN_ROUTES`)."""
     admin = APIRouter()
     for router in (
         build_rooms_router(pool, orchestrator, settings),
         build_rules_router(pool, orchestrator),
+        build_room_requests_router(pool, settings),
     ):
         admin.routes.extend(
             route
@@ -538,6 +551,7 @@ def create_agent_app(
     )
     app.include_router(build_chat_router(pool, settings))
     app.include_router(build_admin_router(pool, orchestrator, settings), prefix=ADMIN_PREFIX)
+    app.include_router(build_internal_router(pool), prefix=INTERNAL_PREFIX)
     app.add_middleware(AgentGate, token_sha256=settings.agent_token_sha256.get_secret_value())
     add_error_handlers(app)
     add_probes(app, pool)

@@ -36,6 +36,10 @@ matrix:
     - "@facebookbot:szymonrichert.pl"
   # Regex with a named group "id" that recognises bridged puppet users.
   puppetPattern: "^@facebook_(?P<id>[0-9]+):"
+  # MATRIX_BRIDGE_PROVISIONING_URL: mautrix-meta provisioning base, called by the bot with its own
+  # Matrix token to search people and open Facebook DMs; empty fails Facebook room requests.
+  # Example: http://mautrix-meta.messaging.svc.cluster.local:29328/_matrix/provision
+  bridgeProvisioningUrl: ""
   accessToken: ""
   accessTokenSecret:
     name: ""
@@ -58,6 +62,8 @@ limits:
   retentionDays: 30
   # MATRIX_AGENT_RATE_PER_MINUTE: agent sends accepted per session per minute.
   agentRatePerMinute: 20
+  # MATRIX_ROOM_REQUESTS_PER_HOUR: open and invite room requests accepted per hour, all agents.
+  roomRequestsPerHour: 10
 
 # Source allowlist of the api (MATRIX_API_ALLOWED_CIDRS, api pod only): the direct peer must be
 # inside one of these CIDRs or the api answers 403 (probes excepted).

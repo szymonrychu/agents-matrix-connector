@@ -40,6 +40,25 @@ class BindingView(BaseModel):
     since: datetime
 
 
+class DeniedSender(BaseModel):
+    user_id: str
+    display_name: str | None
+    facebook_id: str | None
+
+
+class PendingView(BaseModel):
+    """Why a room is waiting: not allowed yet, an open invite, a Messenger message request, and
+    the messages the policy refused (count and senders, never bodies)."""
+
+    allowed: bool
+    invited: bool
+    inviter: str | None
+    message_request: bool
+    denied_count: int
+    last_denied_at: datetime | None
+    denied_senders: list[DeniedSender]
+
+
 class RoomView(BaseModel):
     room_id: str
     name: str | None
@@ -51,6 +70,8 @@ class RoomView(BaseModel):
     member_count: int
     access: AccessView
     preset_id: uuid.UUID | None
+    effective_preset_id: uuid.UUID | None
+    """The room's preset, else the default preset."""
     trigger: Literal["all", "mention"] | None
     effective_trigger: Literal["all", "mention"]
     agents_may_initiate: bool
@@ -58,6 +79,7 @@ class RoomView(BaseModel):
     binding: BindingView | None
     last_event_at: datetime | None
     queued: int
+    pending: PendingView
 
 
 class MemberView(BaseModel):
@@ -77,6 +99,22 @@ class RoomSettingsIn(BaseModel):
     trigger: Literal["all", "mention"] | None = None
     agents_may_initiate: bool | None = None
     """None (or omitted) keeps the stored value: the flag is an authorisation grant."""
+
+
+class RoomAllowIn(BaseModel):
+    """As `RoomSettingsIn`: preset and trigger are stored as sent (omitted clears), a null
+    `agents_may_initiate` keeps the stored flag."""
+
+    preset_id: uuid.UUID | None = None
+    trigger: Literal["all", "mention"] | None = None
+    agents_may_initiate: bool | None = None
+
+
+class RoomAllowView(RoomDetail):
+    rule_id: int
+    """The room's `allow/room` rule."""
+    accept_request_id: int | None
+    """The queued accept of the room's Messenger message request or invite, if any."""
 
 
 class MessageView(BaseModel):

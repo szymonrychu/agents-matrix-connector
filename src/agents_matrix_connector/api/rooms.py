@@ -3,22 +3,28 @@
 from __future__ import annotations
 
 import logging
+import re
+import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Annotated, Literal
 
 from agents_common.orchestrator import NotFound, OrchestratorError, OrchestratorUnavailable
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Header, Query
 from psycopg_pool import AsyncConnectionPool
 
-from agents_matrix_connector import policy
+from agents_matrix_connector import discovery, policy
 from agents_matrix_connector.api.schemas import (
     AccessView,
     ApiError,
     BindingView,
+    DeniedSender,
     MemberView,
     MessageView,
     MetaView,
+    PendingView,
+    RoomAllowIn,
+    RoomAllowView,
     RoomDetail,
     RoomSettingsIn,
     RoomView,
@@ -26,7 +32,7 @@ from agents_matrix_connector.api.schemas import (
     SyncView,
     UserView,
 )
-from agents_matrix_connector.db import directory, inbound, rules, runs
+from agents_matrix_connector.db import directory, inbound, room_requests, rules, runs
 from agents_matrix_connector.settings import ApiSettings, ConnectorSettings
 
 log = logging.getLogger(__name__)
@@ -105,13 +111,39 @@ def _parse_cursor(raw: str) -> tuple[str, int]:
 
 def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSettings) -> APIRouter:
     router = APIRouter()
+    puppet = re.compile(settings.puppet_pattern)
+    bridge_server = settings.user_id.split(":", 1)[1]
+
+    def pending_view(
+        room: directory.RoomRow, allowed: bool, denied: inbound.DeniedSummary | None
+    ) -> PendingView:
+        return PendingView(
+            allowed=allowed,
+            invited=room.membership == "invite",
+            inviter=room.inviter,
+            message_request=room.message_request,
+            denied_count=denied.count if denied else 0,
+            last_denied_at=denied.last_at if denied else None,
+            denied_senders=[
+                DeniedSender(
+                    user_id=user_id,
+                    display_name=name,
+                    facebook_id=discovery.facebook_id(user_id, puppet, bridge_server),
+                )
+                for user_id, name in (denied.senders if denied else [])
+            ],
+        )
 
     def room_view(
         room: directory.RoomRow,
         setting: rules.RoomSettings | None,
         rule_list: list[policy.Rule],
+        default_preset: uuid.UUID | None,
+        denied: inbound.DeniedSummary | None,
     ) -> dict:
         decision = policy.evaluate(_room_subject(room), rule_list, settings.default_policy)
+        access = access_view(decision)
+        preset_id = setting.preset_id if setting else None
         return {
             "room_id": room.room_id,
             "name": room.name,
@@ -121,8 +153,9 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
             "message_request": room.message_request,
             "membership": room.membership,
             "member_count": room.member_count,
-            "access": access_view(decision),
-            "preset_id": setting.preset_id if setting else None,
+            "access": access,
+            "preset_id": preset_id,
+            "effective_preset_id": preset_id or default_preset,
             "trigger": setting.trigger if setting else None,
             "effective_trigger": _effective_trigger(room, setting, settings.group_trigger),
             "agents_may_initiate": setting.agents_may_initiate if setting else False,
@@ -145,10 +178,14 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
             ),
             "last_event_at": room.last_event_at,
             "queued": room.queued,
+            "pending": pending_view(room, access.state == "allowed", denied),
         }
 
     async def detail(room: directory.RoomRow, rule_list: list[policy.Rule]) -> RoomDetail:
-        setting = await rules.get_room_settings(pool, room.room_id)
+        async with pool.connection() as conn:
+            setting = await rules.get_room_settings(conn, room.room_id)
+            default_preset = await rules.get_default_preset(conn)
+            denied = (await inbound.denied_summary(conn, [room.room_id])).get(room.room_id)
         members = [
             MemberView(
                 user_id=m.user_id,
@@ -161,13 +198,30 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
             )
             for m in room.members
         ]
-        return RoomDetail(**room_view(room, setting, rule_list), members=members)
+        return RoomDetail(
+            **room_view(room, setting, rule_list, default_preset, denied), members=members
+        )
 
     async def require_room(room_id: str) -> directory.RoomRow:
         room = await directory.get_room(pool, room_id)
         if room is None:
             raise ApiError(404, "not_found", f"room {room_id!r} not found")
         return room
+
+    async def check_preset(preset_id: uuid.UUID | None) -> None:
+        if preset_id is None:
+            return
+        try:
+            await orchestrator.get_preset(preset_id)
+        except NotFound:
+            raise ApiError(
+                422, "unknown_preset", f"preset_id: unknown preset {preset_id}"
+            ) from None
+        except OrchestratorUnavailable:
+            raise ApiError(503, "unavailable", "orchestrator unavailable") from None
+        except OrchestratorError as exc:
+            log.warning("orchestrator get_preset failed: %s", exc)
+            raise ApiError(502, "orchestrator_error", "orchestrator request failed") from None
 
     @router.get("/meta", response_model=MetaView)
     async def meta() -> MetaView:
@@ -188,10 +242,14 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
         kind: RoomKind | None = None, access: AccessState | None = None
     ) -> list[RoomView]:
         rule_list = await rules.list_rules(pool)
+        async with pool.connection() as conn:
+            default_preset = await rules.get_default_preset(conn)
+            denied = await inbound.denied_summary(conn)
         views = []
         for room in await directory.list_rooms(pool, kind):
+            setting = await rules.get_room_settings(pool, room.room_id)
             view = RoomView(
-                **room_view(room, await rules.get_room_settings(pool, room.room_id), rule_list)
+                **room_view(room, setting, rule_list, default_preset, denied.get(room.room_id))
             )
             if access is None or view.access.state == access:
                 views.append(view)
@@ -205,18 +263,7 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
     @router.put("/rooms/{room_id}/settings", response_model=RoomDetail)
     async def put_settings(room_id: str, body: RoomSettingsIn) -> RoomDetail:
         await require_room(room_id)
-        if body.preset_id is not None:
-            try:
-                await orchestrator.get_preset(body.preset_id)
-            except NotFound:
-                raise ApiError(
-                    422, "unknown_preset", f"preset_id: unknown preset {body.preset_id}"
-                ) from None
-            except OrchestratorUnavailable:
-                raise ApiError(503, "unavailable", "orchestrator unavailable") from None
-            except OrchestratorError as exc:
-                log.warning("orchestrator get_preset failed: %s", exc)
-                raise ApiError(502, "orchestrator_error", "orchestrator request failed") from None
+        await check_preset(body.preset_id)
         await rules.set_room_settings(
             pool,
             room_id,
@@ -225,6 +272,49 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
             agents_may_initiate=body.agents_may_initiate,
         )
         return await detail(await require_room(room_id), await rules.list_rules(pool))
+
+    @router.post("/rooms/{room_id}/allow", response_model=RoomAllowView)
+    async def allow_room(
+        room_id: str,
+        body: RoomAllowIn,
+        session: Annotated[str | None, Header(alias="X-Orch-Session")] = None,
+        slug: Annotated[str | None, Header(alias="X-Orch-Slug")] = None,
+    ) -> RoomAllowView:
+        """Allow the room in one transaction: its settings, an `allow/room` rule (reused when it
+        exists) and, for a Messenger message request or a room still at `invite`, an accept
+        request the bot executes once the room is joined."""
+        room = await require_room(room_id)
+        await check_preset(body.preset_id)
+        note = f"allowed by agent {slug}" if slug else "allowed via api"
+        async with pool.connection() as conn, conn.transaction():
+            # One allow per room at a time, so two calls cannot both queue an accept.
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"agents-matrix-connector:allow:{room_id}",),
+            )
+            rule_id = await rules.allow_room(
+                conn,
+                room_id,
+                preset_id=body.preset_id,
+                trigger=body.trigger,
+                agents_may_initiate=body.agents_may_initiate,
+                note=note,
+            )
+            accept_id = await room_requests.open_accept_id(conn, room_id)
+            if accept_id is None and (room.message_request or room.membership == "invite"):
+                accept_id = (
+                    await room_requests.insert(
+                        conn,
+                        action="accept",
+                        status="confirmed",
+                        room_id=room_id,
+                        requested_by=_session_uuid(session),
+                        requested_slug=slug,
+                    )
+                ).id
+        log.info("room allowed room=%s rule=%s accept=%s", room_id, rule_id, accept_id)
+        view = await detail(await require_room(room_id), await rules.list_rules(pool))
+        return RoomAllowView(**view.model_dump(), rule_id=rule_id, accept_request_id=accept_id)
 
     @router.get("/rooms/{room_id}/messages", response_model=list[MessageView])
     async def room_messages(
@@ -291,6 +381,14 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
         ]
 
     return router
+
+
+def _session_uuid(raw: str | None) -> uuid.UUID | None:
+    """The caller's `X-Orch-Session` for the audit trail; a malformed one is dropped."""
+    try:
+        return uuid.UUID(raw) if raw else None
+    except ValueError:
+        return None
 
 
 async def _older(

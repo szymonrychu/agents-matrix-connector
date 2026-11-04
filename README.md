@@ -52,8 +52,10 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_AGENT_TOKEN_SHA256` | empty | api | sha256 hex (64 lowercase characters) of the orchestrator's agent bearer token; empty leaves the agent listener unbound |
 | `MATRIX_AGENT_RATE_PER_MINUTE` | 20 | api | max agent sends (messages and reactions together) per session in the last 60 s (>= 1) |
 | `MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR` | 60 | api | max Matrix events (message chunks of `MATRIX_REPLY_CHUNK_CHARS`, one per reaction) that agent sends may put into one room in the last hour, all sessions together (>= 1) |
+| `MATRIX_ROOM_REQUESTS_PER_HOUR` | 10 | api | max open and invite room requests created in the last hour, all sessions together (>= 1); more answer 429 `rate_limited` |
 | `MATRIX_ACCESS_TOKEN` | none | bot | Matrix access token (required unless the file is set) |
 | `MATRIX_ACCESS_TOKEN_FILE` | empty | bot | file holding the Matrix access token; wins over the variable, stripped |
+| `MATRIX_BRIDGE_PROVISIONING_URL` | empty | bot | mautrix-meta provisioning base, e.g. `http://mautrix-meta.messaging.svc.cluster.local:29328/_matrix/provision`, called with the bot's own Matrix token; empty fails Facebook targets with `bridge_unconfigured` |
 
 ## API
 
@@ -133,14 +135,20 @@ Discovered rooms. Query: `kind` (`dm`, `group`, `matrix`, `infrastructure`), `ac
 `effective_trigger`, `agents_may_initiate` (false when the room has no settings), `session`
 (the latest run: `id`, `slug`, `status`, or null), `binding` (the room's active session binding:
 `session_id`, `slug`, `origin` `inbound` or `agent`, `since`; `session_id` null while a first run
-reserves the room; null when the room is unbound) and `queued` (messages waiting); 422
+reserves the room; null when the room is unbound), `queued` (messages waiting),
+`effective_preset_id` (the room's preset, else the default preset) and `pending`: `allowed`
+(the room's access state is allowed), `invited` (membership `invite`: the bot has not joined),
+`inviter`, `message_request` (a Messenger message request), `denied_count` and
+`last_denied_at` (messages the policy refused, `not_allowed` or `denied: <kind>`) and
+`denied_senders` (`user_id`, `display_name`, `facebook_id`; never message bodies); 422
 `invalid_request`. The binding is read only: no route writes, releases or moves it.
 
     curl -s 'http://localhost:8000/matrix/api/v1/rooms?kind=dm&access=allowed'
 
 ### `GET /matrix/api/v1/rooms/{room_id}`
 
-One room with its `members` (`user_id`, `display_name`, `facebook_id`, `membership`, `access`). 200; 404 `not_found`.
+One room (the fields of the list, `pending` included) with its `members` (`user_id`,
+`display_name`, `facebook_id`, `membership`, `access`). 200; 404 `not_found`.
 
     curl -s 'http://localhost:8000/matrix/api/v1/rooms/!abc:server'
 
@@ -156,6 +164,22 @@ settings), so a save of the preset or trigger never grants or revokes it. 200 ro
 
     curl -s -X PUT -H 'content-type: application/json' -d '{"trigger": "all"}' \
       'http://localhost:8000/matrix/api/v1/rooms/!abc:server/settings'
+
+### `POST /matrix/api/v1/rooms/{room_id}/allow`
+
+Allow and configure a room in one call. Body as `PUT .../settings` (`preset_id`, `trigger`
+stored as sent, `agents_may_initiate` null keeps the stored flag). One transaction stores the
+settings and an `allow/room` rule for the room id (an existing one is reused, so a second call
+adds nothing) and, when the room is a Messenger message request or still at membership
+`invite`, queues an `accept` room request (status `confirmed`) unless one is open. The bot joins
+an invited room on its next sync because the rule now exists, then accepts the message request
+(`com.beeper.accept_message_request`). The rule note is `allowed by agent <slug>` with an
+`X-Orch-Slug` header, else `allowed via api`. 200: the room as `GET /rooms/{room_id}` plus
+`rule_id` and `accept_request_id` (null when nothing was queued); 404 `not_found`; 422
+`unknown_preset`; 503 `unavailable`; 502 `orchestrator_error`.
+
+    curl -s -X POST 'http://localhost:8000/matrix/api/v1/rooms/!abc:server/allow' \
+      -H 'Content-Type: application/json' -d '{"trigger": "all"}'
 
 ### `GET /matrix/api/v1/rooms/{room_id}/messages`
 
@@ -398,9 +422,21 @@ are those of the UI routes of the same name.
 
 As `GET /matrix/api/v1/rooms`.
 
+### `GET /chat/v1/admin/rooms/{room_id}`
+
+As `GET /matrix/api/v1/rooms/{room_id}`.
+
+### `POST /chat/v1/admin/rooms/{room_id}/allow`
+
+As `POST /matrix/api/v1/rooms/{room_id}/allow`.
+
 ### `PUT /chat/v1/admin/rooms/{room_id}/settings`
 
 As `PUT /matrix/api/v1/rooms/{room_id}/settings`.
+
+### `GET /chat/v1/admin/users`
+
+As `GET /matrix/api/v1/users`.
 
 ### `GET /chat/v1/admin/rules`
 
@@ -413,6 +449,67 @@ As `POST /matrix/api/v1/rules`.
 ### `DELETE /chat/v1/admin/rules/{rule_id}`
 
 As `DELETE /matrix/api/v1/rules/{rule_id}`.
+
+### Room requests
+
+An agent asks to open a chat (`open`) or invite a user into a joined Matrix room (`invite`); the
+bot executes a request only after the user said yes on a taskboard decision. The orchestrator
+enforces that: it asks the decision as the calling session, attaches it through the internal
+decision route and records the answer through the internal confirm route, the only path to
+`confirmed`. The api inserts and confirms rows; the bot resolves names and executes. Statuses:
+
+| Status | Meaning |
+|---|---|
+| `resolving` | a name with no local match; the bot searches the bridge (`search_users`) |
+| `candidates` | the name matched several people (`candidates`: `user_id`, `display_name`, `facebook_id`); re-ask with one id. Terminal |
+| `pending_confirmation` | resolved to one id; waits for the user's decision |
+| `confirmed` | the user said yes; the bot executes it next |
+| `working` | the bot is executing it |
+| `done` | executed; `room_id` is the room (`reason` `join_pending` when the bot still has to join, `not_a_message_request` for an accept with nothing to accept) |
+| `failed` | `no_match`, `interrupted` (a Matrix-id open lost mid-call, never rerun), `bridge_unconfigured`, `bridge_error: <errcode>` or `matrix_error: <errcode>` |
+| `rejected` | the user said no (`user_declined`) |
+
+Execution: a Facebook target opens a DM through the mautrix-meta provisioning API (`create_dm`,
+the bot then joins the portal room); a Matrix target gets a new direct room (`createRoom` with
+`is_direct`, recorded in `m.direct`); an invite is a Matrix `/invite`; an `accept` (queued by
+the allow route) sends `com.beeper.accept_message_request` once the room is joined. A new room
+is not allowed by any of this: allow it with the allow route.
+
+### `POST /chat/v1/admin/room-requests`
+
+Body: `target` (1 to 500 characters: a Matrix user id, a bridge ghost `@facebook_<id>:<server>`,
+a numeric Facebook id, a `facebook.com/profile.php?id=<n>` link on `facebook.com`, `www.`,
+`m.`, `mobile.`, `web.` or `fb.com`, or a display name), `action` (`open`, default, or
+`invite`), `room_id` (invite only: a joined Matrix room), `task_key` (`T-<n>`, the taskboard
+task the decision is asked on). Optional `X-Orch-Session` and `X-Orch-Slug` are stored for the
+audit trail. 201: the request (`id`, `action`, `status`, `target_kind`, `target`,
+`display_name`, `room_id`, `candidates`, `task_key`, `decision_id`, `reason`, `created_at`,
+`updated_at`). An id or link is `pending_confirmation`; a name with one local match too (its
+Facebook id, else its Matrix id); several local matches `candidates`; none `resolving`. 422
+`vanity_link_unresolvable` (a `facebook.com/<username>` link: pass the name or a profile.php
+link), 422 `invalid_target` (empty, the bot, a self identity, a bridge bot, a foreign link),
+422 `invite_not_possible`, 422 `invalid_request`, 429 `rate_limited` (more than
+`MATRIX_ROOM_REQUESTS_PER_HOUR` open and invite requests in the last hour). No row is written
+on a 4xx.
+
+### `GET /chat/v1/admin/room-requests/{request_id}`
+
+The request as above; 404 `not_found`.
+
+### Internal routes (`/chat/v1/internal`)
+
+For the orchestrator only, behind the same bearer, never relayed to agents.
+
+### `PUT /chat/v1/internal/room-requests/{request_id}/decision`
+
+Body `task_key`, `decision_id`: attach the taskboard decision, once, to a
+`pending_confirmation` request. 200 the request; 404 `not_found`; 409 `not_pending`.
+
+### `POST /chat/v1/internal/room-requests/{request_id}/confirm`
+
+Body `decision_id`, `approved`: with the attached decision id, `confirmed` (approved) or
+`rejected` (`user_declined`). 200 the request; 404 `not_found`; 409 `not_pending` (another
+status, no decision attached, or a different decision id).
 
 ## Operations
 
@@ -451,6 +548,15 @@ by `room` for one chat. A deny rule always wins over an allow rule. Set a preset
 (`PUT /matrix/api/v1/rooms/{room_id}/settings`) or one default preset
 (`PUT /matrix/api/v1/settings`); an allowed unbound room with no preset is ignored with
 `no_preset` (see "One session per room, one room per session").
+
+Invites are approved, not auto-joined: the bot joins a Matrix invite only when the room has an
+`allow/room` rule (the allow route adds it), when the bot opened the room itself (an `open`
+room request, such as the portal `create_dm` returned) or when it is the bridge management room
+(from the provisioning `whoami`, read once at start when `MATRIX_BRIDGE_PROVISIONING_URL` is
+set). Every other invite stays at membership `invite` and is listed as pending (`pending.invited`,
+`pending.inviter`) until it is allowed; the next sync then joins it. A sender rule cannot apply
+to an invite (its inviter is the bridge bot), so a new portal of an already allowed person also
+waits for an allow call. Rooms already joined are unaffected.
 
 ### One session per room, one room per session
 

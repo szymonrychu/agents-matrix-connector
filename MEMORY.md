@@ -2,6 +2,47 @@
 
 Lessons that outlive a session. Newest first.
 
+## 2026-11-04 decisions
+
+- matrix-integration (T-25): superleader agents allow rooms and open chats. Decisions are the
+  user's answers in the workbench `docs/plans/matrix-integration/plan.md` (Q1-Q6).
+- Invites are approved, not auto-joined (Q3). `SyncLoop._join_invites` joins an invite only when
+  the room has an `allow/room` rule, the bot opened it itself (an `open` room request in
+  `working`/`done` with that `room_id`, e.g. the portal `create_dm` returned) or it is the
+  bridge management room (`auto_join`, read once from the provisioning `whoami` at start; a
+  failure logs a warning and the bot starts without it). Why: the user wants to approve
+  invitations, and joining a stranger's portal already marks the message request seen on the
+  bridge side. A sender rule cannot approve an invite (the inviter is the bridge bot), so a new
+  portal of an allowed person waits for an allow call. The e2e `Stack.portal` helper approves
+  its portals as bot-opened (an inserted `open`/`done` row) so they join without being allowed.
+- `room_requests` is a queue with two transitioners: the api inserts rows and moves
+  `pending_confirmation` to `confirmed`/`rejected`; the bot moves `resolving` to
+  `pending_confirmation`/`candidates`/`failed` and `confirmed` to `working` to `done`/`failed`.
+  Why not the bot alone: confirmation is the user's answer, which only the orchestrator can
+  read (taskboard), and the bot has no orchestrator-side identity for that. The confirm route is
+  internal (`/chat/v1/internal`, never relayed) and only accepts the decision id the
+  orchestrator attached, so an agent cannot confirm its own request, even with a decision it
+  asked itself. The rows double as the audit trail and are never pruned (low volume, capped by
+  `MATRIX_ROOM_REQUESTS_PER_HOUR`).
+- The allow route (`POST /rooms/{room_id}/allow`) writes settings, the `allow/room` rule and an
+  `accept` row (status `confirmed` directly: the allow call itself is the approval) in one
+  transaction under a per-room advisory lock. The bot sends
+  `com.beeper.accept_message_request` once the room is joined; an accept for a room that is not
+  joined yet goes back to `confirmed` each tick. Allowing a room the bot opened stays a separate
+  allow call, so `room_settings` and `access_rules` keep the api as their only writer.
+- Provisioning (Q6): mautrix-meta serves `/_matrix/provision` on its appservice port 29328 (not
+  29319); the bot calls it with Hermes' own Matrix token and `?user_id=` (relies on
+  `provisioning.allow_matrix_auth`, upstream default true). Empty
+  `MATRIX_BRIDGE_PROVISIONING_URL` fails Facebook targets with `bridge_unconfigured`. The bridge
+  creates portal rooms itself, so Facebook opens never createRoom+invite a ghost.
+- A Matrix open that created its room but failed to update `m.direct` is still `done`: a retry
+  would create a second room, and only the DM marker is lost. Rows a stopped bot left
+  `working` are requeued on the first tick (the bot is a singleton, so nothing else holds them).
+- Vanity `facebook.com/<username>` links answer 422 `vanity_link_unresolvable` (the bridge
+  only takes numeric ids); names resolve locally (exact, case-insensitive display name) first,
+  then through the bridge `search_users` (exact name matches preferred, else all results). Not
+  exactly one match is `candidates`/`failed`, never an open.
+
 ## 2026-11-01 decisions
 
 - Usage quota holds (epic claude-usage-monitor E4, agents-common v0.5.0 to v0.7.0; v0.6.0 only

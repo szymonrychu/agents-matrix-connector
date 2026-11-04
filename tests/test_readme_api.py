@@ -146,10 +146,17 @@ def test_readme_lists_every_agent_route() -> None:
         f"POST {CHAT_PREFIX}/reactions",
         f"GET {CHAT_PREFIX}/messages/{{id}}",
         f"GET {CHAT_PREFIX}/admin/rooms",
+        f"GET {CHAT_PREFIX}/admin/rooms/{{room_id}}",
+        f"POST {CHAT_PREFIX}/admin/rooms/{{room_id}}/allow",
         f"PUT {CHAT_PREFIX}/admin/rooms/{{room_id}}/settings",
+        f"GET {CHAT_PREFIX}/admin/users",
         f"GET {CHAT_PREFIX}/admin/rules",
         f"POST {CHAT_PREFIX}/admin/rules",
         f"DELETE {CHAT_PREFIX}/admin/rules/{{rule_id}}",
+        f"POST {CHAT_PREFIX}/admin/room-requests",
+        f"GET {CHAT_PREFIX}/admin/room-requests/{{request_id}}",
+        f"PUT {CHAT_PREFIX}/internal/room-requests/{{request_id}}/decision",
+        f"POST {CHAT_PREFIX}/internal/room-requests/{{request_id}}/confirm",
     }
     agent = section("Agent API")
     assert readme_routes("Agent API", CHAT_PREFIX) == expected

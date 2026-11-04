@@ -8,7 +8,7 @@ pool.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import psycopg
@@ -36,6 +36,44 @@ class InboundRow:
     reason: str | None
     run_id: int | None
     rule_id: int | None = None
+
+
+@dataclass(frozen=True)
+class DeniedSummary:
+    """A room's messages refused by the access policy: how many, the newest, and who sent them
+    as `(user_id, newest sender_name)` ordered by user id. Bodies are never read."""
+
+    count: int
+    last_at: datetime
+    senders: list[tuple[str, str | None]] = field(default_factory=list)
+
+
+_DENIED = "status = 'ignored' AND (reason = 'not_allowed' OR reason LIKE 'denied:%%')"
+
+
+async def denied_summary(
+    conn: psycopg.AsyncConnection, room_ids: list[str] | None = None
+) -> dict[str, DeniedSummary]:
+    """Per room, the inbound rows the policy refused (`not_allowed` or `denied: <kind>`)."""
+    params = {"rooms": room_ids}
+    where = f"{_DENIED} AND (%(rooms)s::text[] IS NULL OR room_id = ANY(%(rooms)s))"
+    cur = await conn.execute(
+        f"SELECT room_id, count(*), max(received_at) FROM inbound WHERE {where} GROUP BY room_id",
+        params,
+    )
+    totals = {room_id: (count, last_at) for room_id, count, last_at in await cur.fetchall()}
+    cur = await conn.execute(
+        f"SELECT DISTINCT ON (room_id, sender) room_id, sender, sender_name FROM inbound"
+        f" WHERE {where} ORDER BY room_id, sender, id DESC",
+        params,
+    )
+    senders: dict[str, list[tuple[str, str | None]]] = {}
+    for room_id, sender, sender_name in await cur.fetchall():
+        senders.setdefault(room_id, []).append((sender, sender_name))
+    return {
+        room_id: DeniedSummary(count, last_at, senders.get(room_id, []))
+        for room_id, (count, last_at) in totals.items()
+    }
 
 
 async def insert(

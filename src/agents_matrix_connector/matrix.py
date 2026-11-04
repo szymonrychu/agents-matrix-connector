@@ -1,4 +1,4 @@
-"""Thin async client for the eleven Matrix client-server calls the connector makes."""
+"""Thin async client for the fifteen Matrix client-server calls the connector makes."""
 
 import asyncio
 import json
@@ -178,6 +178,31 @@ class MatrixClient:
     async def send_receipt(self, room_id: str, event_id: str) -> None:
         """Mark the room read up to `event_id` with a public `m.read` receipt."""
         await self._request("POST", _path("rooms", room_id, "receipt", "m.read", event_id), json={})
+
+    async def create_room(
+        self, *, invite: list[str], is_direct: bool, preset: str = "trusted_private_chat"
+    ) -> str:
+        """A new room the bot joins as creator, inviting `invite`; the room id."""
+        body = await self._request(
+            "POST",
+            _path("createRoom"),
+            json={"invite": invite, "is_direct": is_direct, "preset": preset},
+        )
+        return body["room_id"]
+
+    async def invite(self, room_id: str, user_id: str) -> None:
+        await self._request("POST", _path("rooms", room_id, "invite"), json={"user_id": user_id})
+
+    async def get_account_data(self, user_id: str, event_type: str) -> dict | None:
+        """The user's global account data of `event_type`; None when it is not set."""
+        try:
+            body = await self._request("GET", _path("user", user_id, "account_data", event_type))
+        except MatrixNotFound:
+            return None
+        return body if isinstance(body, dict) else None
+
+    async def set_account_data(self, user_id: str, event_type: str, content: dict) -> None:
+        await self._request("PUT", _path("user", user_id, "account_data", event_type), json=content)
 
     def _redact(self, text: str) -> str:
         return text.replace(self._token, REDACTED) if self._token else text
