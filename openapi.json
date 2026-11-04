@@ -92,6 +92,43 @@
         "title": "BindingView",
         "type": "object"
       },
+      "DeniedSender": {
+        "properties": {
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "facebook_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Facebook Id"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "display_name",
+          "facebook_id"
+        ],
+        "title": "DeniedSender",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -288,6 +325,68 @@
         "title": "MetaView",
         "type": "object"
       },
+      "PendingView": {
+        "description": "Why a room is waiting: not allowed yet, an open invite, a Messenger message request, and\nthe messages the policy refused (count and senders, never bodies).",
+        "properties": {
+          "allowed": {
+            "title": "Allowed",
+            "type": "boolean"
+          },
+          "denied_count": {
+            "title": "Denied Count",
+            "type": "integer"
+          },
+          "denied_senders": {
+            "items": {
+              "$ref": "#/components/schemas/DeniedSender"
+            },
+            "title": "Denied Senders",
+            "type": "array"
+          },
+          "invited": {
+            "title": "Invited",
+            "type": "boolean"
+          },
+          "inviter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inviter"
+          },
+          "last_denied_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Denied At"
+          },
+          "message_request": {
+            "title": "Message Request",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "allowed",
+          "invited",
+          "inviter",
+          "message_request",
+          "denied_count",
+          "last_denied_at",
+          "denied_senders"
+        ],
+        "title": "PendingView",
+        "type": "object"
+      },
       "RoomDetail": {
         "properties": {
           "access": {
@@ -317,6 +416,18 @@
                 "type": "null"
               }
             ]
+          },
+          "effective_preset_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effective Preset Id"
           },
           "effective_trigger": {
             "enum": [
@@ -383,6 +494,9 @@
             ],
             "title": "Name"
           },
+          "pending": {
+            "$ref": "#/components/schemas/PendingView"
+          },
           "preset_id": {
             "anyOf": [
               {
@@ -440,6 +554,7 @@
           "member_count",
           "access",
           "preset_id",
+          "effective_preset_id",
           "trigger",
           "effective_trigger",
           "agents_may_initiate",
@@ -447,6 +562,7 @@
           "binding",
           "last_event_at",
           "queued",
+          "pending",
           "members"
         ],
         "title": "RoomDetail",
@@ -526,6 +642,18 @@
               }
             ]
           },
+          "effective_preset_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effective Preset Id"
+          },
           "effective_trigger": {
             "enum": [
               "all",
@@ -584,6 +712,9 @@
             ],
             "title": "Name"
           },
+          "pending": {
+            "$ref": "#/components/schemas/PendingView"
+          },
           "preset_id": {
             "anyOf": [
               {
@@ -641,13 +772,15 @@
           "member_count",
           "access",
           "preset_id",
+          "effective_preset_id",
           "trigger",
           "effective_trigger",
           "agents_may_initiate",
           "session",
           "binding",
           "last_event_at",
-          "queued"
+          "queued",
+          "pending"
         ],
         "title": "RoomView",
         "type": "object"

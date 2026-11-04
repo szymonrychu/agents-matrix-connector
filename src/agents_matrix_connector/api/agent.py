@@ -50,7 +50,9 @@ ADMIN_PREFIX = CHAT_PREFIX + "/admin"
 _ADMIN_ROUTES = frozenset(
     {
         ("/rooms", "GET"),
+        ("/rooms/{room_id}", "GET"),
         ("/rooms/{room_id}/settings", "PUT"),
+        ("/users", "GET"),
         ("/rules", "GET"),
         ("/rules", "POST"),
         ("/rules/{rule_id}", "DELETE"),
@@ -513,7 +515,8 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
 def build_admin_router(
     pool: AsyncConnectionPool, orchestrator: Any, settings: ApiSettings
 ) -> APIRouter:
-    """The UI handlers for rules and rooms, narrowed to the five routes the superleader needs."""
+    """The UI handlers for rules, rooms and users, narrowed to the routes the superleader
+    needs (`_ADMIN_ROUTES`)."""
     admin = APIRouter()
     for router in (
         build_rooms_router(pool, orchestrator, settings),

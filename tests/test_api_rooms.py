@@ -405,3 +405,64 @@ async def test_cidr_and_error_body(pool, orchestrator, conn):
         assert invalid.status_code == 422
         assert invalid.json()["error"]["code"] == "invalid_request"
         assert set(invalid.json()["error"]) == {"code", "message"}
+
+
+async def test_room_view_effective_preset_defaults(api, conn):
+    await seed(conn)
+    default, own = uuid.uuid4(), uuid.uuid4()
+    rooms = {r["room_id"]: r for r in (await api.get("/rooms")).json()}
+    assert rooms[GRP]["effective_preset_id"] is None
+    await conn.execute("UPDATE settings SET default_preset_id = %s", (default,))
+    await conn.execute("INSERT INTO room_settings (room_id, preset_id) VALUES (%s, %s)", (DM, own))
+    rooms = {r["room_id"]: r for r in (await api.get("/rooms")).json()}
+    assert rooms[GRP]["preset_id"] is None
+    assert rooms[GRP]["effective_preset_id"] == str(default)
+    assert rooms[DM]["effective_preset_id"] == str(own)
+    detail = (await api.get(room_path(GRP))).json()
+    assert detail["effective_preset_id"] == str(default)
+
+
+async def test_room_view_pending_block(api, conn):
+    await seed(conn)
+    await conn.execute("UPDATE rooms SET message_request = true WHERE room_id = %s", (GRP,))
+    for n, (sender, name, reason) in enumerate(
+        [(ALICE, "Alice A", "not_allowed"), (BOB, "Bob B", "denied: user")]
+    ):
+        await conn.execute(
+            "INSERT INTO inbound (event_id, room_id, sender, sender_name, body, status, reason,"
+            " received_at) VALUES (%s, %s, %s, %s, 'secret body', 'ignored', %s, %s)",
+            (f"$d{n}", GRP, sender, name, reason, T0 + timedelta(minutes=n)),
+        )
+    listed = await api.get("/rooms")
+    assert "secret body" not in listed.text
+    grp = {r["room_id"]: r for r in listed.json()}[GRP]
+    assert grp["pending"] == {
+        "allowed": False,
+        "invited": False,
+        "inviter": None,
+        "message_request": True,
+        "denied_count": 2,
+        "last_denied_at": (T0 + timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+        "denied_senders": [
+            {"user_id": ALICE, "display_name": "Alice A", "facebook_id": "111"},
+            {"user_id": BOB, "display_name": "Bob B", "facebook_id": "222"},
+        ],
+    }
+    dm = {r["room_id"]: r for r in listed.json()}[DM]
+    assert dm["pending"]["allowed"] is True and dm["pending"]["denied_count"] == 0
+    assert dm["pending"]["denied_senders"] == [] and dm["pending"]["last_denied_at"] is None
+    detail = await api.get(room_path(GRP))
+    assert detail.json()["pending"]["denied_count"] == 2
+    assert "secret body" not in detail.text
+
+
+async def test_room_view_invite_pending(api, conn):
+    await conn.execute(
+        "INSERT INTO rooms (room_id, membership, inviter) VALUES ('!inv:x', 'invite', %s)",
+        ("@facebookbot:x",),
+    )
+    room = (await api.get(room_path("!inv:x"))).json()
+    assert room["membership"] == "invite"
+    assert room["pending"]["invited"] is True
+    assert room["pending"]["inviter"] == "@facebookbot:x"
+    assert room["pending"]["allowed"] is False

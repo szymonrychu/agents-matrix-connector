@@ -135,14 +135,20 @@ Discovered rooms. Query: `kind` (`dm`, `group`, `matrix`, `infrastructure`), `ac
 `effective_trigger`, `agents_may_initiate` (false when the room has no settings), `session`
 (the latest run: `id`, `slug`, `status`, or null), `binding` (the room's active session binding:
 `session_id`, `slug`, `origin` `inbound` or `agent`, `since`; `session_id` null while a first run
-reserves the room; null when the room is unbound) and `queued` (messages waiting); 422
+reserves the room; null when the room is unbound), `queued` (messages waiting),
+`effective_preset_id` (the room's preset, else the default preset) and `pending`: `allowed`
+(the room's access state is allowed), `invited` (membership `invite`: the bot has not joined),
+`inviter`, `message_request` (a Messenger message request), `denied_count` and
+`last_denied_at` (messages the policy refused, `not_allowed` or `denied: <kind>`) and
+`denied_senders` (`user_id`, `display_name`, `facebook_id`; never message bodies); 422
 `invalid_request`. The binding is read only: no route writes, releases or moves it.
 
     curl -s 'http://localhost:8000/matrix/api/v1/rooms?kind=dm&access=allowed'
 
 ### `GET /matrix/api/v1/rooms/{room_id}`
 
-One room with its `members` (`user_id`, `display_name`, `facebook_id`, `membership`, `access`). 200; 404 `not_found`.
+One room (the fields of the list, `pending` included) with its `members` (`user_id`,
+`display_name`, `facebook_id`, `membership`, `access`). 200; 404 `not_found`.
 
     curl -s 'http://localhost:8000/matrix/api/v1/rooms/!abc:server'
 
@@ -400,9 +406,17 @@ are those of the UI routes of the same name.
 
 As `GET /matrix/api/v1/rooms`.
 
+### `GET /chat/v1/admin/rooms/{room_id}`
+
+As `GET /matrix/api/v1/rooms/{room_id}`.
+
 ### `PUT /chat/v1/admin/rooms/{room_id}/settings`
 
 As `PUT /matrix/api/v1/rooms/{room_id}/settings`.
+
+### `GET /chat/v1/admin/users`
+
+As `GET /matrix/api/v1/users`.
 
 ### `GET /chat/v1/admin/rules`
 
