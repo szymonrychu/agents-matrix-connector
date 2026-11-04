@@ -21,8 +21,15 @@ TABLES = {
     "sends",
     "room_bindings",
     "room_holds",
+    "room_requests",
 }
-MIGRATIONS = ["0001_init.sql", "0002_agent_sends.sql", "0003_preamble.sql", "0004_room_holds.sql"]
+MIGRATIONS = [
+    "0001_init.sql",
+    "0002_agent_sends.sql",
+    "0003_preamble.sql",
+    "0004_room_holds.sql",
+    "0005_room_requests.sql",
+]
 
 
 @pytest.fixture
@@ -66,6 +73,7 @@ def test_writer_comments(db):
         "sends": "queue: inserted by api, transitions by bot worker",
         "room_bindings": "writer: bot worker",
         "room_holds": "writer: bot worker",
+        "room_requests": "queue: inserted by api; api confirms or rejects",
     }
     with psycopg.connect(db) as conn:
         for table, comment in expected.items():
@@ -74,6 +82,7 @@ def test_writer_comments(db):
         assert _columns(conn, "sends") == SENDS_COLUMNS
         assert _columns(conn, "room_bindings") == ROOM_BINDINGS_COLUMNS
         assert _columns(conn, "room_holds") == ROOM_HOLDS_COLUMNS
+        assert _columns(conn, "room_requests") == ROOM_REQUESTS_COLUMNS
 
 
 SENDS_COLUMNS = {
@@ -110,6 +119,26 @@ ROOM_HOLDS_COLUMNS = {
     "until": ("timestamp with time zone", "NO"),
     "reason": ("text", "NO"),
     "updated_at": ("timestamp with time zone", "NO"),
+}
+
+ROOM_REQUESTS_COLUMNS = {
+    "id": ("bigint", "NO"),
+    "action": ("text", "NO"),
+    "target_kind": ("text", "YES"),
+    "target": ("text", "YES"),
+    "display_name": ("text", "YES"),
+    "room_id": ("text", "YES"),
+    "candidates": ("jsonb", "YES"),
+    "task_key": ("text", "YES"),
+    "decision_id": ("bigint", "YES"),
+    "requested_by": ("uuid", "YES"),
+    "requested_slug": ("text", "YES"),
+    "status": ("text", "NO"),
+    "reason": ("text", "YES"),
+    "created_at": ("timestamp with time zone", "NO"),
+    "updated_at": ("timestamp with time zone", "NO"),
+    "confirmed_at": ("timestamp with time zone", "YES"),
+    "done_at": ("timestamp with time zone", "YES"),
 }
 
 
@@ -381,3 +410,21 @@ def test_preamble_columns(db):
         assert _columns(conn, "settings")["preamble"] == ("text", "YES")
         assert _columns(conn, "access_rules")["preamble"] == ("text", "YES")
         assert _columns(conn, "inbound")["rule_id"] == ("bigint", "YES")
+
+
+def test_room_requests_indexes_and_checks(db):
+    with psycopg.connect(db) as conn:
+        indexes = _index_columns(conn, "room_requests")
+        assert (
+            ("id",),
+            "(status = ANY (ARRAY['resolving'::text, 'confirmed'::text]))",
+            False,
+        ) in indexes
+        assert (("room_id",), None, False) in indexes
+        assert (("created_at",), None, False) in indexes
+    _rejects(db, "INSERT INTO room_requests (action, status) VALUES ('close', 'resolving')")
+    _rejects(db, "INSERT INTO room_requests (action, status) VALUES ('open', 'weird')")
+    _rejects(
+        db,
+        "INSERT INTO room_requests (action, status, target_kind) VALUES ('open', 'resolving', 'x')",
+    )

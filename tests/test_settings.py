@@ -183,3 +183,28 @@ def test_agent_listener_settings(monkeypatch):
     monkeypatch.delenv("MATRIX_HTTP_PORT")
     monkeypatch.setenv("MATRIX_AGENT_PORT", "8000")
     assert "MATRIX_AGENT_PORT" in problems(ApiSettings)
+
+
+def test_room_requests_per_hour_default(monkeypatch):
+    assert load_settings(ApiSettings).room_requests_per_hour == 10
+    monkeypatch.setenv("MATRIX_ROOM_REQUESTS_PER_HOUR", "3")
+    assert load_settings(ApiSettings).room_requests_per_hour == 3
+    monkeypatch.setenv("MATRIX_ROOM_REQUESTS_PER_HOUR", "0")
+    assert "MATRIX_ROOM_REQUESTS_PER_HOUR" in problems(ApiSettings)
+
+
+def test_bridge_provisioning_url_strips_slash(monkeypatch):
+    assert load_settings(BotSettings).bridge_provisioning_url == ""
+    monkeypatch.setenv(
+        "MATRIX_BRIDGE_PROVISIONING_URL", "http://bridge.messaging:29328/_matrix/provision/"
+    )
+    assert (
+        load_settings(BotSettings).bridge_provisioning_url
+        == "http://bridge.messaging:29328/_matrix/provision"
+    )
+
+
+@pytest.mark.parametrize("value", ["ftp://bridge/x", "bridge:29328", "http://"])
+def test_bridge_provisioning_url_rejects_non_http(monkeypatch, value):
+    monkeypatch.setenv("MATRIX_BRIDGE_PROVISIONING_URL", value)
+    assert "MATRIX_BRIDGE_PROVISIONING_URL" in problems()

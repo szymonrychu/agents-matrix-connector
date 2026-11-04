@@ -45,6 +45,7 @@ class ConnectorSettings(BaseServiceSettings):
     agent_token_sha256: SecretStr = Field(SecretStr(""), repr=False)
     agent_rate_per_minute: int = Field(20, ge=1)
     agent_room_chunks_per_hour: int = Field(60, ge=1)
+    room_requests_per_hour: int = Field(10, ge=1)
 
     @field_validator("homeserver_url")
     @classmethod
@@ -120,6 +121,19 @@ class BotSettings(ConnectorSettings):
 
     access_token: SecretStr = Field(SecretStr(""), repr=False)
     access_token_file: str = ""
+    bridge_provisioning_url: str = ""
+    """mautrix-meta provisioning base (`.../_matrix/provision`); empty disables Facebook
+    targets (`bridge_unconfigured`)."""
+
+    @field_validator("bridge_provisioning_url")
+    @classmethod
+    def _bridge_provisioning_url(cls, value: str, info: ValidationInfo) -> str:
+        if not value:
+            return value
+        parsed = urlparse(value)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError(f"{_var(info)}::not an http or https URL")
+        return value.rstrip("/")
 
     @model_validator(mode="after")
     def _access_token_from_file(self):
