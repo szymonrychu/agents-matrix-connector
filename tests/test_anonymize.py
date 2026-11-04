@@ -48,6 +48,9 @@ def test_is_admin_by_mxid_or_facebook_id():
         "(user-abcdefabcdef)",
         "see user-0123456789ab\n",
         "User-0123456789Ab, ok",
+        "my_user-0123456789ab",
+        "user-0123456789abc",
+        "user-0123456789ab_x",
     ],
 )
 def test_pseudonym_tokens_found(text):
@@ -57,13 +60,11 @@ def test_pseudonym_tokens_found(text):
 @pytest.mark.parametrize(
     "text",
     [
-        "user-0123456789abc",
         "xuser-0123456789ab",
         "user-0123456789",
         "user-0123456789ag",
         "user 0123456789ab",
         "superuser-0123456789ab",
-        "user-0123456789ab_x",
         "the user said hi",
     ],
 )

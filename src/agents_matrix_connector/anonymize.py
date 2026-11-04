@@ -19,7 +19,7 @@ from typing import Protocol
 
 PSEUDONYM_DISCLOSED = "pseudonym_disclosed"
 DIGEST_CHARS = 12
-_PSEUDONYM_RE = re.compile(rf"\b(?:user|admin)-[0-9a-f]{{{DIGEST_CHARS}}}\b")
+_PSEUDONYM_RE = re.compile(rf"(?<![a-z0-9])(?:user|admin)-[0-9a-f]{{{DIGEST_CHARS}}}(?![g-z])")
 """A pseudonym token in folded (lowercase) text."""
 
 _IGNORABLE_RANGES = (
