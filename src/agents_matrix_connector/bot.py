@@ -1,5 +1,5 @@
-"""The bot process: Matrix sync, dispatch worker, agent sender and reply tracker under one
-singleton lock."""
+"""The bot process: Matrix sync, dispatch worker, agent sender, reply tracker and room
+requests under one singleton lock."""
 
 import asyncio
 import contextlib
@@ -14,7 +14,9 @@ from agents_common.runtime import LostLock, advisory_singleton, run_service
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
 
+from agents_matrix_connector.bridge import ProvisioningClient
 from agents_matrix_connector.matrix import MatrixAuthError, MatrixClient
+from agents_matrix_connector.room_requests import RoomRequests
 from agents_matrix_connector.sender import Sender
 from agents_matrix_connector.settings import BotSettings
 from agents_matrix_connector.sync import SyncLoop, utcnow
@@ -77,12 +79,17 @@ def build_health_app(sync: SyncLoop, settings: BotSettings) -> FastAPI:
 
 
 async def _work_loop(
-    worker: Worker, sender: Sender, tracker: Tracker, settings: BotSettings, stop
+    worker: Worker,
+    sender: Sender,
+    tracker: Tracker,
+    room_requests: RoomRequests,
+    settings: BotSettings,
+    stop,
 ) -> None:
-    """Worker.tick, Sender.tick then Tracker.tick every poll interval; only a Matrix auth
+    """Worker, Sender, Tracker then RoomRequests tick every poll interval; only a Matrix auth
     failure escapes."""
     while not stop.is_set():
-        for tick in (worker.tick, sender.tick, tracker.tick):
+        for tick in (worker.tick, sender.tick, tracker.tick, room_requests.tick):
             try:
                 await tick()
             except MatrixAuthError:
@@ -96,9 +103,7 @@ async def _work_loop(
 async def _locked(
     pool,
     sync: SyncLoop,
-    worker: Worker,
-    sender: Sender,
-    tracker: Tracker,
+    steps: tuple[Worker, Sender, Tracker, RoomRequests],
     settings: BotSettings,
     stop: asyncio.Event,
     held: asyncio.Event,
@@ -115,15 +120,15 @@ async def _locked(
     try:
         async with advisory_singleton(pool, LOCK_NAME):
             held.set()
-            return await _run_loops(sync, worker, sender, tracker, settings, stop, health)
+            return await _run_loops(sync, steps, settings, stop, health)
     finally:
         stop.set()
         await asyncio.gather(health, return_exceptions=True)
 
 
-async def _run_loops(sync, worker, sender, tracker, settings, stop, health) -> int:
+async def _run_loops(sync, steps, settings, stop, health) -> int:
     syncing = asyncio.create_task(sync.run(stop), name="sync")
-    working = asyncio.create_task(_work_loop(worker, sender, tracker, settings, stop), name="work")
+    working = asyncio.create_task(_work_loop(*steps, settings, stop), name="work")
     stopper = asyncio.create_task(stop.wait())
     tasks = {syncing, working}
     try:
@@ -149,6 +154,7 @@ async def run_bot(
     *,
     matrix_transport: httpx.AsyncBaseTransport | None = None,
     orchestrator_transport: httpx.AsyncBaseTransport | None = None,
+    bridge_transport: httpx.AsyncBaseTransport | None = None,
 ) -> int:
     """Run the bot until SIGTERM. Returns 0 on a clean stop, 78 on a wrong Matrix identity,
     1 when the token is rejected, the singleton lock is lost or the process fails."""
@@ -167,9 +173,21 @@ async def run_bot(
             settings.access_token.get_secret_value(),
             transport=matrix_transport,
         )
+        bridge = (
+            ProvisioningClient(
+                settings.bridge_provisioning_url,
+                settings.access_token.get_secret_value(),
+                settings.user_id,
+                transport=bridge_transport,
+            )
+            if settings.bridge_provisioning_url
+            else None
+        )
         try:
-            code = await _main(settings, pool, orchestrator, matrix, stop)
+            code = await _main(settings, pool, orchestrator, matrix, stop, bridge)
         finally:
+            if bridge is not None:
+                await bridge.aclose()
             await matrix.aclose()
             await orchestrator.aclose()
             await pool.close()
@@ -178,7 +196,7 @@ async def run_bot(
     return exit_code if exit_code else code
 
 
-async def _main(settings, pool, orchestrator, matrix, stop) -> int:
+async def _main(settings, pool, orchestrator, matrix, stop, bridge=None) -> int:
     try:
         who = await matrix.whoami()
     except MatrixAuthError as exc:
@@ -195,9 +213,11 @@ async def _main(settings, pool, orchestrator, matrix, stop) -> int:
     worker = Worker(orchestrator, matrix, pool, settings)
     sender = Sender(pool, settings)
     tracker = Tracker(orchestrator, matrix, pool, settings)
+    room_requests = RoomRequests(pool, matrix, bridge, settings)
     held = asyncio.Event()
     body = asyncio.create_task(
-        _locked(pool, sync, worker, sender, tracker, settings, stop, held), name="bot"
+        _locked(pool, sync, (worker, sender, tracker, room_requests), settings, stop, held),
+        name="bot",
     )
     stopper = asyncio.create_task(stop.wait())
     try:

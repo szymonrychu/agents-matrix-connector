@@ -132,3 +132,28 @@ async def test_sigterm_while_waiting_for_the_lock(pool, port, start):
         await wait_status(port, "/healthz", 200)
         os.kill(os.getpid(), signal.SIGTERM)
         assert await asyncio.wait_for(task, 5) == 0
+
+
+async def test_work_loop_runs_room_requests():
+    from agents_matrix_connector.bot import _work_loop
+
+    order: list[str] = []
+    stop = asyncio.Event()
+
+    class Step:
+        def __init__(self, name, last=False):
+            self.name, self.last = name, last
+
+        async def tick(self):
+            order.append(self.name)
+            if self.last:
+                stop.set()
+
+    settings = type("S", (), {"poll_seconds": 0.01})()
+    await asyncio.wait_for(
+        _work_loop(
+            Step("worker"), Step("sender"), Step("tracker"), Step("rooms", True), settings, stop
+        ),
+        5,
+    )
+    assert order == ["worker", "sender", "tracker", "rooms"]
