@@ -32,6 +32,10 @@ def _esc(value: str) -> str:
     return escape(value, _QUOTES)
 
 
+def sender_name(row: InboundRow) -> str:
+    return row.sender_name or row.sender
+
+
 def preamble_context(
     room_name: str | None, room_id: str, sender: str, rule_name: str, now: datetime
 ) -> dict[str, Any]:
@@ -57,8 +61,11 @@ def render(
     first: bool,
     facebook_id: Callable[[str], str | None],
     preamble: str = DEFAULT_PREAMBLE,
+    sender: Callable[[InboundRow], str] | None = None,
 ) -> str:
-    """`preamble` is the already rendered first-prompt preamble, used when `first`."""
+    """`preamble` is the already rendered first-prompt preamble, used when `first`; `sender`
+    names a message's sender (default its display name, else its user id)."""
+    name = sender or sender_name
     lines = [preamble + "\n" if first else "New messages in the chat:"]
     room_id = rows[0].room_id if rows else ""
     lines.append(
@@ -67,7 +74,7 @@ def render(
     for row in sorted(rows, key=lambda r: r.id):
         at = row.origin_ts.isoformat() if row.origin_ts else ""
         lines.append(
-            f'<message id="m{row.id}" from="{_esc(row.sender_name or row.sender)}" '
+            f'<message id="m{row.id}" from="{_esc(name(row))}" '
             f'facebook_id="{_esc(facebook_id(row.sender) or "")}" '
             f'at="{_esc(at)}">{_esc(row.body or "")}</message>'
         )

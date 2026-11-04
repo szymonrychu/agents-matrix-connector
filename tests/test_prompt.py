@@ -111,3 +111,21 @@ def test_bad_template_raises_template_error():
     context = preamble_context("Ann", "!r:x", "Ann A", "", datetime(2026, 10, 25, tzinfo=UTC))
     with pytest.raises(TemplateError):
         render_preamble("{{ nope }}", context)
+
+
+def test_sender_label_replaces_name_and_body_is_kept():
+    rows = [_row(1, body="I am Ann, ask Bob")]
+    out = render(
+        "user-0123456789ab",
+        "dm",
+        rows,
+        first=False,
+        facebook_id=lambda _s: None,
+        sender=lambda row: "user-0123456789ab" if row.sender == "@a:x" else row.sender,
+    )
+    assert '<chat room="user-0123456789ab" kind="dm"' in out
+    assert (
+        '<message id="m1" from="user-0123456789ab" facebook_id="" '
+        'at="2026-10-25T12:00:00+00:00">I am Ann, ask Bob</message>'
+    ) in out
+    assert 'from="Ann"' not in out

@@ -110,3 +110,28 @@ async def test_allow_room_rule_and_settings_idempotent(pool):
     assert first == second
     assert await rules.list_rules(pool) == [Rule(first, "allow", "room", "!r:x")]
     assert await rules.get_room_settings(pool, "!r:x") == rules.RoomSettings(preset, None, True)
+
+
+async def test_anonymize_names_flag_kept_unless_named(pool):
+    fresh = await rules.set_room_settings(pool, "!r:x", preset_id=None, trigger=None)
+    assert fresh.anonymize_names is False
+    on = await rules.set_room_settings(
+        pool, "!r:x", preset_id=None, trigger="all", anonymize_names=True
+    )
+    assert on == rules.RoomSettings(None, "all", False, True)
+    assert await rules.get_room_settings(pool, "!r:x") == on
+    kept = await rules.set_room_settings(pool, "!r:x", preset_id=None, trigger=None)
+    assert kept.anonymize_names is True
+    async with pool.connection() as conn, conn.transaction():
+        await rules.allow_room(
+            conn, "!r:x", preset_id=None, trigger=None, agents_may_initiate=None, note="n"
+        )
+    assert (await rules.get_room_settings(pool, "!r:x")).anonymize_names is True
+    off = await rules.set_room_settings(
+        pool, "!r:x", preset_id=None, trigger=None, anonymize_names=False
+    )
+    assert off.anonymize_names is False
+    new = await rules.set_room_settings(
+        pool, "!new:x", preset_id=None, trigger=None, anonymize_names=True
+    )
+    assert new.anonymize_names is True and new.agents_may_initiate is False

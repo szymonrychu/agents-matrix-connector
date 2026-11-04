@@ -12,6 +12,7 @@ from agents_common.orchestrator import (
     Session,
 )
 
+from agents_matrix_connector.anonymize import pseudonym
 from agents_matrix_connector.db import bindings, holds, inbound, runs
 from agents_matrix_connector.db.bindings import BindingRow
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
@@ -1246,3 +1247,59 @@ async def test_broken_stored_preamble_falls_back_to_default(conn, fake, make_wor
     await conn.execute("UPDATE settings SET preamble = '{{ nope }}' WHERE id = 1")
     text = await _first_text(conn, fake, make_worker)
     assert text.startswith(DEFAULT_PREAMBLE + "\n\n<chat")
+
+
+async def add_member(conn, room_id: str, user_id: str, name: str, facebook_id=None) -> None:
+    await conn.execute(
+        "INSERT INTO users (user_id, display_name, facebook_id) VALUES (%s, %s, %s)"
+        " ON CONFLICT DO NOTHING",
+        (user_id, name, facebook_id),
+    )
+    await conn.execute(
+        "INSERT INTO room_members (room_id, user_id, membership, display_name)"
+        " VALUES (%s, %s, 'join', %s)",
+        (room_id, user_id, name),
+    )
+
+
+async def anonymized_first_text(conn, fake, make_worker, flag: bool, **overrides) -> str:
+    await conn.execute(
+        "UPDATE settings SET preamble = %s WHERE id = 1",
+        ("{{ room_name }} / {{ sender }}",),
+    )
+    await add_room(conn, DM, name="Alice A")
+    await add_member(conn, DM, ALICE, "Alice A", "111")
+    await add_member(conn, DM, BOT, "Agents")
+    await conn.execute(
+        "INSERT INTO room_settings (room_id, anonymize_names) VALUES (%s, %s)", (DM, flag)
+    )
+    await queue(conn, DM, "I am Alice A")
+    await make_worker(**overrides).tick()
+    [(_, _, _, session_id, *_)] = await room_runs(conn, DM)
+    [message] = session_messages(fake, session_id)
+    return message["text"]
+
+
+async def test_anonymized_room_shows_pseudonyms_not_names(conn, fake, make_worker, preset):
+    await preset()
+    label = pseudonym(ALICE)
+    text = await anonymized_first_text(conn, fake, make_worker, True)
+    assert text.startswith(f'{label} / {label}\n\n<chat room="{label}" kind="dm"')
+    assert f'from="{label}" facebook_id=""' in text
+    assert ">I am Alice A</message>" in text
+    assert 'from="Alice A"' not in text and "111" not in text
+
+
+async def test_anonymized_admin_by_facebook_id(conn, fake, make_worker, preset):
+    await preset()
+    text = await anonymized_first_text(conn, fake, make_worker, True, anonymize_admins=["111"])
+    label = pseudonym(ALICE, admin=True)
+    assert text.startswith(f"{label} / {label}\n\n")
+    assert f'from="{label}"' in text
+
+
+async def test_room_without_flag_keeps_names(conn, fake, make_worker, preset):
+    await preset()
+    text = await anonymized_first_text(conn, fake, make_worker, False)
+    assert text.startswith('Alice A / Alice A\n\n<chat room="Alice A"')
+    assert 'from="Alice A" facebook_id="111"' in text

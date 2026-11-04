@@ -350,3 +350,9 @@ def test_config_bridge_provisioning_url():
 def test_config_room_requests_per_hour():
     assert _config()["MATRIX_ROOM_REQUESTS_PER_HOUR"] == "10"
     assert _config({"limits": {"roomRequestsPerHour": 4}})["MATRIX_ROOM_REQUESTS_PER_HOUR"] == "4"
+
+
+def test_config_anonymize_admins():
+    assert _config()["MATRIX_ANONYMIZE_ADMINS"] == ""
+    admins = {"anonymize": {"admins": ["@facebook_1:x", "2"]}}
+    assert _config(admins)["MATRIX_ANONYMIZE_ADMINS"] == "@facebook_1:x,2"

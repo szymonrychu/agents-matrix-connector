@@ -75,6 +75,9 @@ class RoomView(BaseModel):
     trigger: Literal["all", "mention"] | None
     effective_trigger: Literal["all", "mention"]
     agents_may_initiate: bool
+    anonymize_names: bool
+    """The chat agent sees pseudonyms (`user-<sha>`, `admin-<sha>`) instead of the people's
+    names and ids, and may not send a pseudonym to the room."""
     session: SessionView | None
     binding: BindingView | None
     last_event_at: datetime | None
@@ -99,6 +102,8 @@ class RoomSettingsIn(BaseModel):
     trigger: Literal["all", "mention"] | None = None
     agents_may_initiate: bool | None = None
     """None (or omitted) keeps the stored value: the flag is an authorisation grant."""
+    anonymize_names: bool | None = None
+    """None (or omitted) keeps the stored value."""
 
 
 class RoomAllowIn(BaseModel):

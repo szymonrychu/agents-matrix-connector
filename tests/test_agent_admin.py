@@ -69,6 +69,12 @@ async def test_rules_and_rooms_with_the_bearer(admin, conn):
     )
     assert put.status_code == 200
     assert put.json()["trigger"] == "all" and put.json()["agents_may_initiate"] is True
+    anonymized = await client.put(
+        f"/rooms/{DM}/settings", json={"anonymize_names": True}, headers=headers
+    )
+    assert anonymized.status_code == 200 and anonymized.json()["anonymize_names"] is True
+    rooms = await client.get("/rooms", headers=headers)
+    assert {r["room_id"]: r["name"] for r in rooms.json()}[DM] == "Alice"
     missing = await client.put("/rooms/!nope:x/settings", json={}, headers=headers)
     assert missing.status_code == 404
 

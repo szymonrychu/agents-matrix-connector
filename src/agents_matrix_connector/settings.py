@@ -46,6 +46,8 @@ class ConnectorSettings(BaseServiceSettings):
     agent_rate_per_minute: int = Field(20, ge=1)
     agent_room_chunks_per_hour: int = Field(60, ge=1)
     room_requests_per_hour: int = Field(10, ge=1)
+    anonymize_admins: CsvList = []
+    """Matrix user ids or numeric Facebook ids shown as `admin-<sha>` in anonymized rooms."""
 
     @field_validator("homeserver_url")
     @classmethod
@@ -68,6 +70,16 @@ class ConnectorSettings(BaseServiceSettings):
         for item in value:
             if not USER_ID_RE.match(item):
                 raise ValueError(f"{_var(info)}::not a Matrix user id (@name:server)")
+        return value
+
+    @field_validator("anonymize_admins")
+    @classmethod
+    def _anonymize_admins(cls, value: list[str], info: ValidationInfo) -> list[str]:
+        for item in value:
+            if not (USER_ID_RE.match(item) or (item.isascii() and item.isdigit())):
+                raise ValueError(
+                    f"{_var(info)}::not a Matrix user id (@name:server) or a numeric Facebook id"
+                )
         return value
 
     @field_validator("puppet_pattern")

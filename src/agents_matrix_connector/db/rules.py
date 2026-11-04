@@ -42,6 +42,7 @@ class RoomSettings:
     preset_id: uuid.UUID | None
     trigger: str | None
     agents_may_initiate: bool = False
+    anonymize_names: bool = False
 
 
 @asynccontextmanager
@@ -98,7 +99,8 @@ async def list_rule_rows(pool: AsyncConnectionPool) -> list[RuleRow]:
 async def get_room_settings(source: Source, room_id: str) -> RoomSettings | None:
     async with _conn(source) as conn:
         cur = await conn.execute(
-            "SELECT preset_id, trigger, agents_may_initiate FROM room_settings WHERE room_id = %s",
+            "SELECT preset_id, trigger, agents_may_initiate, anonymize_names"
+            " FROM room_settings WHERE room_id = %s",
             (room_id,),
         )
         row = await cur.fetchone()
@@ -112,28 +114,38 @@ async def set_room_settings(
     preset_id: uuid.UUID | None,
     trigger: str | None,
     agents_may_initiate: bool | None = None,
+    anonymize_names: bool | None = None,
 ) -> RoomSettings:
-    """Store the room's preset and trigger; `agents_may_initiate` None keeps the stored flag.
+    """Store the room's preset and trigger; a flag given as None keeps its stored value.
 
-    A new row without the flag gets false. The flag is an authorisation grant, so a save that
-    does not name it never grants or revokes it.
+    A new row without a flag gets false. `agents_may_initiate` is an authorisation grant and
+    `anonymize_names` a privacy switch, so a save that does not name one never changes it.
     """
     async with pool.connection() as conn:
         cur = await conn.execute(
             """
-            INSERT INTO room_settings (room_id, preset_id, trigger, agents_may_initiate)
-            VALUES (%(room)s, %(preset)s, %(trigger)s, COALESCE(%(flag)s::boolean, false))
+            INSERT INTO room_settings (room_id, preset_id, trigger, agents_may_initiate,
+                                       anonymize_names)
+            VALUES (%(room)s, %(preset)s, %(trigger)s, COALESCE(%(flag)s::boolean, false),
+                    COALESCE(%(anon)s::boolean, false))
             ON CONFLICT (room_id) DO UPDATE
             SET preset_id = EXCLUDED.preset_id, trigger = EXCLUDED.trigger,
                 agents_may_initiate = COALESCE(%(flag)s::boolean,
                                                room_settings.agents_may_initiate),
+                anonymize_names = COALESCE(%(anon)s::boolean, room_settings.anonymize_names),
                 updated_at = now()
-            RETURNING agents_may_initiate
+            RETURNING agents_may_initiate, anonymize_names
             """,
-            {"room": room_id, "preset": preset_id, "trigger": trigger, "flag": agents_may_initiate},
+            {
+                "room": room_id,
+                "preset": preset_id,
+                "trigger": trigger,
+                "flag": agents_may_initiate,
+                "anon": anonymize_names,
+            },
         )
-        stored = (await cur.fetchone())[0]
-    return RoomSettings(preset_id, trigger, stored)
+        flag, anon = await cur.fetchone()
+    return RoomSettings(preset_id, trigger, flag, anon)
 
 
 async def allow_room(

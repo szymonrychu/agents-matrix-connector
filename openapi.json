@@ -463,6 +463,10 @@
             ],
             "title": "Alias"
           },
+          "anonymize_names": {
+            "title": "Anonymize Names",
+            "type": "boolean"
+          },
           "binding": {
             "anyOf": [
               {
@@ -618,6 +622,7 @@
           "trigger",
           "effective_trigger",
           "agents_may_initiate",
+          "anonymize_names",
           "session",
           "binding",
           "last_event_at",
@@ -649,6 +654,10 @@
               }
             ],
             "title": "Alias"
+          },
+          "anonymize_names": {
+            "title": "Anonymize Names",
+            "type": "boolean"
           },
           "binding": {
             "anyOf": [
@@ -801,6 +810,7 @@
           "trigger",
           "effective_trigger",
           "agents_may_initiate",
+          "anonymize_names",
           "session",
           "binding",
           "last_event_at",
@@ -823,6 +833,17 @@
               }
             ],
             "title": "Agents May Initiate"
+          },
+          "anonymize_names": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anonymize Names"
           },
           "preset_id": {
             "anyOf": [
@@ -874,6 +895,10 @@
               }
             ],
             "title": "Alias"
+          },
+          "anonymize_names": {
+            "title": "Anonymize Names",
+            "type": "boolean"
           },
           "binding": {
             "anyOf": [
@@ -1019,6 +1044,7 @@
           "trigger",
           "effective_trigger",
           "agents_may_initiate",
+          "anonymize_names",
           "session",
           "binding",
           "last_event_at",

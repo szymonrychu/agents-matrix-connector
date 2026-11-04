@@ -8,6 +8,11 @@ and the homeserver deduplicates it, so the room gets the message once. Pending o
 the runs' and the agent sends' (`mxa-` ids, stored by the sender), are then sent oldest first,
 each with its own event type and content; a send's row is sent only while its room still
 passes the agent room policy. Once a day old rows are pruned.
+
+In a room flagged `anonymize_names` a final answer containing a pseudonym (`user-<sha>`,
+`admin-<sha>`) is never sent nor matched against earlier sends: the run and its rows fail
+`pseudonym_disclosed` with no notice in the room, and the run's session gets a message saying
+why, so the agent can rephrase and send the answer itself with `orchestrator_chat_send`.
 """
 
 from __future__ import annotations
@@ -26,9 +31,10 @@ from agents_common.orchestrator import (
 )
 from psycopg_pool import AsyncConnectionPool
 
+from agents_matrix_connector import anonymize
 from agents_matrix_connector.chunks import split
 from agents_matrix_connector.clock import utcnow
-from agents_matrix_connector.db import bindings, inbound, runs, sends
+from agents_matrix_connector.db import bindings, inbound, rules, runs, sends
 from agents_matrix_connector.matrix import (
     MatrixAuthError,
     MatrixClient,
@@ -58,13 +64,15 @@ PRUNE_INTERVAL = timedelta(days=1)
 @dataclass(frozen=True)
 class _Outcome:
     """How a finished run closes: its status and reason (shared by its inbound rows), the
-    outbound rows it leaves, and whether its rows go back to `new` instead."""
+    outbound rows it leaves, whether its rows go back to `new` instead, and what its session
+    is told once the run is closed."""
 
     status: str
     reason: str | None
     kind: str = "reply"
     chunks: list[str] = field(default_factory=list)
     requeue: bool = False
+    tell_session: str | None = None
 
 
 _SESSION_GONE = _Outcome("failed", SESSION_GONE, requeue=True)
@@ -105,8 +113,12 @@ class Tracker:
         if outcome is None:
             await self._typing(run.room_id, True)
             return
-        if await self._finish(run, outcome) and not outcome.chunks:
+        if not await self._finish(run, outcome):
+            return
+        if not outcome.chunks:
             await self._typing(run.room_id, False)
+        if outcome.tell_session is not None:
+            await self._tell(run, outcome.tell_session)
 
     async def _outcome(self, run: runs.RunRow) -> _Outcome | None:
         """The run's outcome from its message, or None while it is still running."""
@@ -127,6 +139,9 @@ class Tracker:
             chunks = split(turn.final_text or "", self._settings.reply_chunk_chars)
             if not chunks:
                 return _Outcome("handled", EMPTY_REPLY)
+            rejected = await self._disclosure(run, turn.final_text or "")
+            if rejected is not None:
+                return rejected
             match = await self._send_match(run, (turn.final_text or "").strip())
             if match == "sent":
                 return _Outcome("handled", ALREADY_SENT)
@@ -140,6 +155,51 @@ class Tracker:
                 return _SESSION_GONE
             return _failed(_MESSAGE_REASONS[message.status])
         return self._timed_out(run)
+
+    async def _disclosure(self, run: runs.RunRow, final_text: str) -> _Outcome | None:
+        """The rejection of a final answer that would disclose a pseudonym in a room flagged
+        `anonymize_names`, else None. Checked before `_send_match`: a rejected answer is never
+        matched as already sent."""
+        setting = await rules.get_room_settings(self._pool, run.room_id)
+        if setting is None or not setting.anonymize_names:
+            return None
+        found = anonymize.pseudonyms_in(final_text)
+        if not found:
+            return None
+        log.warning(
+            "run %s: final answer refused (%s), %s pseudonym(s) in it",
+            run.id,
+            anonymize.PSEUDONYM_DISCLOSED,
+            len(found),
+        )
+        return _Outcome(
+            "failed",
+            anonymize.PSEUDONYM_DISCLOSED,
+            tell_session=(
+                f"Your final answer for the chat room {run.room_id} was not sent: it "
+                f"{anonymize.disclosure_message(found)}. Send the rephrased answer with "
+                "orchestrator_chat_send."
+            ),
+        )
+
+    async def _tell(self, run: runs.RunRow, text: str) -> None:
+        """Best effort: post `text` into the run's session; a failure is logged."""
+        if run.session_id is None:
+            log.warning("run %s: no session to tell why it failed", run.id)
+            return
+        try:
+            await self._orchestrator.post_message(run.session_id, text)
+        except OrchestratorUnavailable as exc:
+            log.warning("run %s: could not tell session %s why: %s", run.id, run.session_id, exc)
+        except OrchestratorError as exc:
+            # Status and code only: the message text may echo request content.
+            log.warning(
+                "run %s: could not tell session %s why: %s %s",
+                run.id,
+                run.session_id,
+                exc.status,
+                exc.code,
+            )
 
     async def _send_match(self, run: runs.RunRow, final_text: str) -> str | None:
         """How the final answer was already said (design D10): "sent" when a message send of

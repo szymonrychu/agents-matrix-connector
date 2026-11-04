@@ -52,6 +52,7 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_AGENT_TOKEN_SHA256` | empty | api | sha256 hex (64 lowercase characters) of the orchestrator's agent bearer token; empty leaves the agent listener unbound |
 | `MATRIX_AGENT_RATE_PER_MINUTE` | 20 | api | max agent sends (messages and reactions together) per session in the last 60 s (>= 1) |
 | `MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR` | 60 | api | max Matrix events (message chunks of `MATRIX_REPLY_CHUNK_CHARS`, one per reaction) that agent sends may put into one room in the last hour, all sessions together (>= 1) |
+| `MATRIX_ANONYMIZE_ADMINS` | empty | api, bot | Matrix user ids or numeric Facebook ids, comma separated, shown as `admin-<sha>` instead of `user-<sha>` in rooms with `anonymize_names` |
 | `MATRIX_ROOM_REQUESTS_PER_HOUR` | 10 | api | max open and invite room requests created in the last hour, all sessions together (>= 1); more answer 429 `rate_limited` |
 | `MATRIX_ACCESS_TOKEN` | none | bot | Matrix access token (required unless the file is set) |
 | `MATRIX_ACCESS_TOKEN_FILE` | empty | bot | file holding the Matrix access token; wins over the variable, stripped |
@@ -110,6 +111,9 @@ when not plain handled:
 - `empty_reply`: handled, the agent answered with no text
 - `already_sent`: handled, the turn's final answer equals (stripped) a message the agent sent
   with the send tool during the run, so it is not posted a second time
+- `pseudonym_disclosed`: failed, in a room with `anonymize_names` the turn's final answer
+  contained a pseudonym (`user-<sha>`, `admin-<sha>`): nothing is posted to the room and the
+  run's session is told why, so the agent can rephrase and send with `orchestrator_chat_send`
 - `forbidden`: an outbound reply the homeserver refused (a failed outbound row)
 - `denied: <kind>` and `not_allowed` also appear on ignored messages
 
@@ -132,7 +136,8 @@ Bot user, homeserver, default policy, group trigger, rule kinds per list and syn
 
 Discovered rooms. Query: `kind` (`dm`, `group`, `matrix`, `infrastructure`), `access`
 (`allowed`, `denied`, `default`). 200 list of rooms with `access`, `preset_id`, `trigger`,
-`effective_trigger`, `agents_may_initiate` (false when the room has no settings), `session`
+`effective_trigger`, `agents_may_initiate` and `anonymize_names` (false when the room has no
+settings), `session`
 (the latest run: `id`, `slug`, `status`, or null), `binding` (the room's active session binding:
 `session_id`, `slug`, `origin` `inbound` or `agent`, `since`; `session_id` null while a first run
 reserves the room; null when the room is unbound), `queued` (messages waiting),
@@ -155,10 +160,12 @@ One room (the fields of the list, `pending` included) with its `members` (`user_
 ### `PUT /matrix/api/v1/rooms/{room_id}/settings`
 
 Body `{"preset_id": uuid|null, "trigger": "all"|"mention"|null, "agents_may_initiate":
-true|false|null}`: the room's preset and trigger override (null or omitted clears) and whether
-agents may start a chat in the room while it is unbound (`agents_may_initiate`, off by default).
-An omitted or null `agents_may_initiate` keeps the stored value (false for a room without
-settings), so a save of the preset or trigger never grants or revokes it. 200 room; 404
+true|false|null, "anonymize_names": true|false|null}`: the room's preset and trigger override
+(null or omitted clears), whether agents may start a chat in the room while it is unbound
+(`agents_may_initiate`, off by default) and whether the chat agent sees pseudonyms instead of
+the people's names (`anonymize_names`, off by default, see "Name anonymization"). An omitted or
+null flag keeps its stored value (false for a room without settings), so a save of the preset or
+trigger never changes either. 200 room; 404
 `not_found`; 422 `unknown_preset` or `invalid_request`; 503 `unavailable`; 502
 `orchestrator_error`.
 
@@ -352,6 +359,7 @@ Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
 | `session_bound` | 409 | the room is unbound and flagged, but the session is already bound to another room |
 | `rate_limited` | 429 | the session reached `MATRIX_AGENT_RATE_PER_MINUTE` sends in the last 60 s |
 | `room_chunk_limit` | 429 | the send would take the room past `MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR` chunks in the last hour |
+| `pseudonym_disclosed` | 422 | the room has `anonymize_names` and the message `text` contains a pseudonym (`user-<sha>`, `admin-<sha>`); the message names the tokens found, refer to the person differently |
 | `unavailable` | 503 | the database is unavailable |
 
 Send statuses: `queued` (accepted, waiting for the bot), `sending` (claimed by the bot, being
@@ -369,8 +377,9 @@ claim or send-time check refused it). Reasons:
 The rooms this session may post to, exactly those passing (a) and (b): its bound room (`bound`
 true) when it passes (a), else, while the session is bound to no room, every unbound flagged
 room passing (a). The bound room comes first, then by `name` (code point order, rooms without a
-name last), then `room_id`. 200 `{"rooms": [{"room_id", "name", "kind", "bound",
-"agents_may_initiate"}]}`; 401 `unauthorized`.
+name last), then `room_id`. A room with `anonymize_names` is named with its people's
+pseudonyms (a DM after the other person, a group with member names replaced). 200
+`{"rooms": [{"room_id", "name", "kind", "bound", "agents_may_initiate"}]}`; 401 `unauthorized`.
 
     curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
       http://localhost:8001/chat/v1/rooms
@@ -382,7 +391,8 @@ characters, stored unchanged and split into `MATRIX_REPLY_CHUNK_CHARS` chunks by
 `room` is a Matrix room id; omitted, the room of `reply_to`, else the session's bound room. A
 `reply_to` sends a quoted reply to that message. 202 `{"id": "s<n>", "status": "queued"}` (a
 duplicate: the existing id and its status `queued`, `sending` or `sent`); 401 `unauthorized`;
-422 `invalid_request`, `invalid_text`, `bad_reference` or `room_required`; 403 `room_not_allowed` or
+422 `invalid_request`, `invalid_text`, `bad_reference`, `room_required` or `pseudonym_disclosed`
+(checked after the room); 403 `room_not_allowed` or
 `room_not_authorised`; 409 `room_bound` or `session_bound`; 429 `rate_limited`; 503
 `unavailable`.
 
@@ -625,6 +635,27 @@ current member denies the room, as does a room or alias deny rule; an infrastruc
 encrypted room is never allowed. Current members are those who have joined, leaving out the bot
 user, its self identities and the bridge bots. A room with no such member and no room or alias
 allow rule is `not_allowed`.
+
+### Name anonymization
+
+A room flagged `anonymize_names` (off by default; set it with `PUT .../settings`, from the UI or
+by a superleader through `PUT /chat/v1/admin/rooms/{room_id}/settings`) hides who the people
+are from the chat agent. Each person is `user-<sha>`, `<sha>` being the first 12 hex characters
+of the sha256 of their Matrix user id, or `admin-<sha>` when their Matrix user id or numeric
+Facebook id is listed in `MATRIX_ANONYMIZE_ADMINS`. The prompt's `from`, the room name (a DM is
+named after the other person), the preamble variables `sender` and `room_name` and the room
+names of `GET /chat/v1/rooms` carry pseudonyms, and `facebook_id` is empty. Message bodies are
+never rewritten, and real names may be sent.
+
+A pseudonym must never reach the chat. In such a room `POST /chat/v1/messages` answers 422
+`pseudonym_disclosed` for a text containing `user-<12 hex>` or `admin-<12 hex>` as a whole word
+(any case), and a turn's final answer containing one is not posted: the run fails
+`pseudonym_disclosed` and its session gets a message naming the tokens, so the agent can
+rephrase and send the answer itself. The superleader admin routes (`/chat/v1/admin/rooms`,
+`/users`, room requests) and the UI keep real names.
+
+    curl -s -X PUT -H 'content-type: application/json' -d '{"anonymize_names": true}' \
+      'http://localhost:8000/matrix/api/v1/rooms/!abc:server/settings'
 
 ### Read receipts
 
