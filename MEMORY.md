@@ -4,6 +4,9 @@ Lessons that outlive a session. Newest first.
 
 ## 2026-11-04 decisions
 
+- Room ids: the `room` rule format accepts `!opaque:server` and the server-less `!opaque` of
+  Matrix room version 12 (`!` + 43-char url-safe base64 of the create event hash). Why: the
+  allow route returned 500 for a v12 room because validation required `:server`.
 - matrix-integration (T-25): superleader agents allow rooms and open chats. Decisions are the
   user's answers in the workbench `docs/plans/matrix-integration/plan.md` (Q1-Q6).
 - Invites are approved, not auto-joined (Q3). `SyncLoop._join_invites` joins an invite only when

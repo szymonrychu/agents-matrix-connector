@@ -28,7 +28,10 @@ MAX_DISPLAY_NAME_CHARS = 128
 _FORMATS: dict[str, tuple[re.Pattern[str], str]] = {
     "user": (re.compile(r"@[^:\s]+:\S+"), "a Matrix user id like @local:server"),
     "facebook": (re.compile(r"[0-9]{1,32}"), "1 to 32 digits"),
-    "room": (re.compile(r"![^:\s]+:\S+"), "a Matrix room id like !id:server"),
+    "room": (
+        re.compile(r"![^:\s]+(:\S+)?"),
+        "a Matrix room id like !id:server or, for room version 12, !id",
+    ),
     "alias": (re.compile(r"#[^:\s]+:\S+"), "a Matrix room alias like #alias:server"),
 }
 
