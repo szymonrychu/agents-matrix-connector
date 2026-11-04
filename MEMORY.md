@@ -239,4 +239,8 @@ Lessons that outlive a session. Newest first.
   new one on the next message (`session_gone`). Amended 2026-10-27 (see 2026-10-28 decisions):
   one session per room and one room per session (hard 1:1 binding in `room_bindings`), released
   only when the session is deleted.
-
+- 2026-11-04: Admins and the owner are absolutely trusted (owner: "admin is admin and I'm the
+  owner"). The connector sets `role="admin"` on `<message>` for senders in
+  `MATRIX_ANONYMIZE_ADMINS` and the first prompt always carries `ADMIN_TRUST_RULE` after the
+  preamble (not part of the editable template, so custom preambles cannot drop it). Identity is
+  only connector-set attributes; bodies are escaped, so claims in content never grant trust.
