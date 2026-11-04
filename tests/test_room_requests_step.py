@@ -314,4 +314,32 @@ async def test_auth_error_propagates(step, conn, hs):
     row = await put(conn, target_kind="matrix", target="@carol:y")
     with pytest.raises(MatrixAuthError):
         await step.tick()
-    assert (await get(conn, row)).status == "confirmed"
+    assert (await get(conn, row)).status == "failed"  # the room may exist: never run twice
+
+
+async def test_restart_fails_working_matrix_open_as_interrupted(
+    pool, matrix, bridge, url, conn, hs
+):
+    row = await put(conn, target_kind="matrix", target="@carol:y", status="working")
+    fb = await put(conn, target_kind="facebook", target="100", status="working")
+    inv = await put(conn, action="invite", target="@carol:y", room_id="!r:x", status="working")
+    await RoomRequests(pool, matrix, bridge, settings(url))._recover()
+    got = await get(conn, row)
+    assert (got.status, got.reason) == ("failed", "interrupted")
+    assert (await get(conn, fb)).status == "confirmed"
+    assert (await get(conn, inv)).status == "confirmed"
+    assert hs.created_rooms() == []
+
+
+async def test_unexpected_error_fails_matrix_open_as_interrupted(step, conn, hs, monkeypatch):
+    async def boom(*a, **kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(step, "_run", boom)
+    row = await put(conn, target_kind="matrix", target="@carol:y")
+    fb = await put(conn, target_kind="facebook", target="100")
+    with pytest.raises(RuntimeError):
+        await step._execute()
+    got = await get(conn, row)
+    assert (got.status, got.reason) == ("failed", "interrupted")
+    assert (await get(conn, fb)).status in ("confirmed", "working")

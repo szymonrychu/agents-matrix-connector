@@ -466,7 +466,7 @@ decision route and records the answer through the internal confirm route, the on
 | `confirmed` | the user said yes; the bot executes it next |
 | `working` | the bot is executing it |
 | `done` | executed; `room_id` is the room (`reason` `join_pending` when the bot still has to join, `not_a_message_request` for an accept with nothing to accept) |
-| `failed` | `no_match`, `bridge_unconfigured`, `bridge_error: <errcode>` or `matrix_error: <errcode>` |
+| `failed` | `no_match`, `interrupted` (a Matrix-id open lost mid-call, never rerun), `bridge_unconfigured`, `bridge_error: <errcode>` or `matrix_error: <errcode>` |
 | `rejected` | the user said no (`user_declined`) |
 
 Execution: a Facebook target opens a DM through the mautrix-meta provisioning API (`create_dm`,

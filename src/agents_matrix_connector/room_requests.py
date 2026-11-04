@@ -32,6 +32,7 @@ NO_MATCH = "no_match"
 JOIN_PENDING = "join_pending"
 NOT_A_MESSAGE_REQUEST = "not_a_message_request"
 ROOM_LEFT = "room_left"
+INTERRUPTED = "interrupted"
 
 
 class _Retry(Exception):
@@ -66,11 +67,17 @@ class RoomRequests:
         await self._execute()
 
     async def _recover(self) -> None:
-        """Rows a previous bot left `working` (it stopped mid-call) run again."""
+        """Rows a previous bot left `working` (it stopped mid-call) run again, except a
+        Matrix-id open: its room may exist already and a rerun would create a second one."""
         async with self._pool.connection() as conn:
-            cur = await conn.execute("SELECT id FROM room_requests WHERE status = 'working'")
-            for (request_id,) in await cur.fetchall():
-                if await repo.release(conn, request_id):
+            cur = await conn.execute(
+                "SELECT id, action, target_kind FROM room_requests WHERE status = 'working'"
+            )
+            for request_id, action, kind in await cur.fetchall():
+                if action == "open" and kind == "matrix":
+                    await repo.fail(conn, request_id, "working", INTERRUPTED)
+                    log.info("room request %s failed as interrupted by a restart", request_id)
+                elif await repo.release(conn, request_id):
                     log.info("room request %s requeued after a restart", request_id)
 
     # Resolving names through the bridge search.
@@ -130,7 +137,12 @@ class RoomRequests:
                 await self._fail(row.id, "working", exc.reason)
                 continue
             except BaseException:
-                await self._release(row.id)  # MatrixAuthError and anything unexpected
+                # MatrixAuthError and anything unexpected. A Matrix-id open may have created
+                # its room already, so it fails rather than runs twice.
+                if row.action == "open" and row.target_kind == "matrix":
+                    await self._fail(row.id, "working", INTERRUPTED)
+                else:
+                    await self._release(row.id)
                 raise
             if room_id is None and reason is None:
                 await self._release(row.id)  # an accept waiting for its join

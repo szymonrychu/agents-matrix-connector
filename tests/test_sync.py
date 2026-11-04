@@ -852,6 +852,24 @@ async def test_management_room_joined(fake, client, pool, monkeypatch):
     assert spy.joined == ["!mgmt:hs"]
 
 
+async def test_management_room_retried_until_known(fake, client, pool, monkeypatch):
+    spy = JoinSpy(client, monkeypatch)
+    add_dm(fake, joined=False, room_id="!mgmt:hs", state=[])
+    fake.invite("!mgmt:hs", BRIDGE)
+    answers = [None, frozenset({"!mgmt:hs"})]
+
+    async def source():
+        return answers.pop(0)
+
+    loop = SyncLoop(client, pool, make_settings(), now=lambda: T0, auto_join_source=source)
+    await loop.run_once()
+    assert spy.joined == []
+    await loop.run_once()
+    assert spy.joined == ["!mgmt:hs"]
+    await loop.run_once()  # answered once, never asked again
+    assert answers == []
+
+
 async def test_join_after_allow(fake, client, pool, monkeypatch):
     spy = JoinSpy(client, monkeypatch)
     add_dm(fake, joined=False)

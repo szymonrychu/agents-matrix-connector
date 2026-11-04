@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -194,9 +194,12 @@ class SyncLoop:
         *,
         now: Callable[[], datetime] = utcnow,
         auto_join: frozenset[str] = frozenset(),
+        auto_join_source: Callable[[], Awaitable[frozenset[str] | None]] | None = None,
     ):
         self._matrix = matrix
         self._auto_join = auto_join
+        # Asked on every tick until it answers (None means "could not say yet").
+        self._auto_join_source = auto_join_source
         self._pool = pool
         self._settings = settings
         self._now = now
@@ -224,6 +227,11 @@ class SyncLoop:
             delay = BACKOFF_INITIAL_SECONDS
 
     async def run_once(self) -> None:
+        if self._auto_join_source is not None:
+            found = await self._auto_join_source()
+            if found is not None:
+                self._auto_join = self._auto_join | found
+                self._auto_join_source = None
         async with self._pool.connection() as conn:
             since, stored_filter = await directory.get_sync_state(conn)
         self._filter_id = self._filter_id or stored_filter

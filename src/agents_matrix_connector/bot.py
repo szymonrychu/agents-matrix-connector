@@ -196,16 +196,17 @@ async def run_bot(
     return exit_code if exit_code else code
 
 
-async def _management_room(bridge: ProvisioningClient | None) -> frozenset[str]:
-    """The bridge management room, joined on invite like an allowed room; none without a
-    bridge or when the bridge cannot say (the bot starts anyway)."""
+async def _management_room(bridge: ProvisioningClient | None) -> frozenset[str] | None:
+    """The bridge management room, joined on invite like an allowed room; empty without a
+    bridge, None when the bridge cannot say (the bot starts anyway and the sync loop asks again
+    on its next tick)."""
     if bridge is None:
         return frozenset()
     try:
         room = (await bridge.whoami()).get("management_room")
     except BridgeError as exc:
-        log.warning("bridge whoami failed (%s); the management room is not auto-joined", exc)
-        return frozenset()
+        log.warning("bridge whoami failed (%s); the management room is not auto-joined yet", exc)
+        return None
     return frozenset({room}) if isinstance(room, str) and room else frozenset()
 
 
@@ -222,7 +223,7 @@ async def _main(settings, pool, orchestrator, matrix, stop, bridge=None) -> int:
             settings.user_id,
         )
         return EXIT_BAD_SETTINGS
-    sync = SyncLoop(matrix, pool, settings, auto_join=await _management_room(bridge))
+    sync = SyncLoop(matrix, pool, settings, auto_join_source=lambda: _management_room(bridge))
     worker = Worker(orchestrator, matrix, pool, settings)
     sender = Sender(pool, settings)
     tracker = Tracker(orchestrator, matrix, pool, settings)
