@@ -155,6 +155,47 @@
         "title": "ChatRooms",
         "type": "object"
       },
+      "ConfirmIn": {
+        "additionalProperties": false,
+        "properties": {
+          "approved": {
+            "title": "Approved",
+            "type": "boolean"
+          },
+          "decision_id": {
+            "minimum": 1.0,
+            "title": "Decision Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "decision_id",
+          "approved"
+        ],
+        "title": "ConfirmIn",
+        "type": "object"
+      },
+      "DecisionIn": {
+        "additionalProperties": false,
+        "properties": {
+          "decision_id": {
+            "minimum": 1.0,
+            "title": "Decision Id",
+            "type": "integer"
+          },
+          "task_key": {
+            "pattern": "^T-[0-9]+$",
+            "title": "Task Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_key",
+          "decision_id"
+        ],
+        "title": "DecisionIn",
+        "type": "object"
+      },
       "DeniedSender": {
         "properties": {
           "display_name": {
@@ -824,6 +865,203 @@
         "title": "RoomDetail",
         "type": "object"
       },
+      "RoomRequestIn": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "default": "open",
+            "enum": [
+              "open",
+              "invite"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "room_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Room Id"
+          },
+          "target": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Target",
+            "type": "string"
+          },
+          "task_key": {
+            "pattern": "^T-[0-9]+$",
+            "title": "Task Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "task_key"
+        ],
+        "title": "RoomRequestIn",
+        "type": "object"
+      },
+      "RoomRequestView": {
+        "properties": {
+          "action": {
+            "enum": [
+              "open",
+              "invite",
+              "accept"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "candidates": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidates"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "decision_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decision Id"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "room_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Room Id"
+          },
+          "status": {
+            "enum": [
+              "resolving",
+              "candidates",
+              "pending_confirmation",
+              "confirmed",
+              "working",
+              "done",
+              "failed",
+              "rejected"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target"
+          },
+          "target_kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "matrix",
+                  "facebook",
+                  "name"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Kind"
+          },
+          "task_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Key"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "action",
+          "status",
+          "target_kind",
+          "target",
+          "display_name",
+          "room_id",
+          "candidates",
+          "task_key",
+          "decision_id",
+          "reason",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "RoomRequestView",
+        "type": "object"
+      },
       "RoomSettingsIn": {
         "properties": {
           "agents_may_initiate": {
@@ -1396,6 +1634,118 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/chat/v1/admin/room-requests": {
+      "post": {
+        "description": "Queue an open or invite. Nothing happens on Matrix or Facebook until the user's yes\non the taskboard decision is confirmed through the internal confirm route.",
+        "operationId": "create_chat_v1_admin_room_requests_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Orch-Session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Orch-Session"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Orch-Slug",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Orch-Slug"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoomRequestIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoomRequestView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create"
+      }
+    },
+    "/chat/v1/admin/room-requests/{request_id}": {
+      "get": {
+        "operationId": "get_chat_v1_admin_room_requests__request_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoomRequestView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get"
+      }
+    },
     "/chat/v1/admin/rooms": {
       "get": {
         "operationId": "list_rooms_chat_v1_admin_rooms_get",
@@ -1789,6 +2139,106 @@
           }
         },
         "summary": "List Users"
+      }
+    },
+    "/chat/v1/internal/room-requests/{request_id}/confirm": {
+      "post": {
+        "description": "The user's answer: confirmed (approved) or rejected. Only with the attached\ndecision id.",
+        "operationId": "confirm_chat_v1_internal_room_requests__request_id__confirm_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoomRequestView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Confirm"
+      }
+    },
+    "/chat/v1/internal/room-requests/{request_id}/decision": {
+      "put": {
+        "description": "Attach the taskboard decision the orchestrator asked; once, and only while the row\nwaits for confirmation.",
+        "operationId": "attach_decision_chat_v1_internal_room_requests__request_id__decision_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecisionIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoomRequestView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Attach Decision"
       }
     },
     "/chat/v1/messages": {

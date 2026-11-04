@@ -450,6 +450,67 @@ As `POST /matrix/api/v1/rules`.
 
 As `DELETE /matrix/api/v1/rules/{rule_id}`.
 
+### Room requests
+
+An agent asks to open a chat (`open`) or invite a user into a joined Matrix room (`invite`); the
+bot executes a request only after the user said yes on a taskboard decision. The orchestrator
+enforces that: it asks the decision as the calling session, attaches it through the internal
+decision route and records the answer through the internal confirm route, the only path to
+`confirmed`. The api inserts and confirms rows; the bot resolves names and executes. Statuses:
+
+| Status | Meaning |
+|---|---|
+| `resolving` | a name with no local match; the bot searches the bridge (`search_users`) |
+| `candidates` | the name matched several people (`candidates`: `user_id`, `display_name`, `facebook_id`); re-ask with one id. Terminal |
+| `pending_confirmation` | resolved to one id; waits for the user's decision |
+| `confirmed` | the user said yes; the bot executes it next |
+| `working` | the bot is executing it |
+| `done` | executed; `room_id` is the room (`reason` `join_pending` when the bot still has to join, `not_a_message_request` for an accept with nothing to accept) |
+| `failed` | `no_match`, `bridge_unconfigured`, `bridge_error: <errcode>` or `matrix_error: <errcode>` |
+| `rejected` | the user said no (`user_declined`) |
+
+Execution: a Facebook target opens a DM through the mautrix-meta provisioning API (`create_dm`,
+the bot then joins the portal room); a Matrix target gets a new direct room (`createRoom` with
+`is_direct`, recorded in `m.direct`); an invite is a Matrix `/invite`; an `accept` (queued by
+the allow route) sends `com.beeper.accept_message_request` once the room is joined. A new room
+is not allowed by any of this: allow it with the allow route.
+
+### `POST /chat/v1/admin/room-requests`
+
+Body: `target` (1 to 500 characters: a Matrix user id, a bridge ghost `@facebook_<id>:<server>`,
+a numeric Facebook id, a `facebook.com/profile.php?id=<n>` link on `facebook.com`, `www.`,
+`m.`, `mobile.`, `web.` or `fb.com`, or a display name), `action` (`open`, default, or
+`invite`), `room_id` (invite only: a joined Matrix room), `task_key` (`T-<n>`, the taskboard
+task the decision is asked on). Optional `X-Orch-Session` and `X-Orch-Slug` are stored for the
+audit trail. 201: the request (`id`, `action`, `status`, `target_kind`, `target`,
+`display_name`, `room_id`, `candidates`, `task_key`, `decision_id`, `reason`, `created_at`,
+`updated_at`). An id or link is `pending_confirmation`; a name with one local match too (its
+Facebook id, else its Matrix id); several local matches `candidates`; none `resolving`. 422
+`vanity_link_unresolvable` (a `facebook.com/<username>` link: pass the name or a profile.php
+link), 422 `invalid_target` (empty, the bot, a self identity, a bridge bot, a foreign link),
+422 `invite_not_possible`, 422 `invalid_request`, 429 `rate_limited` (more than
+`MATRIX_ROOM_REQUESTS_PER_HOUR` open and invite requests in the last hour). No row is written
+on a 4xx.
+
+### `GET /chat/v1/admin/room-requests/{request_id}`
+
+The request as above; 404 `not_found`.
+
+### Internal routes (`/chat/v1/internal`)
+
+For the orchestrator only, behind the same bearer, never relayed to agents.
+
+### `PUT /chat/v1/internal/room-requests/{request_id}/decision`
+
+Body `task_key`, `decision_id`: attach the taskboard decision, once, to a
+`pending_confirmation` request. 200 the request; 404 `not_found`; 409 `not_pending`.
+
+### `POST /chat/v1/internal/room-requests/{request_id}/confirm`
+
+Body `decision_id`, `approved`: with the attached decision id, `confirmed` (approved) or
+`rejected` (`user_declined`). 200 the request; 404 `not_found`; 409 `not_pending` (another
+status, no decision attached, or a different decision id).
+
 ## Operations
 
 ### Bot identity (taken over from Hermes)
