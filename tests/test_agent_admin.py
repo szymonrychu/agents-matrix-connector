@@ -34,6 +34,7 @@ async def test_admin_routes_need_the_bearer(admin):
         ("DELETE", "/rules/1", None),
         ("GET", f"/rooms/{DM}", None),
         ("GET", "/users", None),
+        ("POST", f"/rooms/{DM}/allow", {}),
     ]
     for method, path, body in calls:
         r = await client.request(method, path, json=body)
@@ -111,3 +112,14 @@ async def test_admin_room_detail_and_users_routes(admin, conn):
     assert [u["display_name"] for u in users.json()] == ["Bob B"]
     assert (await client.get(f"/rooms/{DM}")).status_code == 401
     assert (await client.get("/users")).status_code == 401
+
+
+async def test_admin_allow_needs_bearer(admin, conn):
+    client, headers = admin
+    await seed(conn)
+    assert (await client.post(f"/rooms/{DM}/allow", json={})).status_code == 401
+    r = await client.post(
+        "/rooms/!grp:x/allow", json={"trigger": "all"}, headers={**headers, "X-Orch-Slug": "s-1"}
+    )
+    assert r.status_code == 200
+    assert r.json()["access"]["state"] == "allowed" and r.json()["rule_id"] > 0

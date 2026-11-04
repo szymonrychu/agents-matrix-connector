@@ -7,10 +7,10 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Annotated, Literal
 
 from agents_common.orchestrator import NotFound, OrchestratorError, OrchestratorUnavailable
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Header, Query
 from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector import discovery, policy
@@ -23,6 +23,8 @@ from agents_matrix_connector.api.schemas import (
     MessageView,
     MetaView,
     PendingView,
+    RoomAllowIn,
+    RoomAllowView,
     RoomDetail,
     RoomSettingsIn,
     RoomView,
@@ -30,7 +32,7 @@ from agents_matrix_connector.api.schemas import (
     SyncView,
     UserView,
 )
-from agents_matrix_connector.db import directory, inbound, rules, runs
+from agents_matrix_connector.db import directory, inbound, room_requests, rules, runs
 from agents_matrix_connector.settings import ApiSettings, ConnectorSettings
 
 log = logging.getLogger(__name__)
@@ -206,6 +208,21 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
             raise ApiError(404, "not_found", f"room {room_id!r} not found")
         return room
 
+    async def check_preset(preset_id: uuid.UUID | None) -> None:
+        if preset_id is None:
+            return
+        try:
+            await orchestrator.get_preset(preset_id)
+        except NotFound:
+            raise ApiError(
+                422, "unknown_preset", f"preset_id: unknown preset {preset_id}"
+            ) from None
+        except OrchestratorUnavailable:
+            raise ApiError(503, "unavailable", "orchestrator unavailable") from None
+        except OrchestratorError as exc:
+            log.warning("orchestrator get_preset failed: %s", exc)
+            raise ApiError(502, "orchestrator_error", "orchestrator request failed") from None
+
     @router.get("/meta", response_model=MetaView)
     async def meta() -> MetaView:
         last = await directory.last_sync_at(pool)
@@ -246,18 +263,7 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
     @router.put("/rooms/{room_id}/settings", response_model=RoomDetail)
     async def put_settings(room_id: str, body: RoomSettingsIn) -> RoomDetail:
         await require_room(room_id)
-        if body.preset_id is not None:
-            try:
-                await orchestrator.get_preset(body.preset_id)
-            except NotFound:
-                raise ApiError(
-                    422, "unknown_preset", f"preset_id: unknown preset {body.preset_id}"
-                ) from None
-            except OrchestratorUnavailable:
-                raise ApiError(503, "unavailable", "orchestrator unavailable") from None
-            except OrchestratorError as exc:
-                log.warning("orchestrator get_preset failed: %s", exc)
-                raise ApiError(502, "orchestrator_error", "orchestrator request failed") from None
+        await check_preset(body.preset_id)
         await rules.set_room_settings(
             pool,
             room_id,
@@ -266,6 +272,49 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
             agents_may_initiate=body.agents_may_initiate,
         )
         return await detail(await require_room(room_id), await rules.list_rules(pool))
+
+    @router.post("/rooms/{room_id}/allow", response_model=RoomAllowView)
+    async def allow_room(
+        room_id: str,
+        body: RoomAllowIn,
+        session: Annotated[str | None, Header(alias="X-Orch-Session")] = None,
+        slug: Annotated[str | None, Header(alias="X-Orch-Slug")] = None,
+    ) -> RoomAllowView:
+        """Allow the room in one transaction: its settings, an `allow/room` rule (reused when it
+        exists) and, for a Messenger message request or a room still at `invite`, an accept
+        request the bot executes once the room is joined."""
+        room = await require_room(room_id)
+        await check_preset(body.preset_id)
+        note = f"allowed by agent {slug}" if slug else "allowed via api"
+        async with pool.connection() as conn, conn.transaction():
+            # One allow per room at a time, so two calls cannot both queue an accept.
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"agents-matrix-connector:allow:{room_id}",),
+            )
+            rule_id = await rules.allow_room(
+                conn,
+                room_id,
+                preset_id=body.preset_id,
+                trigger=body.trigger,
+                agents_may_initiate=body.agents_may_initiate,
+                note=note,
+            )
+            accept_id = await room_requests.open_accept_id(conn, room_id)
+            if accept_id is None and (room.message_request or room.membership == "invite"):
+                accept_id = (
+                    await room_requests.insert(
+                        conn,
+                        action="accept",
+                        status="confirmed",
+                        room_id=room_id,
+                        requested_by=_session_uuid(session),
+                        requested_slug=slug,
+                    )
+                ).id
+        log.info("room allowed room=%s rule=%s accept=%s", room_id, rule_id, accept_id)
+        view = await detail(await require_room(room_id), await rules.list_rules(pool))
+        return RoomAllowView(**view.model_dump(), rule_id=rule_id, accept_request_id=accept_id)
 
     @router.get("/rooms/{room_id}/messages", response_model=list[MessageView])
     async def room_messages(
@@ -332,6 +381,14 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
         ]
 
     return router
+
+
+def _session_uuid(raw: str | None) -> uuid.UUID | None:
+    """The caller's `X-Orch-Session` for the audit trail; a malformed one is dropped."""
+    try:
+        return uuid.UUID(raw) if raw else None
+    except ValueError:
+        return None
 
 
 async def _older(

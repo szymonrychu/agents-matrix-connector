@@ -85,3 +85,28 @@ async def test_room_settings_and_default_preset(pool, url):
         assert await rules.get_default_preset(conn) == preset
     await rules.set_default_preset(pool, None)
     assert await rules.get_default_preset(pool) is None
+
+
+async def test_allow_room_rule_and_settings_idempotent(pool):
+    preset = uuid.uuid4()
+    async with pool.connection() as conn, conn.transaction():
+        first = await rules.allow_room(
+            conn,
+            "!r:x",
+            preset_id=preset,
+            trigger="all",
+            agents_may_initiate=True,
+            note="allowed via api",
+        )
+    async with pool.connection() as conn, conn.transaction():
+        second = await rules.allow_room(
+            conn,
+            "!r:x",
+            preset_id=preset,
+            trigger=None,
+            agents_may_initiate=None,
+            note="again",
+        )
+    assert first == second
+    assert await rules.list_rules(pool) == [Rule(first, "allow", "room", "!r:x")]
+    assert await rules.get_room_settings(pool, "!r:x") == rules.RoomSettings(preset, None, True)

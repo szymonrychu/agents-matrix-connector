@@ -126,14 +126,20 @@ async def count_recent_opens(conn: psycopg.AsyncConnection, seconds: int) -> int
     return (await cur.fetchone())[0]
 
 
-async def has_open_accept(conn: psycopg.AsyncConnection, room_id: str) -> bool:
-    """Whether the room has an accept row that is not finished yet (confirmed or working)."""
+async def open_accept_id(conn: psycopg.AsyncConnection, room_id: str) -> int | None:
+    """The room's accept row that is not finished yet (confirmed or working), if any."""
     cur = await conn.execute(
-        "SELECT 1 FROM room_requests WHERE action = 'accept' AND room_id = %s"
-        " AND status IN ('confirmed', 'working') LIMIT 1",
+        "SELECT id FROM room_requests WHERE action = 'accept' AND room_id = %s"
+        " AND status IN ('confirmed', 'working') ORDER BY id LIMIT 1",
         (room_id,),
     )
-    return await cur.fetchone() is not None
+    row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def has_open_accept(conn: psycopg.AsyncConnection, room_id: str) -> bool:
+    """Whether the room has an accept row that is not finished yet (confirmed or working)."""
+    return await open_accept_id(conn, room_id) is not None
 
 
 async def attach_decision(

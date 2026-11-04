@@ -165,6 +165,22 @@ settings), so a save of the preset or trigger never grants or revokes it. 200 ro
     curl -s -X PUT -H 'content-type: application/json' -d '{"trigger": "all"}' \
       'http://localhost:8000/matrix/api/v1/rooms/!abc:server/settings'
 
+### `POST /matrix/api/v1/rooms/{room_id}/allow`
+
+Allow and configure a room in one call. Body as `PUT .../settings` (`preset_id`, `trigger`
+stored as sent, `agents_may_initiate` null keeps the stored flag). One transaction stores the
+settings and an `allow/room` rule for the room id (an existing one is reused, so a second call
+adds nothing) and, when the room is a Messenger message request or still at membership
+`invite`, queues an `accept` room request (status `confirmed`) unless one is open. The bot joins
+an invited room on its next sync because the rule now exists, then accepts the message request
+(`com.beeper.accept_message_request`). The rule note is `allowed by agent <slug>` with an
+`X-Orch-Slug` header, else `allowed via api`. 200: the room as `GET /rooms/{room_id}` plus
+`rule_id` and `accept_request_id` (null when nothing was queued); 404 `not_found`; 422
+`unknown_preset`; 503 `unavailable`; 502 `orchestrator_error`.
+
+    curl -s -X POST 'http://localhost:8000/matrix/api/v1/rooms/!abc:server/allow' \
+      -H 'Content-Type: application/json' -d '{"trigger": "all"}'
+
 ### `GET /matrix/api/v1/rooms/{room_id}/messages`
 
 The room's merged inbound and outbound feed, newest first. Query: `limit` (1..200, default
@@ -409,6 +425,10 @@ As `GET /matrix/api/v1/rooms`.
 ### `GET /chat/v1/admin/rooms/{room_id}`
 
 As `GET /matrix/api/v1/rooms/{room_id}`.
+
+### `POST /chat/v1/admin/rooms/{room_id}/allow`
+
+As `POST /matrix/api/v1/rooms/{room_id}/allow`.
 
 ### `PUT /chat/v1/admin/rooms/{room_id}/settings`
 

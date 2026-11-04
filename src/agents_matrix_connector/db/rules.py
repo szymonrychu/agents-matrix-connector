@@ -136,6 +136,44 @@ async def set_room_settings(
     return RoomSettings(preset_id, trigger, stored)
 
 
+async def allow_room(
+    conn: psycopg.AsyncConnection,
+    room_id: str,
+    *,
+    preset_id: uuid.UUID | None,
+    trigger: str | None,
+    agents_may_initiate: bool | None,
+    note: str,
+) -> int:
+    """In the caller's transaction: store the room settings (as `set_room_settings`) and the
+    `allow/room` rule for the room id, reusing an existing one. Returns the rule id."""
+    await conn.execute(
+        """
+        INSERT INTO room_settings (room_id, preset_id, trigger, agents_may_initiate)
+        VALUES (%(room)s, %(preset)s, %(trigger)s, COALESCE(%(flag)s::boolean, false))
+        ON CONFLICT (room_id) DO UPDATE
+        SET preset_id = EXCLUDED.preset_id, trigger = EXCLUDED.trigger,
+            agents_may_initiate = COALESCE(%(flag)s::boolean, room_settings.agents_may_initiate),
+            updated_at = now()
+        """,
+        {"room": room_id, "preset": preset_id, "trigger": trigger, "flag": agents_may_initiate},
+    )
+    list_, kind, value = policy.validate_rule("allow", "room", room_id)
+    cur = await conn.execute(
+        "INSERT INTO access_rules (list, kind, value, note) VALUES (%s, %s, %s, %s)"
+        " ON CONFLICT DO NOTHING RETURNING id",
+        (list_, kind, value, note),
+    )
+    row = await cur.fetchone()
+    if row is not None:
+        return row[0]
+    cur = await conn.execute(
+        "SELECT id FROM access_rules WHERE list = %s AND kind = %s AND value = %s",
+        (list_, kind, value),
+    )
+    return (await cur.fetchone())[0]
+
+
 async def get_default_preset(source: Source) -> uuid.UUID | None:
     async with _conn(source) as conn:
         cur = await conn.execute("SELECT default_preset_id FROM settings WHERE id = 1")

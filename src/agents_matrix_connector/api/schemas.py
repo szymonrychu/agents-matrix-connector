@@ -101,6 +101,22 @@ class RoomSettingsIn(BaseModel):
     """None (or omitted) keeps the stored value: the flag is an authorisation grant."""
 
 
+class RoomAllowIn(BaseModel):
+    """As `RoomSettingsIn`: preset and trigger are stored as sent (omitted clears), a null
+    `agents_may_initiate` keeps the stored flag."""
+
+    preset_id: uuid.UUID | None = None
+    trigger: Literal["all", "mention"] | None = None
+    agents_may_initiate: bool | None = None
+
+
+class RoomAllowView(RoomDetail):
+    rule_id: int
+    """The room's `allow/room` rule."""
+    accept_request_id: int | None
+    """The queued accept of the room's Messenger message request or invite, if any."""
+
+
 class MessageView(BaseModel):
     direction: Literal["in", "out"]
     id: str

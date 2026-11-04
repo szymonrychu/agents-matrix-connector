@@ -51,6 +51,7 @@ _ADMIN_ROUTES = frozenset(
     {
         ("/rooms", "GET"),
         ("/rooms/{room_id}", "GET"),
+        ("/rooms/{room_id}/allow", "POST"),
         ("/rooms/{room_id}/settings", "PUT"),
         ("/users", "GET"),
         ("/rules", "GET"),
