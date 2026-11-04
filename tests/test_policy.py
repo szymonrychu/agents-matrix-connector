@@ -227,6 +227,9 @@ def test_infrastructure_and_encrypted_refused():
         ) == Decision(False, ROOM_INFRASTRUCTURE, None, "room")
 
 
+V12_ROOM = "!OBcFGV30jyOrJmTuKqlh-rHGj8vXBVczfgjZQWif_Mw"
+
+
 def test_validate_rule_formats():
     accepted = [
         (("allow", "user", "  @alice:hs.example "), ("allow", "user", "@alice:hs.example")),
@@ -235,6 +238,8 @@ def test_validate_rule_formats():
         (("deny", "facebook", "9" * 32), ("deny", "facebook", "9" * 32)),
         (("allow", "room", " !abc:hs "), ("allow", "room", "!abc:hs")),
         (("deny", "room", "!abc:hs"), ("deny", "room", "!abc:hs")),
+        (("allow", "room", V12_ROOM), ("allow", "room", V12_ROOM)),
+        (("deny", "room", " " + V12_ROOM), ("deny", "room", V12_ROOM)),
         (("allow", "alias", "#chat:hs"), ("allow", "alias", "#chat:hs")),
         (("deny", "alias", " #chat:hs"), ("deny", "alias", "#chat:hs")),
         (("deny", "display_name", "  Alice Smith  "), ("deny", "display_name", "Alice Smith")),
@@ -266,7 +271,10 @@ def test_validate_rule_formats():
         (("allow", "facebook", "-1"), "value:"),
         (("allow", "facebook", "١٢"), "value:"),
         (("allow", "room", "#abc:hs"), "value:"),
-        (("allow", "room", "!abc"), "value:"),
+        (("allow", "room", "foo"), "value:"),
+        (("allow", "room", "!"), "value:"),
+        (("allow", "room", "!a b"), "value:"),
+        (("deny", "room", "!"), "value:"),
         (("allow", "room", "!:hs"), "value:"),
         (("allow", "alias", "!abc:hs"), "value:"),
         (("allow", "alias", "#abc"), "value:"),

@@ -564,3 +564,11 @@ async def test_allow_unknown_preset_422(api, conn):
     assert await _rule_ids(conn, GRP) == []
     cur = await conn.execute("SELECT count(*) FROM room_settings WHERE room_id = %s", (GRP,))
     assert (await cur.fetchone())[0] == 0
+
+
+async def test_allow_room_version_12_id_without_server(api, conn):
+    room_id = "!OBcFGV30jyOrJmTuKqlh-rHGj8vXBVczfgjZQWif_Mw"
+    await conn.execute("INSERT INTO rooms (room_id, membership) VALUES (%s, 'join')", (room_id,))
+    r = await api.post(room_path(room_id, "/allow"), json={})
+    assert r.status_code == 200
+    assert len(await _rule_ids(conn, room_id)) == 1
