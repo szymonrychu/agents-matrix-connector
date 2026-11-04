@@ -9,6 +9,7 @@ MATRIX_SELF_IDENTITIES: {{ join "," ($m.selfIdentities | default list) | quote }
 MATRIX_BRIDGE_BOTS: {{ join "," ($m.bridgeBots | default list) | quote }}
 MATRIX_PUPPET_PATTERN: {{ $m.puppetPattern | quote }}
 MATRIX_BRIDGE_PROVISIONING_URL: {{ $m.bridgeProvisioningUrl | default "" | quote }}
+MATRIX_ANONYMIZE_ADMINS: {{ join "," (.Values.anonymize.admins | default list) | quote }}
 MATRIX_DEFAULT_POLICY: {{ .Values.policy.default | quote }}
 MATRIX_GROUP_TRIGGER: {{ .Values.policy.groupTrigger | quote }}
 MATRIX_MAX_NEW_SESSIONS: {{ .Values.limits.maxNewSessions | int | toString | quote }}

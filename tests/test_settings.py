@@ -114,6 +114,8 @@ def test_access_token_file_wins(monkeypatch, tmp_path):
         ("MATRIX_SYNC_TIMEOUT_SECONDS", "0"),
         ("MATRIX_SYNC_TIMEOUT_SECONDS", "121"),
         ("MATRIX_RETENTION_DAYS", "0"),
+        ("MATRIX_ANONYMIZE_ADMINS", "@ok:x.org,nope"),
+        ("MATRIX_ANONYMIZE_ADMINS", "12a"),
     ],
 )
 def test_invalid_values_named(monkeypatch, var, value):
@@ -208,3 +210,10 @@ def test_bridge_provisioning_url_strips_slash(monkeypatch):
 def test_bridge_provisioning_url_rejects_non_http(monkeypatch, value):
     monkeypatch.setenv("MATRIX_BRIDGE_PROVISIONING_URL", value)
     assert "MATRIX_BRIDGE_PROVISIONING_URL" in problems()
+
+
+def test_anonymize_admins(monkeypatch):
+    assert load_settings(ApiSettings).anonymize_admins == []
+    monkeypatch.setenv("MATRIX_ANONYMIZE_ADMINS", "@facebook_1:x.org, 1234567")
+    s = load_settings(BotSettings)
+    assert s.anonymize_admins == ["@facebook_1:x.org", "1234567"]

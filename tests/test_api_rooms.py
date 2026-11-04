@@ -219,6 +219,28 @@ async def test_room_settings_flag_omitted_keeps_value(api, conn, fake):
     assert await _stored_flag(conn, DM) is False
 
 
+async def test_room_settings_anonymize_names(api, conn):
+    await seed(conn)
+    assert (await api.get(room_path(DM))).json()["anonymize_names"] is False
+    assert all(r["anonymize_names"] is False for r in (await api.get("/rooms")).json())
+
+    on = await api.put(room_path(DM, "/settings"), json={"anonymize_names": True})
+    assert on.status_code == 200 and on.json()["anonymize_names"] is True
+    assert (await _listed(api, DM))["anonymize_names"] is True
+
+    kept = await api.put(room_path(DM, "/settings"), json={"trigger": "all"})
+    assert kept.json()["anonymize_names"] is True
+    null = await api.put(room_path(DM, "/settings"), json={"anonymize_names": None})
+    assert null.json()["anonymize_names"] is True
+
+    off = await api.put(room_path(DM, "/settings"), json={"anonymize_names": False})
+    assert off.json()["anonymize_names"] is False
+    assert (await api.get(room_path(DM))).json()["anonymize_names"] is False
+
+    bad = await api.put(room_path(DM, "/settings"), json={"anonymize_names": "maybe"})
+    assert bad.status_code == 422 and bad.json()["error"]["code"] == "invalid_request"
+
+
 async def test_agents_may_initiate_default_false(api, conn):
     await seed(conn)
     assert await _stored_flag(conn, GRP) is None

@@ -4,6 +4,22 @@ Lessons that outlive a session. Newest first.
 
 ## 2026-11-04 decisions
 
+- Name anonymization (T-43, user corrections m345 and m346): a per-room `anonymize_names` flag
+  (`room_settings`, migration 0006, default off), settable from the UI and by superleaders
+  through the admin settings route. Pseudonym `user-<sha>` / `admin-<sha>` is the first 12 hex
+  of a plain sha256 of the mxid, no HMAC and no secret (the user asked for exactly that);
+  `admin-` for ids in `MATRIX_ANONYMIZE_ADMINS` (mxids or numeric Facebook ids, never display
+  names, so nobody renames into the label). Only identity fields are pseudonymised (prompt
+  `from`, empty `facebook_id`, room name, preamble `sender`/`room_name`, `/chat/v1/rooms`
+  names); bodies are never rewritten and there is no real-name check: the user wants real names
+  usable and only the pseudonyms kept out of the chat. A pseudonym in outbound text is
+  rejected, never redacted: the API answers 422 `pseudonym_disclosed` naming the tokens; the
+  tracker fails the run `pseudonym_disclosed` before `_send_match` (so it is never matched as
+  already sent), posts nothing to the room (no generic notice, the agent is expected to answer
+  itself) and posts a message into the run's session through the orchestrator naming the tokens
+  and asking for a rephrased `orchestrator_chat_send`; that post is best effort and logged on
+  failure. Matching folds NFKC/casefold and drops invisible characters so width or zero-width
+  tricks do not slip a token past. Admin relays and the UI keep real names.
 - Room ids: the `room` rule format accepts `!opaque:server` and the server-less `!opaque` of
   Matrix room version 12 (`!` + 43-char url-safe base64 of the create event hash). Why: the
   allow route returned 500 for a v12 room because validation required `:server`.

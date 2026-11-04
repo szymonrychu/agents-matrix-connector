@@ -783,3 +783,75 @@ async def agent_rows(pool) -> list[tuple]:
         "SELECT send_id, txn_id, status, reason, event_id IS NOT NULL FROM outbound"
         " WHERE send_id IS NOT NULL ORDER BY id",
     )
+
+
+async def anonymize_room(pool, room=ROOM) -> None:
+    async with pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO room_settings (room_id, anonymize_names) VALUES (%s, true)", (room,)
+        )
+
+
+def session_texts(orch, session_id) -> list[str]:
+    return [m["text"] for m in orch.messages.values() if m["session_id"] == session_id]
+
+
+async def test_final_answer_with_pseudonym_rejected_and_agent_told(
+    tracker, pool, orch, orch_client, hs, matrix
+):
+    await anonymize_room(pool)
+    run_id, message_id, session = await seed(pool, orch, orch_client, bodies=("hi", "there"))
+    final = "Sure, I told admin-abcdefabcdef and USER-0123456789AB."
+    # Sent before the room was anonymized: never matched, so the answer is not "already sent".
+    await put_send(pool, session, final, at=T0)
+    orch.complete_turn(message_id, final)
+    await tracker.tick()
+    await tracker.tick()
+
+    assert await run_state(pool, run_id) == ("failed", "pseudonym_disclosed")
+    assert await row_states(pool) == [
+        ("failed", "pseudonym_disclosed", run_id),
+        ("failed", "pseudonym_disclosed", run_id),
+    ]
+    assert await outbound_rows(pool) == []
+    assert bodies(hs) == [] and matrix.sends == []
+    assert hs.typing_state(ROOM) is False
+    told = session_texts(orch, session)[1:]
+    assert len(told) == 1
+    assert told[0].startswith(f"Your final answer for the chat room {ROOM} was not sent:")
+    assert "admin-abcdefabcdef, USER-0123456789AB" in told[0]
+    assert "must not be sent to the chat" in told[0]
+    assert "orchestrator_chat_send" in told[0]
+
+
+async def test_final_answer_without_pseudonym_sent_in_anonymized_room(
+    tracker, pool, orch, orch_client, hs
+):
+    await anonymize_room(pool)
+    run_id, message_id, session = await seed(pool, orch, orch_client)
+    orch.complete_turn(message_id, "Thanks Alice, see user-0123")
+    await tracker.tick()
+    assert await run_state(pool, run_id) == ("handled", None)
+    assert bodies(hs) == ["Thanks Alice, see user-0123"]
+    assert session_texts(orch, session) == ["prompt"]
+
+
+async def test_pseudonym_allowed_where_names_are_not_hidden(tracker, pool, orch, orch_client, hs):
+    run_id, message_id, _ = await seed(pool, orch, orch_client)
+    orch.complete_turn(message_id, "user-0123456789ab")
+    await tracker.tick()
+    assert await run_state(pool, run_id) == ("handled", None)
+    assert bodies(hs) == ["user-0123456789ab"]
+
+
+async def test_rejection_notice_failure_is_logged(tracker, pool, orch, orch_client, hs, caplog):
+    await anonymize_room(pool)
+    run_id, message_id, session = await seed(pool, orch, orch_client)
+    orch.complete_turn(message_id, "user-0123456789ab")
+    orch.fail_next("post_message", 503)
+    with caplog.at_level(logging.WARNING):
+        await tracker.tick()
+    assert await run_state(pool, run_id) == ("failed", "pseudonym_disclosed")
+    assert bodies(hs) == []
+    assert session_texts(orch, session) == ["prompt"]
+    assert f"run {run_id}: could not tell session {session}" in caplog.text

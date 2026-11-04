@@ -11,7 +11,7 @@ from pathlib import Path
 from api_helpers import make_settings
 from fastapi.routing import APIRoute
 
-from agents_matrix_connector import policy, sync, tracker, worker
+from agents_matrix_connector import anonymize, policy, sync, tracker, worker
 from agents_matrix_connector.api import openapi
 from agents_matrix_connector.api.agent import CHAT_PREFIX, create_agent_app
 from agents_matrix_connector.api.app import PREFIX, create_api_app
@@ -98,6 +98,7 @@ def test_readme_lists_every_reason() -> None:
         tracker.FORBIDDEN,
         tracker.MESSAGE_FAILED,
         tracker.MESSAGE_CANCELLED,
+        anonymize.PSEUDONYM_DISCLOSED,
         PRESET_NOT_FOUND,
     }
     assert policy.denied("<kind>") in README
@@ -173,6 +174,7 @@ def test_readme_lists_every_agent_route() -> None:
         "session_bound",
         "rate_limited",
         "room_chunk_limit",
+        anonymize.PSEUDONYM_DISCLOSED,
         "invalid_slug",
         "unavailable",
     ):
@@ -197,6 +199,7 @@ def test_readme_lists_every_agent_route() -> None:
         "MATRIX_AGENT_RATE_PER_MINUTE",
         "MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR",
         "agents_may_initiate",
+        "anonymize_names",
     ):
         assert phrase in agent, phrase
     duplicate = re.search(r"^Duplicate rule:.*?(?=\n\n|\Z)", agent, re.MULTILINE | re.DOTALL)

@@ -18,6 +18,7 @@ import pytest
 from api_helpers import BOT, make_settings
 from psycopg_pool import AsyncConnectionPool
 
+from agents_matrix_connector.anonymize import pseudonym
 from agents_matrix_connector.api import agent as agent_api
 from agents_matrix_connector.api.agent import CHAT_PREFIX, create_agent_app, valid_key
 from agents_matrix_connector.db.sends import parse_ref
@@ -1124,3 +1125,56 @@ async def test_status_own_sends_only(agent, conn):
         r = await agent.get(f"/messages/{ref}", headers=as_(session))
         refused(r, 404, "not_found")
     assert (await agent.get(f"/messages/{others}", headers=as_(other))).status_code == 200
+
+
+async def anonymize(conn, room_id):
+    await conn.execute(
+        "UPDATE room_settings SET anonymize_names = true WHERE room_id = %s", (room_id,)
+    )
+
+
+async def test_pseudonym_in_anonymized_room_refused(agent, conn):
+    home, plain = "!home:x", "!plain:x"
+    for room in (home, plain):
+        await add_room(conn, room, flag=False)
+        await allow_room(conn, room)
+    await anonymize(conn, home)
+    session, other = uuid.uuid4(), uuid.uuid4()
+    await bind(conn, home, session)
+    await bind(conn, plain, other)
+
+    r = await say(agent, session, "Thanks User-0123456789Ab and admin-abcdefabcdef!")
+    refused(r, 422, "pseudonym_disclosed")
+    message = r.json()["error"]["message"]
+    assert message.startswith("text: contains the pseudonym(s) User-0123456789Ab, admin-abcdefab")
+    assert "must not be sent to the chat" in message
+    assert "refer to the person differently" in message
+    assert await count_sends(conn) == 0
+
+    accepted(await say(agent, session, "Thanks Alice Smith, see user-0123"))
+    accepted(await say(agent, other, "user-0123456789ab is fine where names are not hidden"))
+
+
+async def test_pseudonym_check_after_room_checks(agent, conn):
+    room = "!home:x"
+    await add_room(conn, room, flag=False)
+    await allow_room(conn, room)
+    await anonymize(conn, room)
+    await bind(conn, room, uuid.uuid4())
+    r = await say(agent, uuid.uuid4(), "hi user-0123456789ab", room=room)
+    refused(r, 409, "room_bound")
+
+
+async def test_anonymized_room_names_listed_as_pseudonyms(agent, conn):
+    dm, group = "!dm:x", "!group:x"
+    await add_room(conn, dm, name="Alice A", flag=True)
+    await add_room(
+        conn, group, kind="group", name="Alice A, Bob B", members=(ALICE, BOB), flag=True
+    )
+    await conn.execute("UPDATE users SET display_name = 'Alice A' WHERE user_id = %s", (ALICE,))
+    await conn.execute("UPDATE users SET display_name = 'Bob B' WHERE user_id = %s", (BOB,))
+    for room in (dm, group):
+        await allow_room(conn, room)
+        await anonymize(conn, room)
+    names = {r["room_id"]: r["name"] for r in await listed(agent, uuid.uuid4())}
+    assert names == {dm: pseudonym(ALICE), group: f"{pseudonym(ALICE)}, {pseudonym(BOB)}"}

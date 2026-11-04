@@ -29,6 +29,7 @@ MIGRATIONS = [
     "0003_preamble.sql",
     "0004_room_holds.sql",
     "0005_room_requests.sql",
+    "0006_anonymize_names.sql",
 ]
 
 
@@ -410,6 +411,16 @@ def test_preamble_columns(db):
         assert _columns(conn, "settings")["preamble"] == ("text", "YES")
         assert _columns(conn, "access_rules")["preamble"] == ("text", "YES")
         assert _columns(conn, "inbound")["rule_id"] == ("bigint", "YES")
+
+
+def test_anonymize_names_column(db):
+    with psycopg.connect(db) as conn:
+        assert _columns(conn, "room_settings")["anonymize_names"] == ("boolean", "NO")
+        assert _column_default(conn, "room_settings", "anonymize_names") == "false"
+        conn.execute("INSERT INTO room_settings (room_id) VALUES ('!anon')")
+        assert conn.execute(
+            "SELECT anonymize_names FROM room_settings WHERE room_id = '!anon'"
+        ).fetchone() == (False,)
 
 
 def test_room_requests_indexes_and_checks(db):

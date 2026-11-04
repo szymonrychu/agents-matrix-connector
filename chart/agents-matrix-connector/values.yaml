@@ -51,6 +51,12 @@ policy:
   # MATRIX_GROUP_TRIGGER: mention | all
   groupTrigger: mention
 
+# Rooms flagged anonymize_names (a per-room setting) show the chat agent pseudonyms instead of
+# names. MATRIX_ANONYMIZE_ADMINS: Matrix user ids or numeric Facebook ids shown as admin-<sha>
+# there instead of user-<sha>.
+anonymize:
+  admins: []
+
 limits:
   maxNewSessions: 3
   maxQueuedPerRoom: 20

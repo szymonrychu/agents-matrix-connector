@@ -59,7 +59,7 @@ from agents_common.orchestrator import (
 from agents_common.templating import TemplateError
 from psycopg_pool import AsyncConnectionPool
 
-from agents_matrix_connector import discovery, prompt
+from agents_matrix_connector import anonymize, discovery, prompt
 from agents_matrix_connector.clock import utcnow
 from agents_matrix_connector.db import bindings, directory, holds, inbound, rules, runs
 from agents_matrix_connector.db.bindings import BindingRow
@@ -447,17 +447,32 @@ class Worker:
             log.warning("matrix read receipt in %s failed: %s", batch.room_id, exc.status)
 
     async def _render(self, batch: _Batch, *, first: bool) -> str:
+        """The prompt of the batch; in a room flagged `anonymize_names` the room name and every
+        sender are pseudonyms and no Facebook id is shown (bodies stay as written)."""
         room = await directory.get_room(self._pool, batch.room_id)
+        setting = await rules.get_room_settings(self._pool, batch.room_id)
+        room_name = room.name if room else None
+        sender: Callable[[InboundRow], str] = prompt.sender_name
+        facebook_id: Callable[[str], str | None] = self._facebook_id
+        if setting is not None and setting.anonymize_names:
+            labeler = anonymize.Labeler(self._settings.anonymize_admins, self._facebook_id)
+            excluded = self._settings.self_ids() | set(self._settings.bridge_bots)
+            members = room.members if room else []
+            room_name = labeler.room(room_name, room.kind if room else None, members, excluded)
+            sender, facebook_id = labeler.sender, anonymize.no_facebook_id
         return prompt.render(
-            room.name if room else None,
+            room_name,
             (room.kind if room else None) or "",
             batch.rows,
             first=first,
-            facebook_id=self._facebook_id,
-            preamble=await self._preamble(batch, room.name if room else None) if first else "",
+            facebook_id=facebook_id,
+            preamble=await self._preamble(batch, room_name, sender) if first else "",
+            sender=sender,
         )
 
-    async def _preamble(self, batch: _Batch, room_name: str | None) -> str:
+    async def _preamble(
+        self, batch: _Batch, room_name: str | None, sender: Callable[[InboundRow], str]
+    ) -> str:
         """The rendered first-prompt preamble: the deciding rule's template, else the global
         one, else the default; a stored template that no longer renders falls back to the
         default so a bad edit never stalls the chat."""
@@ -470,7 +485,7 @@ class Worker:
         context = prompt.preamble_context(
             room_name,
             batch.room_id,
-            (first.sender_name or first.sender) if first else "",
+            sender(first) if first else "",
             (rule[0] or "") if rule else "",
             self._now(),
         )

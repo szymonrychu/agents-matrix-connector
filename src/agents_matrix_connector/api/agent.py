@@ -29,7 +29,7 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from agents_matrix_connector import policy
+from agents_matrix_connector import anonymize, discovery, policy
 from agents_matrix_connector.api.app import (
     EXEMPT_PATHS,
     add_error_handlers,
@@ -324,6 +324,13 @@ async def _resolve(
 def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRouter:
     router = APIRouter(prefix=CHAT_PREFIX)
     send_errors = _errors(400, 401, 403, 409, 422, 429, 503)
+    puppet = re.compile(settings.puppet_pattern)
+    bridge_server = settings.user_id.split(":", 1)[1]
+    excluded = settings.self_ids() | set(settings.bridge_bots)
+    labeler = anonymize.Labeler(
+        settings.anonymize_admins,
+        lambda user_id: discovery.facebook_id(user_id, puppet, bridge_server),
+    )
 
     async def queue(
         who: Caller,
@@ -362,6 +369,20 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
                         raise _bad_reference(masked_field, _UNUSABLE_REFERENCE)
                 status, message = _REFUSALS[outcome]
                 raise ApiError(status, outcome, message)
+            setting = await rules.get_room_settings(conn, room_id)
+            if text is not None and setting is not None and setting.anonymize_names:
+                found = anonymize.pseudonyms_in(text)
+                if found:
+                    log.info(
+                        "agent send refused session=%s code=%s",
+                        who.session_id,
+                        anonymize.PSEUDONYM_DISCLOSED,
+                    )
+                    raise ApiError(
+                        422,
+                        anonymize.PSEUDONYM_DISCLOSED,
+                        "text: " + anonymize.disclosure_message(found),
+                    )
             async with conn.transaction():
                 await _lock(conn, "session", str(who.session_id))
                 await _lock(conn, "room", room_id)
@@ -412,7 +433,8 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
 
     @router.get("/rooms", response_model=ChatRooms, responses=_errors(400, 401, 503))
     async def list_rooms(who: Annotated[Caller, Depends(caller)]) -> ChatRooms:
-        """The rooms this session may post to: its bound room, else the unbound flagged rooms."""
+        """The rooms this session may post to: its bound room, else the unbound flagged rooms.
+        A room with `anonymize_names` is named with its people's pseudonyms."""
         # The directory is read before the connection is taken: one pool connection at a time.
         directory_rooms = []
         for listed in await directory.list_rooms(pool):
@@ -427,10 +449,13 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
                 if await may_post(conn, who.session_id, room, rule_list, settings) != "ok":
                     continue
                 setting = await rules.get_room_settings(conn, room.room_id)
+                name = room.name
+                if setting is not None and setting.anonymize_names:
+                    name = labeler.room(name, room.kind, room.members, excluded)
                 found.append(
                     ChatRoom(
                         room_id=room.room_id,
-                        name=room.name,
+                        name=name,
                         kind=room.kind,
                         bound=own is not None and own.room_id == room.room_id,
                         agents_may_initiate=setting is not None and setting.agents_may_initiate,
@@ -443,7 +468,8 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
     async def send_message(
         who: Annotated[Caller, Depends(caller)], body: MessageIn
     ) -> SendAccepted:
-        """Queue a message, optionally a quoted reply."""
+        """Queue a message, optionally a quoted reply. In a room with `anonymize_names`, a text
+        containing a pseudonym (`user-<sha>`, `admin-<sha>`) is 422 `pseudonym_disclosed`."""
         if not body.text.strip():
             raise ApiError(
                 422, "invalid_text", "text: needs a non-whitespace character to be delivered"
