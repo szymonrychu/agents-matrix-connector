@@ -254,6 +254,19 @@
           "message": {
             "title": "Message",
             "type": "string"
+          },
+          "occupier": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Only on 409 room_bound, for the orchestrator: the session bound to a room agents may start a chat in.",
+            "title": "Occupier"
           }
         },
         "required": [

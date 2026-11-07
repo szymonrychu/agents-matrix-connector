@@ -401,6 +401,71 @@ async def test_binding_refusals(agent, conn):
     assert await bindings_snapshot(conn) == before
 
 
+async def error_keys(response) -> set[str]:
+    return set(response.json()["error"])
+
+
+async def test_room_bound_names_occupier_when_room_flagged(agent, conn):
+    await add_room(conn, "!occ:x", flag=True)
+    await allow_room(conn, "!occ:x")
+    occupier, caller = uuid.uuid4(), uuid.uuid4()
+    await bind(conn, "!occ:x", occupier)
+    r = await say(agent, caller, "x", room="!occ:x")
+    refused(r, 409, "room_bound")
+    assert r.json()["error"]["occupier"] == str(occupier)
+    assert await count_sends(conn) == 0
+
+
+async def test_room_bound_hides_occupier_when_not_flagged(agent, conn):
+    await add_room(conn, "!occ:x", flag=False)
+    await allow_room(conn, "!occ:x")
+    await bind(conn, "!occ:x", uuid.uuid4())
+    r = await say(agent, uuid.uuid4(), "x", room="!occ:x")
+    refused(r, 409, "room_bound")
+    assert await error_keys(r) == {"code", "message"}
+
+
+async def test_room_bound_reservation_has_no_occupier(agent, conn):
+    await add_room(conn, "!occ:x", flag=True)
+    await allow_room(conn, "!occ:x")
+    await reserve(conn, "!occ:x")
+    r = await say(agent, uuid.uuid4(), "x", room="!occ:x")
+    refused(r, 409, "room_bound")
+    assert await error_keys(r) == {"code", "message"}
+
+
+async def test_reply_masking_still_wins_over_occupier(agent, conn):
+    await add_room(conn, "!occ:x", flag=True)
+    await allow_room(conn, "!occ:x")
+    await bind(conn, "!occ:x", uuid.uuid4())
+    ref, _ = await add_inbound(conn, "!occ:x")
+    r = await say(agent, uuid.uuid4(), "x", reply_to=ref)
+    refused(r, 422, "bad_reference")
+    assert "occupier" not in r.json()["error"]
+
+
+async def test_other_refusals_carry_no_occupier(agent, conn):
+    denied, unflagged, flagged = "!denied:x", "!unflagged:x", "!flagged:x"
+    await add_room(conn, denied, flag=True)
+    await add_room(conn, unflagged, flag=False)
+    await allow_room(conn, unflagged)
+    await add_room(conn, flagged, flag=True)
+    await allow_room(conn, flagged)
+    bound_room, bound = "!bound:x", uuid.uuid4()
+    await add_room(conn, bound_room, flag=True)
+    await allow_room(conn, bound_room)
+    await bind(conn, bound_room, bound)
+    cases = [
+        (uuid.uuid4(), denied, 403, "room_not_allowed"),
+        (uuid.uuid4(), unflagged, 403, "room_not_authorised"),
+        (bound, flagged, 409, "session_bound"),
+    ]
+    for session, room, status, error in cases:
+        r = await say(agent, session, "x", room=room)
+        refused(r, status, error)
+        assert await error_keys(r) == {"code", "message"}
+
+
 async def test_policy_member_rules(agent_for, conn, monkeypatch):
     calls = []
     real = agent_api.agent_room_decision

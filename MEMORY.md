@@ -2,6 +2,15 @@
 
 Lessons that outlive a session. Newest first.
 
+## 2026-11-07 decisions
+
+- 409 `room_bound` names the occupier (`error.occupier`, the bound session id) so the
+  orchestrator can relay a cron session's post through it. Only the orchestrator reads it (it is
+  the sole `/chat/v1` caller) and it never passes it to an agent. Only for a room flagged
+  `agents_may_initiate` with a session bound (the caller could have started a chat there); never
+  for a reservation (no session yet) or an unflagged room. This amends the 2026-10-28
+  anti-probing rule for exactly this case; reply-masking (`bad_reference`) still wins first.
+
 ## 2026-11-04 decisions
 
 - Name anonymization (T-43, user corrections m345 and m346): a per-room `anonymize_names` flag
