@@ -354,7 +354,7 @@ Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
 | `bad_reference` | 422 | `reply_to` or `to` is not an `m<n>` or `s<n>` this session can reference: unknown, another session's send, a send not yet `sent`, a reaction, of another room than the given `room`, an `m<n>` whose room is refused to a session that is not bound to it, or a raw event id |
 | `room_required` | 422 | no `room`, no `reply_to`, and the session is bound to no room |
 | `room_not_allowed` | 403 | the room is unknown or not policy-allowed for agent sends (both answer the same) |
-| `room_bound` | 409 | the room is bound to (or reserved by) another session |
+| `room_bound` | 409 | the room is bound to (or reserved by) another session; a room flagged `agents_may_initiate` with a session bound also carries `error.occupier`, that session's id (never for a reservation or an unflagged room), read by the orchestrator, which never passes it to an agent |
 | `room_not_authorised` | 403 | the room is unbound and not flagged `agents_may_initiate` |
 | `session_bound` | 409 | the room is unbound and flagged, but the session is already bound to another room |
 | `rate_limited` | 429 | the session reached `MATRIX_AGENT_RATE_PER_MINUTE` sends in the last 60 s |

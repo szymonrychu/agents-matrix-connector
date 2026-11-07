@@ -169,6 +169,19 @@ async def may_post(
     return "ok"
 
 
+async def relay_occupier(conn: psycopg.AsyncConnection, room_id: str) -> uuid.UUID | None:
+    """The session bound to a room agents may start a chat in, else None.
+
+    Named on `room_bound` only for the orchestrator (the sole caller), which relays the post
+    through it. A reservation has no session yet; an unflagged room is not disclosed.
+    """
+    setting = await rules.get_room_settings(conn, room_id)
+    if setting is None or not setting.agents_may_initiate:
+        return None
+    binding = await bindings.active_for_room(conn, room_id)
+    return binding.session_id if binding is not None else None
+
+
 class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -217,6 +230,11 @@ class SendStatus(BaseModel):
 class ErrorDetail(BaseModel):
     code: str
     message: str
+    occupier: uuid.UUID | None = Field(
+        default=None,
+        description="Only on 409 room_bound, for the orchestrator: the session bound to a room "
+        "agents may start a chat in.",
+    )
 
 
 class ErrorBody(BaseModel):
@@ -368,7 +386,10 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
                     if own is None or own.room_id != room_id:
                         raise _bad_reference(masked_field, _UNUSABLE_REFERENCE)
                 status, message = _REFUSALS[outcome]
-                raise ApiError(status, outcome, message)
+                occupier = await relay_occupier(conn, room_id) if outcome == "room_bound" else None
+                raise ApiError(
+                    status, outcome, message, {"occupier": str(occupier)} if occupier else None
+                )
             setting = await rules.get_room_settings(conn, room_id)
             if text is not None and setting is not None and setting.anonymize_names:
                 found = anonymize.pseudonyms_in(text)

@@ -12,11 +12,12 @@ from pydantic import BaseModel
 class ApiError(Exception):
     """An error answered as `{error: {code, message}}`."""
 
-    def __init__(self, status: int, code: str, message: str):
+    def __init__(self, status: int, code: str, message: str, extra: dict[str, Any] | None = None):
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
+        self.extra = extra
 
 
 class AccessView(BaseModel):

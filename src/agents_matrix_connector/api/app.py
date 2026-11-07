@@ -6,6 +6,7 @@ Authorization header.
 
 import ipaddress
 import logging
+from typing import Any
 
 import psycopg
 from agents_common.orchestrator import OrchestratorClient
@@ -29,11 +30,14 @@ EXEMPT_PATHS = frozenset({"/healthz", "/readyz"})
 
 
 def error_response(
-    status: int, code: str, message: str, headers: dict[str, str] | None = None
+    status: int,
+    code: str,
+    message: str,
+    headers: dict[str, str] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> JSONResponse:
-    return JSONResponse(
-        {"error": {"code": code, "message": message}}, status_code=status, headers=headers
-    )
+    error = {"code": code, "message": message, **(extra or {})}
+    return JSONResponse({"error": error}, status_code=status, headers=headers)
 
 
 class SourceAllowlist:
@@ -73,7 +77,7 @@ def add_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(ApiError)
     async def _api_error(request: Request, exc: ApiError) -> JSONResponse:
-        return error_response(exc.status, exc.code, exc.message)
+        return error_response(exc.status, exc.code, exc.message, extra=exc.extra)
 
     @app.exception_handler(RequestValidationError)
     async def _invalid(request: Request, exc: RequestValidationError) -> JSONResponse:
