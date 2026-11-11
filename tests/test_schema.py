@@ -22,6 +22,7 @@ TABLES = {
     "room_bindings",
     "room_holds",
     "room_requests",
+    "room_notes",
 }
 MIGRATIONS = [
     "0001_init.sql",
@@ -30,6 +31,7 @@ MIGRATIONS = [
     "0004_room_holds.sql",
     "0005_room_requests.sql",
     "0006_anonymize_names.sql",
+    "0007_room_notes.sql",
 ]
 
 
@@ -75,6 +77,7 @@ def test_writer_comments(db):
         "room_bindings": "writer: bot worker",
         "room_holds": "writer: bot worker",
         "room_requests": "queue: inserted by api; api confirms or rejects",
+        "room_notes": "writer: api",
     }
     with psycopg.connect(db) as conn:
         for table, comment in expected.items():
