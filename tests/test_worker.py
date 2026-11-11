@@ -13,11 +13,11 @@ from agents_common.orchestrator import (
 )
 
 from agents_matrix_connector.anonymize import pseudonym
-from agents_matrix_connector.db import bindings, holds, inbound, runs
+from agents_matrix_connector.db import bindings, holds, inbound, notes, runs, skills
 from agents_matrix_connector.db.bindings import BindingRow
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
 from agents_matrix_connector.matrix import MatrixClient
-from agents_matrix_connector.prompt import ADMIN_TRUST_RULE, DEFAULT_PREAMBLE
+from agents_matrix_connector.prompt import ADMIN_TRUST_RULE, DEFAULT_PREAMBLE, MEMORY_RULE
 from agents_matrix_connector.settings import BotSettings
 from agents_matrix_connector.worker import Worker, binding_state, check_action
 
@@ -1153,6 +1153,83 @@ async def test_preamble_for_session_new_to_room(conn, fake, make_worker):
     assert message["text"].startswith(DEFAULT_PREAMBLE)
 
 
+async def _memory_text(conn, fake, make_worker, room=DM, **overrides) -> str:
+    """The first prompt a freshly bound leader gets for a queued message in the room."""
+    await add_room(conn, room)
+    leader = add_session(fake, "hive-lead")
+    await bind_agent(conn, room, leader)
+    await queue(conn, room, "hello")
+    await make_worker(**overrides).tick()
+    [message] = session_messages(fake, leader)
+    return message["text"]
+
+
+async def test_first_prompt_includes_memory(conn, fake, make_worker):
+    await notes.put(conn, DM, "## Requests\n- fix deck", 0, "hive-1")
+    await skills.put(conn, DM, "deck-tune", "tune a deck", "steps", 0, "hive-1")
+    text = await _memory_text(conn, fake, make_worker)
+    assert MEMORY_RULE in text
+    assert "<room-notes>\n## Requests\n- fix deck\n</room-notes>" in text
+    assert '<skill name="deck-tune">tune a deck</skill>' in text
+    assert "steps" not in text.replace(MEMORY_RULE, "")
+    assert text.index(ADMIN_TRUST_RULE) < text.index(MEMORY_RULE) < text.index("<chat ")
+
+
+async def test_first_prompt_rule_without_notes(conn, fake, make_worker):
+    text = await _memory_text(conn, fake, make_worker)
+    assert MEMORY_RULE in text
+    body = text.replace(MEMORY_RULE, "")
+    assert "<room-notes>" not in body and "<room-skills>" not in body
+
+
+async def test_followup_prompt_has_no_memory(conn, fake, make_worker):
+    await notes.put(conn, DM, "remember this", 0, None)
+    await add_room(conn, DM)
+    leader = add_session(fake, "hive-lead")
+    await bind_agent(conn, DM, leader)
+    await queue(conn, DM, "first")
+    worker = make_worker()
+    await worker.tick()
+    [(run_id, *_)] = await room_runs(conn, DM)
+    await finish_handled(conn, run_id)
+    await queue(conn, DM, "second")
+    await worker.tick()
+    first, second = session_messages(fake, leader)
+    assert "remember this" in first["text"] and MEMORY_RULE in first["text"]
+    assert second["text"].startswith("New messages in the chat:")
+    assert "remember this" not in second["text"] and MEMORY_RULE not in second["text"]
+
+
+async def test_first_prompt_memory_only_own_room(conn, fake, make_worker):
+    await notes.put(conn, OTHER, "other room notes", 0, None)
+    await skills.put(conn, OTHER, "other-skill", "other desc", "b", 0, None)
+    text = await _memory_text(conn, fake, make_worker)
+    assert MEMORY_RULE in text
+    body = text.replace(MEMORY_RULE, "")
+    assert "<room-notes>" not in body and "<room-skills>" not in body
+    assert "other room notes" not in text and "other-skill" not in text
+
+
+async def test_bound_session_new_to_room_gets_memory(conn, fake, make_worker):
+    """A scheduled session bound by an agent send gets the block on its first inbound batch."""
+    await notes.put(conn, THIRD, "third notes", 0, None)
+    await add_room(conn, OTHER, name="Other")
+    await add_room(conn, THIRD, name="Third")
+    other = add_session(fake, "hive-other")
+    await add_run(conn, OTHER, other, kind="follow")
+    await bind_agent(conn, THIRD, other, send_id=2)
+    await queue(conn, THIRD, "hello")
+    await make_worker().tick()
+    [message] = session_messages(fake, other)
+    assert "third notes" in message["text"] and MEMORY_RULE in message["text"]
+
+
+async def test_memory_rule_override_in_prompt(conn, fake, make_worker):
+    text = await _memory_text(conn, fake, make_worker, room_memory_rule="CUSTOM RULE")
+    assert "CUSTOM RULE" in text
+    assert MEMORY_RULE not in text
+
+
 async def test_resume_keeps_preamble_for_session_new_to_room(conn, fake, make_worker):
     await add_room(conn, DM)
     leader = add_session(fake, "hive-lead")
@@ -1199,7 +1276,9 @@ async def _first_text(conn, fake, make_worker, rule_id=None):
 async def test_preamble_default_when_nothing_overrides(conn, fake, make_worker, preset):
     await preset()
     text = await _first_text(conn, fake, make_worker)
-    assert text.startswith(DEFAULT_PREAMBLE + "\n\n" + ADMIN_TRUST_RULE + "\n\n<chat")
+    assert text.startswith(
+        DEFAULT_PREAMBLE + "\n\n" + ADMIN_TRUST_RULE + "\n\n" + MEMORY_RULE + "\n\n<chat"
+    )
 
 
 async def test_global_preamble_replaces_default_and_renders_variables(
@@ -1212,7 +1291,8 @@ async def test_global_preamble_replaces_default_and_renders_variables(
     )
     text = await _first_text(conn, fake, make_worker)
     assert text.startswith(
-        f"Global for Alice {DM} from Alice A at {T0.isoformat()}\n\n{ADMIN_TRUST_RULE}\n\n<chat"
+        f"Global for Alice {DM} from Alice A at {T0.isoformat()}\n\n{ADMIN_TRUST_RULE}\n\n"
+        f"{MEMORY_RULE}\n\n<chat"
     )
 
 
@@ -1227,7 +1307,7 @@ async def test_rule_preamble_beats_global(conn, fake, make_worker, preset):
         )
     ).fetchall()
     text = await _first_text(conn, fake, make_worker, rule_id)
-    assert text.startswith(f"Rule family\n\n{ADMIN_TRUST_RULE}\n\n<chat")
+    assert text.startswith(f"Rule family\n\n{ADMIN_TRUST_RULE}\n\n{MEMORY_RULE}\n\n<chat")
 
 
 async def test_rule_without_preamble_falls_to_global(conn, fake, make_worker, preset):
@@ -1241,14 +1321,16 @@ async def test_rule_without_preamble_falls_to_global(conn, fake, make_worker, pr
         )
     ).fetchall()
     text = await _first_text(conn, fake, make_worker, rule_id)
-    assert text.startswith(f"Global\n\n{ADMIN_TRUST_RULE}\n\n<chat")
+    assert text.startswith(f"Global\n\n{ADMIN_TRUST_RULE}\n\n{MEMORY_RULE}\n\n<chat")
 
 
 async def test_broken_stored_preamble_falls_back_to_default(conn, fake, make_worker, preset):
     await preset()
     await conn.execute("UPDATE settings SET preamble = '{{ nope }}' WHERE id = 1")
     text = await _first_text(conn, fake, make_worker)
-    assert text.startswith(DEFAULT_PREAMBLE + "\n\n" + ADMIN_TRUST_RULE + "\n\n<chat")
+    assert text.startswith(
+        DEFAULT_PREAMBLE + "\n\n" + ADMIN_TRUST_RULE + "\n\n" + MEMORY_RULE + "\n\n<chat"
+    )
 
 
 async def add_member(conn, room_id: str, user_id: str, name: str, facebook_id=None) -> None:
@@ -1287,7 +1369,8 @@ async def test_anonymized_room_shows_pseudonyms_not_names(conn, fake, make_worke
     label = pseudonym(ALICE)
     text = await anonymized_first_text(conn, fake, make_worker, True)
     assert text.startswith(
-        f'{label} / {label}\n\n{ADMIN_TRUST_RULE}\n\n<chat room="{label}" kind="dm"'
+        f"{label} / {label}\n\n{ADMIN_TRUST_RULE}\n\n{MEMORY_RULE}\n\n"
+        f'<chat room="{label}" kind="dm"'
     )
     assert f'from="{label}" facebook_id=""' in text
     assert ">I am Alice A</message>" in text
@@ -1319,5 +1402,7 @@ async def test_non_admin_message_has_no_role(conn, fake, make_worker, preset):
 async def test_room_without_flag_keeps_names(conn, fake, make_worker, preset):
     await preset()
     text = await anonymized_first_text(conn, fake, make_worker, False)
-    assert text.startswith(f'Alice A / Alice A\n\n{ADMIN_TRUST_RULE}\n\n<chat room="Alice A"')
+    assert text.startswith(
+        f'Alice A / Alice A\n\n{ADMIN_TRUST_RULE}\n\n{MEMORY_RULE}\n\n<chat room="Alice A"'
+    )
     assert 'from="Alice A" facebook_id="111"' in text
