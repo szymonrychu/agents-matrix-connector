@@ -46,6 +46,14 @@ class ConnectorSettings(BaseServiceSettings):
     agent_rate_per_minute: int = Field(20, ge=1)
     agent_room_chunks_per_hour: int = Field(60, ge=1)
     room_requests_per_hour: int = Field(10, ge=1)
+    room_notes_max_chars: int = Field(8000, ge=100, le=32000)
+    """Max characters (code points) of one room's notes."""
+    room_skill_max_chars: int = Field(8000, ge=100, le=32000)
+    """Max characters (code points) of one room skill body."""
+    room_skills_max: int = Field(20, ge=1, le=100)
+    """Max skills per room."""
+    room_memory_rule: str = ""
+    """Replaces `prompt.MEMORY_RULE` in first prompts and the notes GET; empty keeps it."""
     anonymize_admins: CsvList = []
     """Matrix user ids or numeric Facebook ids shown as `admin-<sha>` in anonymized rooms."""
 

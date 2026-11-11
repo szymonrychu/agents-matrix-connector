@@ -54,6 +54,10 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR` | 60 | api | max Matrix events (message chunks of `MATRIX_REPLY_CHUNK_CHARS`, one per reaction) that agent sends may put into one room in the last hour, all sessions together (>= 1) |
 | `MATRIX_ANONYMIZE_ADMINS` | empty | api, bot | Matrix user ids or numeric Facebook ids, comma separated, shown as `admin-<sha>` instead of `user-<sha>` in rooms with `anonymize_names` |
 | `MATRIX_ROOM_REQUESTS_PER_HOUR` | 10 | api | max open and invite room requests created in the last hour, all sessions together (>= 1); more answer 429 `rate_limited` |
+| `MATRIX_ROOM_NOTES_MAX_CHARS` | 8000 | api | max characters of one room's notes (100 to 32000); a longer PUT is 413 `notes_too_large` |
+| `MATRIX_ROOM_SKILL_MAX_CHARS` | 8000 | api | max characters of one skill body (100 to 32000); longer is 413 `skill_too_large` |
+| `MATRIX_ROOM_SKILLS_MAX` | 20 | api | max skills per room (1 to 100); another create is 409 `skill_limit` |
+| `MATRIX_ROOM_MEMORY_RULE` | empty | worker and api | replaces the built-in room memory rule in first prompts and the notes GET; empty keeps the built-in |
 | `MATRIX_ACCESS_TOKEN` | none | bot | Matrix access token (required unless the file is set) |
 | `MATRIX_ACCESS_TOKEN_FILE` | empty | bot | file holding the Matrix access token; wins over the variable, stripped |
 | `MATRIX_BRIDGE_PROVISIONING_URL` | empty | bot | mautrix-meta provisioning base, e.g. `http://mautrix-meta.messaging.svc.cluster.local:29328/_matrix/provision`, called with the bot's own Matrix token; empty fails Facebook targets with `bridge_unconfigured` |

@@ -23,6 +23,12 @@ MATRIX_RETENTION_DAYS: {{ .Values.limits.retentionDays | int | toString | quote 
 MATRIX_AGENT_PORT: {{ .Values.agentApi.port | int | toString | quote }}
 MATRIX_AGENT_RATE_PER_MINUTE: {{ .Values.limits.agentRatePerMinute | int | toString | quote }}
 MATRIX_ROOM_REQUESTS_PER_HOUR: {{ .Values.limits.roomRequestsPerHour | int | toString | quote }}
+MATRIX_ROOM_NOTES_MAX_CHARS: {{ .Values.limits.roomNotesMaxChars | int | toString | quote }}
+MATRIX_ROOM_SKILL_MAX_CHARS: {{ .Values.limits.roomSkillMaxChars | int | toString | quote }}
+MATRIX_ROOM_SKILLS_MAX: {{ .Values.limits.roomSkillsMax | int | toString | quote }}
+{{- with .Values.roomMemory.rule }}
+MATRIX_ROOM_MEMORY_RULE: {{ . | quote }}
+{{- end }}
 {{- range $k, $v := .Values.env }}
 {{- if not (hasPrefix "MATRIX_" $k) }}
 {{- fail (printf "agents-matrix-connector: env key %q must start with MATRIX_" $k) }}

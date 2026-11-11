@@ -352,6 +352,22 @@ def test_config_room_requests_per_hour():
     assert _config({"limits": {"roomRequestsPerHour": 4}})["MATRIX_ROOM_REQUESTS_PER_HOUR"] == "4"
 
 
+def test_config_room_memory():
+    data = _config()
+    assert data["MATRIX_ROOM_NOTES_MAX_CHARS"] == "8000"
+    assert data["MATRIX_ROOM_SKILL_MAX_CHARS"] == "8000"
+    assert data["MATRIX_ROOM_SKILLS_MAX"] == "20"
+    assert "MATRIX_ROOM_MEMORY_RULE" not in data
+    assert _config({"roomMemory": {"rule": "x"}})["MATRIX_ROOM_MEMORY_RULE"] == "x"
+    limits = {"limits": {"roomNotesMaxChars": 100, "roomSkillMaxChars": 200, "roomSkillsMax": 3}}
+    data = _config(limits)
+    assert (data["MATRIX_ROOM_NOTES_MAX_CHARS"], data["MATRIX_ROOM_SKILL_MAX_CHARS"]) == (
+        "100",
+        "200",
+    )
+    assert data["MATRIX_ROOM_SKILLS_MAX"] == "3"
+
+
 def test_config_anonymize_admins():
     assert _config()["MATRIX_ANONYMIZE_ADMINS"] == ""
     admins = {"anonymize": {"admins": ["@facebook_1:x", "2"]}}
