@@ -9,8 +9,9 @@ token and its hash never reach a log line or an error body. Probes stay open.
 The `/chat/v1` routes (design D2, D4, D5, D6) act for the session named by `X-Orch-Session`.
 They list the rooms the session may post to, queue messages and reactions as `sends` rows and
 read a send's status. One predicate, `may_post`, decides every room for the send routes and the
-listing. The api only inserts `sends` rows and never writes `room_bindings`: the bot's claim of
-a send re-checks the room and is the binding step (D9).
+listing. The api inserts `sends` rows and writes `room_notes` and `room_skills`, but never
+`room_bindings`: the bot's claim of a send re-checks the room and is the binding step (D9).
+The notes and skills routes never take a room: it is the caller session's active binding.
 """
 
 import hashlib
@@ -44,7 +45,8 @@ from agents_matrix_connector.api.rooms import agent_room_decision, build_rooms_r
 from agents_matrix_connector.api.rules import build_rules_router
 from agents_matrix_connector.api.schemas import ApiError
 from agents_matrix_connector.chunks import split
-from agents_matrix_connector.db import bindings, directory, rules, sends
+from agents_matrix_connector.db import bindings, directory, notes, rules, sends, skills
+from agents_matrix_connector.prompt import memory_rule
 from agents_matrix_connector.settings import ApiSettings, ConnectorSettings
 
 log = logging.getLogger(__name__)
@@ -75,6 +77,8 @@ DUPLICATE_SECONDS = 60
 RATE_WINDOW_SECONDS = 60
 ROOM_WINDOW_SECONDS = 3600
 SLUG_MAX = 40
+SKILL_DESCRIPTION_MAX = 1024
+_SKILL_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}", re.ASCII)
 _SLUG_RE = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", re.ASCII)
 _UNUSABLE_REFERENCE = "not a message id (m<n> or s<n>) this session can reference"
 
@@ -227,6 +231,66 @@ class SendStatus(BaseModel):
     sent_at: datetime | None
 
 
+class NotesIn(_Body):
+    body: str
+    """The whole notes body; empty forgets the notes."""
+    expected_version: int = Field(ge=0)
+    """The version read before (0 when none exists yet); a stale one is 409 version_conflict."""
+
+
+class RoomNotes(BaseModel):
+    room_id: str
+    body: str
+    version: int
+    updated_at: datetime | None
+    chars: int
+    max_chars: int
+    rule: str
+    """The room memory rule: how to keep notes and skills."""
+
+
+class SkillIn(_Body):
+    description: str = Field(min_length=1, max_length=SKILL_DESCRIPTION_MAX)
+    """When to use the skill (becomes the SKILL.md description)."""
+    body: str = Field(min_length=1)
+    """The skill's steps with their inputs (becomes the SKILL.md content)."""
+    expected_version: int = Field(ge=0)
+    """The version read before (0 to create); a stale one is 409 version_conflict."""
+
+
+class SkillMeta(BaseModel):
+    name: str
+    description: str
+    version: int
+    updated_at: datetime
+    chars: int
+
+
+class RoomSkills(BaseModel):
+    room_id: str
+    skills: list[SkillMeta]
+    max_skills: int
+    max_chars: int
+
+
+class RoomSkill(BaseModel):
+    room_id: str
+    name: str
+    description: str
+    body: str
+    version: int
+    updated_at: datetime
+    chars: int
+    max_chars: int
+
+
+class SkillDeleted(BaseModel):
+    room_id: str
+    name: str
+    deleted: bool
+    """Always true on 200."""
+
+
 class ErrorDetail(BaseModel):
     code: str
     message: str
@@ -288,6 +352,41 @@ def valid_slug(slug: str) -> bool:
         and slug != "orchestrator"
         and not slug.startswith("orchestrator-")
     )
+
+
+_ROOM_UNBOUND = "this session is not bound to a chat room"
+
+
+async def _own_room(conn: psycopg.AsyncConnection, who: Caller) -> str:
+    """The room of the caller session's active binding; never a request parameter."""
+    own = await bindings.active_for_session(conn, who.session_id)
+    if own is None:
+        raise ApiError(409, "room_unbound", _ROOM_UNBOUND)
+    return own.room_id
+
+
+def _version_conflict(expected: int, current: int) -> ApiError:
+    return ApiError(
+        409,
+        "version_conflict",
+        f"changed since version {expected}; current version is {current}: re-read and merge",
+    )
+
+
+def _skill_name(name: str) -> str:
+    """A valid skill name (a SKILL.md directory name), else 422."""
+    if _SKILL_NAME_RE.fullmatch(name) is None:
+        raise ApiError(
+            422,
+            "invalid_request",
+            "name: lowercase letters, digits and hyphens, 1 to 64 characters, starting with a "
+            "letter or digit",
+        )
+    return name
+
+
+def _skill_not_found() -> ApiError:
+    return ApiError(404, "skill_not_found", "no skill with that name in this room")
 
 
 def _bad_reference(field: str, why: str) -> ApiError:
@@ -564,6 +663,177 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
             created_at=row.created_at,
             sent_at=row.sent_at,
         )
+
+    notes_errors = _errors(400, 401, 409, 413, 422, 503)
+
+    def room_notes(room_id: str, row: notes.NotesRow | None) -> RoomNotes:
+        body = row.body if row else ""
+        return RoomNotes(
+            room_id=room_id,
+            body=body,
+            version=row.version if row else 0,
+            updated_at=row.updated_at if row else None,
+            chars=len(body),
+            max_chars=settings.room_notes_max_chars,
+            rule=memory_rule(settings),
+        )
+
+    @router.get("/notes", response_model=RoomNotes, responses=_errors(400, 401, 409, 503))
+    async def get_notes(who: Annotated[Caller, Depends(caller)]) -> RoomNotes:
+        """The notes of the room this session is bound to (empty, version 0, when none), with
+        the room memory rule."""
+        async with pool.connection() as conn:
+            room_id = await _own_room(conn, who)
+            row = await notes.get(conn, room_id)
+        log.info(
+            "notes read session=%s room=%s version=%s",
+            who.session_id,
+            room_id,
+            row.version if row else 0,
+        )
+        return room_notes(room_id, row)
+
+    @router.put("/notes", response_model=RoomNotes, responses=notes_errors)
+    async def put_notes(who: Annotated[Caller, Depends(caller)], body: NotesIn) -> RoomNotes:
+        """Replace the notes of the room this session is bound to, guarded by the version read
+        before (0 creates); an empty body forgets them. Over the cap is 413."""
+        cap = settings.room_notes_max_chars
+        if len(body.body) > cap:
+            raise ApiError(
+                413,
+                "notes_too_large",
+                f"body: at most {cap} characters, got {len(body.body)}",
+            )
+        async with pool.connection() as conn, conn.transaction():
+            room_id = await _own_room(conn, who)
+            row = await notes.put(conn, room_id, body.body, body.expected_version, who.slug)
+            if row is None:
+                current = await notes.get(conn, room_id)
+                raise _version_conflict(body.expected_version, current.version if current else 0)
+        log.info(
+            "notes write session=%s room=%s version=%s chars=%s",
+            who.session_id,
+            room_id,
+            row.version,
+            len(row.body),
+        )
+        return room_notes(room_id, row)
+
+    skill_errors = _errors(400, 401, 404, 409, 422, 503)
+
+    def room_skill(row: skills.SkillRow) -> RoomSkill:
+        return RoomSkill(
+            room_id=row.room_id,
+            name=row.name,
+            description=row.description,
+            body=row.body,
+            version=row.version,
+            updated_at=row.updated_at,
+            chars=len(row.body),
+            max_chars=settings.room_skill_max_chars,
+        )
+
+    @router.get("/skills", response_model=RoomSkills, responses=_errors(400, 401, 409, 503))
+    async def list_skills(who: Annotated[Caller, Depends(caller)]) -> RoomSkills:
+        """The skills of the room this session is bound to: name, description and version, no
+        bodies."""
+        async with pool.connection() as conn:
+            room_id = await _own_room(conn, who)
+            rows = await skills.list_for_room(conn, room_id)
+        log.info("skill list session=%s room=%s count=%s", who.session_id, room_id, len(rows))
+        return RoomSkills(
+            room_id=room_id,
+            skills=[
+                SkillMeta(
+                    name=row.name,
+                    description=row.description,
+                    version=row.version,
+                    updated_at=row.updated_at,
+                    chars=len(row.body),
+                )
+                for row in rows
+            ],
+            max_skills=settings.room_skills_max,
+            max_chars=settings.room_skill_max_chars,
+        )
+
+    @router.get("/skills/{name}", response_model=RoomSkill, responses=skill_errors)
+    async def get_skill(who: Annotated[Caller, Depends(caller)], name: str) -> RoomSkill:
+        """One skill of the room this session is bound to, with its body."""
+        _skill_name(name)
+        async with pool.connection() as conn:
+            room_id = await _own_room(conn, who)
+            row = await skills.get(conn, room_id, name)
+        if row is None:
+            raise _skill_not_found()
+        log.info(
+            "skill read session=%s room=%s name=%s version=%s chars=%s",
+            who.session_id,
+            room_id,
+            name,
+            row.version,
+            len(row.body),
+        )
+        return room_skill(row)
+
+    @router.put("/skills/{name}", response_model=RoomSkill, responses=_errors(*skill_errors, 413))
+    async def put_skill(
+        who: Annotated[Caller, Depends(caller)], name: str, body: SkillIn
+    ) -> RoomSkill:
+        """Create (`expected_version` 0) or replace a skill of the room this session is bound
+        to. Over `MATRIX_ROOM_SKILL_MAX_CHARS` is 413; a create past `MATRIX_ROOM_SKILLS_MAX`
+        is 409 `skill_limit`."""
+        _skill_name(name)
+        cap = settings.room_skill_max_chars
+        if len(body.body) > cap:
+            raise ApiError(
+                413, "skill_too_large", f"body: at most {cap} characters, got {len(body.body)}"
+            )
+        async with pool.connection() as conn, conn.transaction():
+            room_id = await _own_room(conn, who)
+            await skills.lock_room(conn, room_id)
+            existing = await skills.get(conn, room_id, name)
+            if existing is None:
+                if body.expected_version > 0:
+                    raise _skill_not_found()
+                if await skills.count(conn, room_id) >= settings.room_skills_max:
+                    raise ApiError(
+                        409,
+                        "skill_limit",
+                        f"at most {settings.room_skills_max} skills per room: delete one first",
+                    )
+            row = await skills.put(
+                conn,
+                room_id,
+                name,
+                body.description,
+                body.body,
+                body.expected_version,
+                who.slug,
+            )
+            if row is None:
+                raise _version_conflict(body.expected_version, existing.version if existing else 0)
+        log.info(
+            "skill write session=%s room=%s name=%s version=%s chars=%s",
+            who.session_id,
+            room_id,
+            name,
+            row.version,
+            len(row.body),
+        )
+        return room_skill(row)
+
+    @router.delete("/skills/{name}", response_model=SkillDeleted, responses=skill_errors)
+    async def delete_skill(who: Annotated[Caller, Depends(caller)], name: str) -> SkillDeleted:
+        """Delete a skill of the room this session is bound to."""
+        _skill_name(name)
+        async with pool.connection() as conn, conn.transaction():
+            room_id = await _own_room(conn, who)
+            deleted = await skills.delete(conn, room_id, name)
+        if not deleted:
+            raise _skill_not_found()
+        log.info("skill delete session=%s room=%s name=%s", who.session_id, room_id, name)
+        return SkillDeleted(room_id=room_id, name=name, deleted=True)
 
     return router
 

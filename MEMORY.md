@@ -2,6 +2,35 @@
 
 Lessons that outlive a session. Newest first.
 
+## 2026-11-11 decisions
+
+- Per-room notes and skills (T-124): tables `room_notes` and `room_skills`, single writer api;
+  the worker only reads them to build first prompts. Why: a room's context must outlive its
+  sessions and bindings (a session is replaced, the room stays), and one writer keeps the
+  one-writer-per-table rule.
+- The room is never a request parameter: every notes and skills route resolves it from the
+  caller session's active binding (`bindings.active_for_session`), so a session cannot reach
+  another room's data and a rebound room keeps its notes (no FK to `rooms` either: notes
+  outlive a pruned room row).
+- Optimistic version, 0 = create; a stale version is 409 `version_conflict` and the body is
+  unchanged. Two writers on one room (a retried PUT, two sessions over time) cannot silently
+  overwrite each other; the loser re-reads and merges.
+- Caps are our own connector caps counted in code points (`len(str)`), not a wrapper or hook
+  limit: notes 8000, skill body 8000, 20 skills per room, description 1024 (below Claude Code's
+  1,536 skill-listing truncation). The skill count cap is checked under a per-room advisory lock
+  so concurrent creates cannot pass it.
+- Bodies and descriptions are never logged or echoed in errors (log room id, name, version and
+  char count only): they are readable data, but a room's notes can hold private chat content.
+- One rule constant, `prompt.MEMORY_RULE`, is injected with the notes and the skill index into
+  every first prompt (after the trust rule) and returned by the notes GET, so scheduled
+  sessions that never get a chat batch first can read it there; `MATRIX_ROOM_MEMORY_RULE`
+  overrides it. No preset carries the rule, so changing it needs no preset edit. Injected notes
+  and skill names/descriptions are escaped like chat bodies and framed as facts, not
+  instructions; the rule is the only imperative text.
+- Skills materialize as `$CLAUDE_CONFIG_DIR/skills/<name>/SKILL.md` written by the agent, never
+  in the working directory: the workdir is cached per preset and shared across rooms, so a skill
+  there would leak into other rooms.
+
 ## 2026-11-07 decisions
 
 - 409 `room_bound` names the occupier (`error.occupier`, the bound session id) so the

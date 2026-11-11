@@ -61,7 +61,16 @@ from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector import anonymize, discovery, prompt
 from agents_matrix_connector.clock import utcnow
-from agents_matrix_connector.db import bindings, directory, holds, inbound, rules, runs
+from agents_matrix_connector.db import (
+    bindings,
+    directory,
+    holds,
+    inbound,
+    notes,
+    rules,
+    runs,
+    skills,
+)
 from agents_matrix_connector.db.bindings import BindingRow
 from agents_matrix_connector.db.inbound import InboundRow
 from agents_matrix_connector.matrix import MatrixClient, MatrixError
@@ -465,10 +474,23 @@ class Worker:
             (room.kind if room else None) or "",
             batch.rows,
             first=first,
+            memory=await self._memory(batch.room_id) if first else "",
             facebook_id=facebook_id,
             preamble=await self._preamble(batch, room_name, sender) if first else "",
             sender=sender,
             is_admin=self._is_admin,
+        )
+
+    async def _memory(self, room_id: str) -> str:
+        """The room memory block of a first prompt: the rule, the room's notes and the index of
+        its skills. Only this room's rows are read; bodies are never logged."""
+        async with self._pool.connection() as conn:
+            row = await notes.get(conn, room_id)
+            room_skills = await skills.list_for_room(conn, room_id)
+        return prompt.memory_block(
+            prompt.memory_rule(self._settings),
+            row.body if row else "",
+            [(skill.name, skill.description) for skill in room_skills],
         )
 
     def _is_admin(self, row: InboundRow) -> bool:

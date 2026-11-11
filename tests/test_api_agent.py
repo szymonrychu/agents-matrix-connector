@@ -15,13 +15,14 @@ from datetime import datetime
 
 import httpx
 import pytest
-from api_helpers import BOT, make_settings
+from api_helpers import BOT, DM, GRP, make_settings
 from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector.anonymize import pseudonym
 from agents_matrix_connector.api import agent as agent_api
 from agents_matrix_connector.api.agent import CHAT_PREFIX, create_agent_app, valid_key
 from agents_matrix_connector.db.sends import parse_ref
+from agents_matrix_connector.prompt import MEMORY_RULE
 
 TOKEN = secrets.token_hex(32)
 DIGEST = hashlib.sha256(TOKEN.encode()).hexdigest()
@@ -1243,3 +1244,350 @@ async def test_anonymized_room_names_listed_as_pseudonyms(agent, conn):
         await anonymize(conn, room)
     names = {r["room_id"]: r["name"] for r in await listed(agent, uuid.uuid4())}
     assert names == {dm: pseudonym(ALICE), group: f"{pseudonym(ALICE)}, {pseudonym(BOB)}"}
+
+
+# --- room notes --------------------------------------------------------------------------------
+
+NOTES_CANARY = "CANARY-NOTES-7f3a"
+
+
+async def notes_get(agent, session_id) -> httpx.Response:
+    return await agent.get("/notes", headers=as_(session_id))
+
+
+async def notes_put(agent, session_id, body, version) -> httpx.Response:
+    return await agent.put(
+        "/notes", json={"body": body, "expected_version": version}, headers=as_(session_id)
+    )
+
+
+async def bound_session(conn, room=DM, slug="hive-1") -> uuid.UUID:
+    session = uuid.uuid4()
+    await bind(conn, room, session, slug)
+    return session
+
+
+async def test_notes_unbound_session_refused(agent, conn):
+    session = uuid.uuid4()
+    refused(await notes_get(agent, session), 409, "room_unbound")
+    r = await notes_put(agent, session, "x", 0)
+    refused(r, 409, "room_unbound")
+    assert r.json()["error"]["message"] == "this session is not bound to a chat room"
+    assert (await (await conn.execute("SELECT count(*) FROM room_notes")).fetchone())[0] == 0
+
+
+async def test_notes_round_trip(agent, conn):
+    session = await bound_session(conn)
+    r = await notes_get(agent, session)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "room_id": DM,
+        "body": "",
+        "version": 0,
+        "updated_at": None,
+        "chars": 0,
+        "max_chars": 8000,
+        "rule": MEMORY_RULE,
+    }
+    r = await notes_put(agent, session, "## Requests\n- fix deck", 0)
+    assert r.status_code == 200, r.text
+    put = r.json()
+    assert (put["room_id"], put["body"], put["version"], put["chars"]) == (
+        DM,
+        "## Requests\n- fix deck",
+        1,
+        len("## Requests\n- fix deck"),
+    )
+    assert put["updated_at"] is not None
+    got = (await notes_get(agent, session)).json()
+    assert got == put
+    cleared = (await notes_put(agent, session, "", 1)).json()
+    assert (cleared["body"], cleared["version"], cleared["chars"]) == ("", 2, 0)
+
+
+async def test_notes_rule_override(agent_for, conn):
+    session = await bound_session(conn)
+    r = await notes_get(agent_for(room_memory_rule="R"), session)
+    assert r.json()["rule"] == "R"
+
+
+async def test_notes_isolated_between_rooms(agent, conn):
+    a, b = await bound_session(conn, DM), await bound_session(conn, GRP, "hive-2")
+    await notes_put(agent, a, "secret of A", 0)
+    got = (await notes_get(agent, b)).json()
+    assert (got["room_id"], got["body"], got["version"]) == (GRP, "", 0)
+    r = await notes_put(agent, b, "B writes", 0)
+    assert r.json()["room_id"] == GRP
+    assert (await notes_get(agent, a)).json()["body"] == "secret of A"
+    rows = await (await conn.execute("SELECT room_id, body FROM room_notes ORDER BY 1")).fetchall()
+    assert rows == [(DM, "secret of A"), (GRP, "B writes")]
+
+
+async def test_notes_follow_rebinding(agent, conn):
+    a = await bound_session(conn, DM)
+    await notes_put(agent, a, "room one notes", 0)
+    await conn.execute(
+        "UPDATE room_bindings SET released_at = now(), release_reason = 'test'"
+        " WHERE session_id = %s",
+        (a,),
+    )
+    c = await bound_session(conn, DM, "hive-3")
+    got = (await notes_get(agent, c)).json()
+    assert (got["body"], got["version"]) == ("room one notes", 1)
+    refused(await notes_get(agent, a), 409, "room_unbound")
+    refused(await notes_put(agent, a, "stale", 1), 409, "room_unbound")
+    assert (await notes_get(agent, c)).json()["body"] == "room one notes"
+
+
+async def test_notes_stale_version_conflict(agent, conn):
+    session = await bound_session(conn)
+    await notes_put(agent, session, "one", 0)
+    assert (await notes_put(agent, session, "two", 1)).status_code == 200
+    r = await notes_put(agent, session, "three", 1)
+    refused(r, 409, "version_conflict")
+    assert r.json()["error"]["message"] == (
+        "changed since version 1; current version is 2: re-read and merge"
+    )
+    r = await notes_put(agent, session, "again", 0)
+    refused(r, 409, "version_conflict")
+    got = (await notes_get(agent, session)).json()
+    assert (got["body"], got["version"]) == ("two", 2)
+
+
+async def test_notes_cap_counts_code_points(agent, agent_for, conn):
+    session = await bound_session(conn)
+    emoji = "\U0001f600"
+    r = await notes_put(agent, session, emoji * 8000, 0)
+    assert r.status_code == 200, r.text
+    assert r.json()["chars"] == 8000
+    r = await notes_put(agent, session, emoji * 8001, 1)
+    refused(r, 413, "notes_too_large")
+    message = r.json()["error"]["message"]
+    assert "8000" in message and "8001" in message
+    small = agent_for(room_notes_max_chars=100)
+    assert (await notes_put(small, session, "x" * 100, 1)).status_code == 200
+    refused(await notes_put(small, session, "x" * 101, 2), 413, "notes_too_large")
+    assert (await notes_get(small, session)).json()["max_chars"] == 100
+
+
+async def test_notes_body_never_logged(agent, conn, caplog):
+    caplog.set_level("DEBUG")
+    session = await bound_session(conn)
+    body = f"{NOTES_CANARY} " + "y" * 20
+    r = await notes_put(agent, session, body, 0)
+    assert r.status_code == 200
+    await notes_get(agent, session)
+    stale = await notes_put(agent, session, body, 0)
+    big = await notes_put(agent, session, NOTES_CANARY * 2000, 1)
+    bad = await agent.put(
+        "/notes", json={"body": NOTES_CANARY, "expected_version": -1}, headers=as_(session)
+    )
+    assert bad.status_code == 422
+    for response in (stale, big, bad):
+        assert NOTES_CANARY not in response.text
+    assert NOTES_CANARY not in caplog.text
+
+
+async def test_notes_validation(agent, conn):
+    session = await bound_session(conn)
+    for payload in (
+        {"body": "x"},
+        {"expected_version": 0},
+        {"body": "x", "expected_version": -1},
+        {"body": "x", "expected_version": 0, "room": DM},
+        {"body": 5, "expected_version": 0},
+    ):
+        r = await agent.put("/notes", json=payload, headers=as_(session))
+        refused(r, 422, "invalid_request")
+    assert (await notes_get(agent, session)).json()["version"] == 0
+
+
+# --- room skills -------------------------------------------------------------------------------
+
+SKILL_CANARY = "CANARY-SKILL-91bc"
+
+
+async def skills_list(agent, session_id) -> httpx.Response:
+    return await agent.get("/skills", headers=as_(session_id))
+
+
+async def skill_get(agent, session_id, name) -> httpx.Response:
+    return await agent.get(f"/skills/{name}", headers=as_(session_id))
+
+
+async def skill_put(
+    agent, session_id, name, version=0, *, description="when to use it", body="the steps"
+) -> httpx.Response:
+    return await agent.put(
+        f"/skills/{name}",
+        json={"description": description, "body": body, "expected_version": version},
+        headers=as_(session_id),
+    )
+
+
+async def skill_delete(agent, session_id, name) -> httpx.Response:
+    return await agent.delete(f"/skills/{name}", headers=as_(session_id))
+
+
+async def test_skills_unbound_session_refused(agent, conn):
+    session = uuid.uuid4()
+    refused(await skills_list(agent, session), 409, "room_unbound")
+    refused(await skill_get(agent, session, "deck-tune"), 409, "room_unbound")
+    refused(await skill_put(agent, session, "deck-tune"), 409, "room_unbound")
+    refused(await skill_delete(agent, session, "deck-tune"), 409, "room_unbound")
+    assert (await (await conn.execute("SELECT count(*) FROM room_skills")).fetchone())[0] == 0
+
+
+async def test_skills_round_trip(agent, conn):
+    session = await bound_session(conn)
+    r = await skills_list(agent, session)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"room_id": DM, "skills": [], "max_skills": 20, "max_chars": 8000}
+    r = await skill_put(agent, session, "deck-tune", description="tune a deck", body="1. do it")
+    assert r.status_code == 200, r.text
+    saved = r.json()
+    assert (saved["room_id"], saved["name"], saved["description"]) == (
+        DM,
+        "deck-tune",
+        "tune a deck",
+    )
+    assert (saved["body"], saved["version"], saved["chars"], saved["max_chars"]) == (
+        "1. do it",
+        1,
+        len("1. do it"),
+        8000,
+    )
+    assert saved["updated_at"]
+    listing = (await skills_list(agent, session)).json()
+    assert listing["skills"] == [
+        {
+            "name": "deck-tune",
+            "description": "tune a deck",
+            "version": 1,
+            "updated_at": saved["updated_at"],
+            "chars": len("1. do it"),
+        }
+    ]
+    assert (await skill_get(agent, session, "deck-tune")).json() == saved
+    r = await skill_delete(agent, session, "deck-tune")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"room_id": DM, "name": "deck-tune", "deleted": True}
+    refused(await skill_get(agent, session, "deck-tune"), 404, "skill_not_found")
+    refused(await skill_delete(agent, session, "deck-tune"), 404, "skill_not_found")
+
+
+async def test_skills_isolated_between_rooms(agent, conn):
+    a, b = await bound_session(conn, DM), await bound_session(conn, GRP, "hive-2")
+    await skill_put(agent, a, "deck-tune", body="A's steps")
+    assert (await skills_list(agent, b)).json()["skills"] == []
+    refused(await skill_get(agent, b, "deck-tune"), 404, "skill_not_found")
+    refused(await skill_delete(agent, b, "deck-tune"), 404, "skill_not_found")
+    refused(await skill_put(agent, b, "deck-tune", 1, body="B over A"), 404, "skill_not_found")
+    r = await skill_put(agent, b, "deck-tune", body="B's own")
+    assert r.status_code == 200 and r.json()["room_id"] == GRP
+    rows = await (
+        await conn.execute("SELECT room_id, body, version FROM room_skills ORDER BY room_id")
+    ).fetchall()
+    assert rows == [(DM, "A's steps", 1), (GRP, "B's own", 1)]
+    assert (await skill_get(agent, a, "deck-tune")).json()["body"] == "A's steps"
+
+
+async def test_skill_caps(agent, agent_for, conn):
+    session = await bound_session(conn)
+    emoji = "\U0001f600"
+    assert (await skill_put(agent, session, "big", body=emoji * 8000)).status_code == 200
+    r = await skill_put(agent, session, "big", 1, body=emoji * 8001)
+    refused(r, 413, "skill_too_large")
+    message = r.json()["error"]["message"]
+    assert "8000" in message and "8001" in message
+    r = await skill_put(agent, session, "desc", description="d" * 1025)
+    refused(r, 422, "invalid_request")
+    assert (await skill_put(agent, session, "desc", description="d" * 1024)).status_code == 200
+    refused(await skill_put(agent, session, "empty", body=""), 422, "invalid_request")
+    refused(await skill_put(agent, session, "nodesc", description=""), 422, "invalid_request")
+
+    other = await bound_session(conn, GRP, "hive-2")
+    two = agent_for(room_skills_max=2)
+    assert (await skill_put(two, other, "one")).status_code == 200
+    assert (await skill_put(two, other, "two")).status_code == 200
+    r = await skill_put(two, other, "three")
+    refused(r, 409, "skill_limit")
+    assert r.json()["error"]["message"] == "at most 2 skills per room: delete one first"
+    assert (await skill_put(two, other, "two", 1, body="updated")).status_code == 200
+    small = agent_for(room_skill_max_chars=100)
+    refused(await skill_put(small, other, "two", 2, body="x" * 101), 413, "skill_too_large")
+    assert (await skills_list(small, other)).json()["max_chars"] == 100
+
+
+async def test_skill_count_cap_holds_concurrently(agent_for, conn):
+    session = await bound_session(conn)
+    one = agent_for(room_skills_max=1)
+    results = await asyncio.gather(
+        skill_put(one, session, "alpha"), skill_put(one, session, "beta")
+    )
+    assert sorted(r.status_code for r in results) == [200, 409]
+    loser = next(r for r in results if r.status_code == 409)
+    assert code(loser) == "skill_limit"
+    assert (await (await conn.execute("SELECT count(*) FROM room_skills")).fetchone())[0] == 1
+
+
+@pytest.mark.parametrize("name", ["Bad", "-x", "a" * 65, "a.b", "a_b", "x y"])
+async def test_skill_bad_name_refused(agent, conn, name):
+    session = await bound_session(conn)
+    refused(await skill_put(agent, session, name), 422, "invalid_request")
+    refused(await skill_get(agent, session, name), 422, "invalid_request")
+    refused(await skill_delete(agent, session, name), 422, "invalid_request")
+    assert (await (await conn.execute("SELECT count(*) FROM room_skills")).fetchone())[0] == 0
+
+
+async def test_skill_name_limits_accepted(agent, conn):
+    session = await bound_session(conn)
+    for name in ("a", "0", "a" * 64, "a-b-1"):
+        assert (await skill_put(agent, session, name)).status_code == 200, name
+
+
+async def test_skill_stale_version_conflict(agent, conn):
+    session = await bound_session(conn)
+    await skill_put(agent, session, "deck-tune", body="one")
+    assert (await skill_put(agent, session, "deck-tune", 1, body="two")).status_code == 200
+    r = await skill_put(agent, session, "deck-tune", 1, body="three")
+    refused(r, 409, "version_conflict")
+    assert r.json()["error"]["message"] == (
+        "changed since version 1; current version is 2: re-read and merge"
+    )
+    r = await skill_put(agent, session, "deck-tune", 0, body="again")
+    refused(r, 409, "version_conflict")
+    got = (await skill_get(agent, session, "deck-tune")).json()
+    assert (got["body"], got["version"]) == ("two", 2)
+
+
+async def test_skill_update_missing_is_404(agent, conn):
+    session = await bound_session(conn)
+    refused(await skill_put(agent, session, "ghost", 3), 404, "skill_not_found")
+
+
+async def test_skill_body_never_logged(agent, agent_for, conn, caplog):
+    caplog.set_level("DEBUG")
+    session = await bound_session(conn)
+    text = f"{SKILL_CANARY} payload"
+    r = await skill_put(agent, session, "deck-tune", description=text, body=text)
+    assert r.status_code == 200
+    await skills_list(agent, session)
+    await skill_get(agent, session, "deck-tune")
+    responses = [
+        await skill_put(agent, session, "deck-tune", 0, description=text, body=text),
+        await skill_put(agent, session, "deck-tune", 1, description=SKILL_CANARY * 200, body=text),
+        await skill_put(
+            agent_for(room_skill_max_chars=100), session, "deck-tune", 1, body=text * 20
+        ),
+        await skill_put(agent, session, "Bad Name", description=text, body=text),
+        await skill_put(
+            agent_for(room_skills_max=1), session, "other", description=text, body=text
+        ),
+        await skill_put(agent, session, "ghost", 4, description=text, body=text),
+    ]
+    assert [r.status_code for r in responses] == [409, 422, 413, 422, 409, 404]
+    for response in responses:
+        assert SKILL_CANARY not in response.text
+    await skill_delete(agent, session, "deck-tune")
+    assert SKILL_CANARY not in caplog.text

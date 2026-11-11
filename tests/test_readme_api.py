@@ -146,6 +146,12 @@ def test_readme_lists_every_agent_route() -> None:
         f"POST {CHAT_PREFIX}/messages",
         f"POST {CHAT_PREFIX}/reactions",
         f"GET {CHAT_PREFIX}/messages/{{id}}",
+        f"GET {CHAT_PREFIX}/notes",
+        f"PUT {CHAT_PREFIX}/notes",
+        f"GET {CHAT_PREFIX}/skills",
+        f"GET {CHAT_PREFIX}/skills/{{name}}",
+        f"PUT {CHAT_PREFIX}/skills/{{name}}",
+        f"DELETE {CHAT_PREFIX}/skills/{{name}}",
         f"GET {CHAT_PREFIX}/admin/rooms",
         f"GET {CHAT_PREFIX}/admin/rooms/{{room_id}}",
         f"POST {CHAT_PREFIX}/admin/rooms/{{room_id}}/allow",
@@ -177,6 +183,12 @@ def test_readme_lists_every_agent_route() -> None:
         anonymize.PSEUDONYM_DISCLOSED,
         "invalid_slug",
         "unavailable",
+        "room_unbound",
+        "version_conflict",
+        "notes_too_large",
+        "skill_not_found",
+        "skill_too_large",
+        "skill_limit",
     ):
         assert f"`{code}`" in agent, f"README Agent API does not name error code {code}"
     for status in ("queued", "sending", "sent", "failed", "refused"):

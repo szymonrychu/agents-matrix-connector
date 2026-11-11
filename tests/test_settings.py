@@ -217,3 +217,23 @@ def test_anonymize_admins(monkeypatch):
     monkeypatch.setenv("MATRIX_ANONYMIZE_ADMINS", "@facebook_1:x.org, 1234567")
     s = load_settings(BotSettings)
     assert s.anonymize_admins == ["@facebook_1:x.org", "1234567"]
+
+
+def test_room_memory_settings_defaults_and_bounds(monkeypatch):
+    s = load_settings(ApiSettings)
+    assert (s.room_notes_max_chars, s.room_skill_max_chars, s.room_skills_max) == (8000, 8000, 20)
+    assert s.room_memory_rule == ""
+    for name in ("MATRIX_ROOM_NOTES_MAX_CHARS", "MATRIX_ROOM_SKILL_MAX_CHARS"):
+        for bad in ("99", "32001"):
+            monkeypatch.setenv(name, bad)
+            assert name in problems(ApiSettings), (name, bad)
+        monkeypatch.setenv(name, "100")
+        assert load_settings(ApiSettings) is not None
+        monkeypatch.delenv(name)
+    for bad in ("0", "101"):
+        monkeypatch.setenv("MATRIX_ROOM_SKILLS_MAX", bad)
+        assert "MATRIX_ROOM_SKILLS_MAX" in problems(ApiSettings), bad
+    monkeypatch.setenv("MATRIX_ROOM_SKILLS_MAX", "100")
+    monkeypatch.setenv("MATRIX_ROOM_MEMORY_RULE", "R")
+    s = load_settings(ApiSettings)
+    assert (s.room_skills_max, s.room_memory_rule) == (100, "R")

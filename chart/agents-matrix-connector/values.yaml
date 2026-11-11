@@ -70,6 +70,17 @@ limits:
   agentRatePerMinute: 20
   # MATRIX_ROOM_REQUESTS_PER_HOUR: open and invite room requests accepted per hour, all agents.
   roomRequestsPerHour: 10
+  # MATRIX_ROOM_NOTES_MAX_CHARS: max characters of one room's notes (100 to 32000).
+  roomNotesMaxChars: 8000
+  # MATRIX_ROOM_SKILL_MAX_CHARS: max characters of one room skill body (100 to 32000).
+  roomSkillMaxChars: 8000
+  # MATRIX_ROOM_SKILLS_MAX: max skills per room (1 to 100).
+  roomSkillsMax: 20
+
+roomMemory:
+  # MATRIX_ROOM_MEMORY_RULE: replaces the built-in room memory rule in first prompts and the
+  # notes GET; empty keeps the built-in rule and sets no variable.
+  rule: ""
 
 # Source allowlist of the api (MATRIX_API_ALLOWED_CIDRS, api pod only): the direct peer must be
 # inside one of these CIDRs or the api answers 403 (probes excepted).
