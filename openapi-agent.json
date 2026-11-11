@@ -373,6 +373,26 @@
         "title": "MessageIn",
         "type": "object"
       },
+      "NotesIn": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "body",
+          "expected_version"
+        ],
+        "title": "NotesIn",
+        "type": "object"
+      },
       "PendingView": {
         "description": "Why a room is waiting: not allowed yet, an open invite, a Messenger message request, and\nthe messages the policy refused (count and senders, never bodies).",
         "properties": {
@@ -886,6 +906,57 @@
           "members"
         ],
         "title": "RoomDetail",
+        "type": "object"
+      },
+      "RoomNotes": {
+        "properties": {
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "chars": {
+            "title": "Chars",
+            "type": "integer"
+          },
+          "max_chars": {
+            "title": "Max Chars",
+            "type": "integer"
+          },
+          "room_id": {
+            "title": "Room Id",
+            "type": "string"
+          },
+          "rule": {
+            "title": "Rule",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "room_id",
+          "body",
+          "version",
+          "updated_at",
+          "chars",
+          "max_chars",
+          "rule"
+        ],
+        "title": "RoomNotes",
         "type": "object"
       },
       "RoomRequestIn": {
@@ -2531,6 +2602,238 @@
           }
         },
         "summary": "Send Status"
+      }
+    },
+    "/chat/v1/notes": {
+      "get": {
+        "description": "The notes of the room this session is bound to (empty, version 0, when none), with\nthe room memory rule.",
+        "operationId": "get_notes_chat_v1_notes_get",
+        "parameters": [
+          {
+            "description": "the calling session's uuid; missing or malformed is 401 unauthorized",
+            "in": "header",
+            "name": "X-Orch-Session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "the calling session's uuid; missing or malformed is 401 unauthorized",
+              "title": "X-Orch-Session"
+            }
+          },
+          {
+            "description": "the calling session's slug",
+            "in": "header",
+            "name": "X-Orch-Slug",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "the calling session's slug",
+              "title": "X-Orch-Slug"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoomNotes"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Get Notes"
+      },
+      "put": {
+        "description": "Replace the notes of the room this session is bound to, guarded by the version read\nbefore (0 creates); an empty body forgets them. Over the cap is 413.",
+        "operationId": "put_notes_chat_v1_notes_put",
+        "parameters": [
+          {
+            "description": "the calling session's uuid; missing or malformed is 401 unauthorized",
+            "in": "header",
+            "name": "X-Orch-Session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "the calling session's uuid; missing or malformed is 401 unauthorized",
+              "title": "X-Orch-Session"
+            }
+          },
+          {
+            "description": "the calling session's slug",
+            "in": "header",
+            "name": "X-Orch-Slug",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "the calling session's slug",
+              "title": "X-Orch-Slug"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotesIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoomNotes"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Put Notes"
       }
     },
     "/chat/v1/reactions": {

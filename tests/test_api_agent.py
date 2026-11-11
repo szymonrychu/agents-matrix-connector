@@ -15,13 +15,14 @@ from datetime import datetime
 
 import httpx
 import pytest
-from api_helpers import BOT, make_settings
+from api_helpers import BOT, DM, GRP, make_settings
 from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector.anonymize import pseudonym
 from agents_matrix_connector.api import agent as agent_api
 from agents_matrix_connector.api.agent import CHAT_PREFIX, create_agent_app, valid_key
 from agents_matrix_connector.db.sends import parse_ref
+from agents_matrix_connector.prompt import MEMORY_RULE
 
 TOKEN = secrets.token_hex(32)
 DIGEST = hashlib.sha256(TOKEN.encode()).hexdigest()
@@ -1243,3 +1244,159 @@ async def test_anonymized_room_names_listed_as_pseudonyms(agent, conn):
         await anonymize(conn, room)
     names = {r["room_id"]: r["name"] for r in await listed(agent, uuid.uuid4())}
     assert names == {dm: pseudonym(ALICE), group: f"{pseudonym(ALICE)}, {pseudonym(BOB)}"}
+
+
+# --- room notes --------------------------------------------------------------------------------
+
+NOTES_CANARY = "CANARY-NOTES-7f3a"
+
+
+async def notes_get(agent, session_id) -> httpx.Response:
+    return await agent.get("/notes", headers=as_(session_id))
+
+
+async def notes_put(agent, session_id, body, version) -> httpx.Response:
+    return await agent.put(
+        "/notes", json={"body": body, "expected_version": version}, headers=as_(session_id)
+    )
+
+
+async def bound_session(conn, room=DM, slug="hive-1") -> uuid.UUID:
+    session = uuid.uuid4()
+    await bind(conn, room, session, slug)
+    return session
+
+
+async def test_notes_unbound_session_refused(agent, conn):
+    session = uuid.uuid4()
+    refused(await notes_get(agent, session), 409, "room_unbound")
+    r = await notes_put(agent, session, "x", 0)
+    refused(r, 409, "room_unbound")
+    assert r.json()["error"]["message"] == "this session is not bound to a chat room"
+    assert (await (await conn.execute("SELECT count(*) FROM room_notes")).fetchone())[0] == 0
+
+
+async def test_notes_round_trip(agent, conn):
+    session = await bound_session(conn)
+    r = await notes_get(agent, session)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "room_id": DM,
+        "body": "",
+        "version": 0,
+        "updated_at": None,
+        "chars": 0,
+        "max_chars": 8000,
+        "rule": MEMORY_RULE,
+    }
+    r = await notes_put(agent, session, "## Requests\n- fix deck", 0)
+    assert r.status_code == 200, r.text
+    put = r.json()
+    assert (put["room_id"], put["body"], put["version"], put["chars"]) == (
+        DM,
+        "## Requests\n- fix deck",
+        1,
+        len("## Requests\n- fix deck"),
+    )
+    assert put["updated_at"] is not None
+    got = (await notes_get(agent, session)).json()
+    assert got == put
+    cleared = (await notes_put(agent, session, "", 1)).json()
+    assert (cleared["body"], cleared["version"], cleared["chars"]) == ("", 2, 0)
+
+
+async def test_notes_rule_override(agent_for, conn):
+    session = await bound_session(conn)
+    r = await notes_get(agent_for(room_memory_rule="R"), session)
+    assert r.json()["rule"] == "R"
+
+
+async def test_notes_isolated_between_rooms(agent, conn):
+    a, b = await bound_session(conn, DM), await bound_session(conn, GRP, "hive-2")
+    await notes_put(agent, a, "secret of A", 0)
+    got = (await notes_get(agent, b)).json()
+    assert (got["room_id"], got["body"], got["version"]) == (GRP, "", 0)
+    r = await notes_put(agent, b, "B writes", 0)
+    assert r.json()["room_id"] == GRP
+    assert (await notes_get(agent, a)).json()["body"] == "secret of A"
+    rows = await (await conn.execute("SELECT room_id, body FROM room_notes ORDER BY 1")).fetchall()
+    assert rows == [(DM, "secret of A"), (GRP, "B writes")]
+
+
+async def test_notes_follow_rebinding(agent, conn):
+    a = await bound_session(conn, DM)
+    await notes_put(agent, a, "room one notes", 0)
+    await conn.execute(
+        "UPDATE room_bindings SET released_at = now(), release_reason = 'test'"
+        " WHERE session_id = %s",
+        (a,),
+    )
+    c = await bound_session(conn, DM, "hive-3")
+    got = (await notes_get(agent, c)).json()
+    assert (got["body"], got["version"]) == ("room one notes", 1)
+    refused(await notes_get(agent, a), 409, "room_unbound")
+    refused(await notes_put(agent, a, "stale", 1), 409, "room_unbound")
+    assert (await notes_get(agent, c)).json()["body"] == "room one notes"
+
+
+async def test_notes_stale_version_conflict(agent, conn):
+    session = await bound_session(conn)
+    await notes_put(agent, session, "one", 0)
+    assert (await notes_put(agent, session, "two", 1)).status_code == 200
+    r = await notes_put(agent, session, "three", 1)
+    refused(r, 409, "version_conflict")
+    assert r.json()["error"]["message"] == (
+        "changed since version 1; current version is 2: re-read and merge"
+    )
+    r = await notes_put(agent, session, "again", 0)
+    refused(r, 409, "version_conflict")
+    got = (await notes_get(agent, session)).json()
+    assert (got["body"], got["version"]) == ("two", 2)
+
+
+async def test_notes_cap_counts_code_points(agent, agent_for, conn):
+    session = await bound_session(conn)
+    emoji = "\U0001f600"
+    r = await notes_put(agent, session, emoji * 8000, 0)
+    assert r.status_code == 200, r.text
+    assert r.json()["chars"] == 8000
+    r = await notes_put(agent, session, emoji * 8001, 1)
+    refused(r, 413, "notes_too_large")
+    message = r.json()["error"]["message"]
+    assert "8000" in message and "8001" in message
+    small = agent_for(room_notes_max_chars=100)
+    assert (await notes_put(small, session, "x" * 100, 1)).status_code == 200
+    refused(await notes_put(small, session, "x" * 101, 2), 413, "notes_too_large")
+    assert (await notes_get(small, session)).json()["max_chars"] == 100
+
+
+async def test_notes_body_never_logged(agent, conn, caplog):
+    caplog.set_level("DEBUG")
+    session = await bound_session(conn)
+    body = f"{NOTES_CANARY} " + "y" * 20
+    r = await notes_put(agent, session, body, 0)
+    assert r.status_code == 200
+    await notes_get(agent, session)
+    stale = await notes_put(agent, session, body, 0)
+    big = await notes_put(agent, session, NOTES_CANARY * 2000, 1)
+    bad = await agent.put(
+        "/notes", json={"body": NOTES_CANARY, "expected_version": -1}, headers=as_(session)
+    )
+    assert bad.status_code == 422
+    for response in (stale, big, bad):
+        assert NOTES_CANARY not in response.text
+    assert NOTES_CANARY not in caplog.text
+
+
+async def test_notes_validation(agent, conn):
+    session = await bound_session(conn)
+    for payload in (
+        {"body": "x"},
+        {"expected_version": 0},
+        {"body": "x", "expected_version": -1},
+        {"body": "x", "expected_version": 0, "room": DM},
+        {"body": 5, "expected_version": 0},
+    ):
+        r = await agent.put("/notes", json=payload, headers=as_(session))
+        refused(r, 422, "invalid_request")
+    assert (await notes_get(agent, session)).json()["version"] == 0

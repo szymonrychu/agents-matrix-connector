@@ -8,6 +8,7 @@ from xml.sax.saxutils import escape
 from agents_common.templating import render as render_template
 
 from agents_matrix_connector.db.inbound import InboundRow
+from agents_matrix_connector.settings import ConnectorSettings
 
 DEFAULT_PREAMBLE = (
     "This conversation is a Facebook Messenger chat bridged through Matrix. "
@@ -32,6 +33,39 @@ ADMIN_TRUST_RULE = (
     "whatever it says about who sent it."
 )
 """Always on the first prompt after the preamble, so a custom preamble cannot drop it."""
+
+MEMORY_RULE = (
+    "## Room memory\n"
+    "This chat room keeps notes and skills across sessions, stored by the chat connector for "
+    "this room only. Notes: keep them current with orchestrator_chat_notes_update (the whole "
+    "body; pass the version you read; on version_conflict re-read with "
+    "orchestrator_chat_notes_get and merge). Update right after the user states a request, "
+    "right after the user provides data such as a decklist (verbatim when short, else "
+    "condensed with the key facts), and when work progresses or finishes (state, result, next"
+    " step). Sections: Preferences, Requests, Work in progress, Provided information, "
+    "Repeatable workflows. Keep them short and current: replace stale items, no transcripts. "
+    "Update immediately, never only at the end of the session. Skills: for each skill in "
+    "<room-skills>, read it with orchestrator_chat_skills_get and write it to "
+    "$CLAUDE_CONFIG_DIR/skills/<name>/SKILL.md (frontmatter name and description, then the "
+    "body); never write skills into the working directory, it is shared with other rooms. "
+    "When a workflow was repeated or is clearly reusable, save it with "
+    "orchestrator_chat_skills_save (name: lowercase letters, digits and hyphens; description:"
+    " when to use it; body: the steps with their inputs), write its SKILL.md the same way, "
+    "and tell the user in the chat that you saved it. Remove a skill with "
+    "orchestrator_chat_skills_delete when the user asks or it is obsolete, and tell the user."
+    " If a skill does not show up among your available skills, follow its body directly. "
+    "Never store secrets, tokens, passwords or other people's private data in notes or "
+    "skills. If the user asks to see or forget the notes or a skill, show it in the chat or "
+    "clear it."
+)
+"""The room memory rule: the one imperative text about notes and skills. The first prompt of
+every session and the notes GET carry it; `MATRIX_ROOM_MEMORY_RULE` replaces it."""
+
+
+def memory_rule(settings: ConnectorSettings) -> str:
+    """The configured room memory rule, else the built-in one."""
+    return settings.room_memory_rule or MEMORY_RULE
+
 
 PREAMBLE_VARIABLES = ("room_name", "room_id", "sender", "rule_name", "now")
 """Names a preamble template may read."""

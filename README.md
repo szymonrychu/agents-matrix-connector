@@ -364,6 +364,9 @@ Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
 | `rate_limited` | 429 | the session reached `MATRIX_AGENT_RATE_PER_MINUTE` sends in the last 60 s |
 | `room_chunk_limit` | 429 | the send would take the room past `MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR` chunks in the last hour |
 | `pseudonym_disclosed` | 422 | the room has `anonymize_names` and the message `text` contains a pseudonym (`user-<sha>`, `admin-<sha>`); the message names the tokens found, refer to the person differently |
+| `room_unbound` | 409 | the notes or skills routes need the session to be bound to a chat room, and it is bound to none |
+| `version_conflict` | 409 | `expected_version` is not the stored version: re-read and merge, then write again |
+| `notes_too_large` | 413 | the notes `body` is over `MATRIX_ROOM_NOTES_MAX_CHARS` characters (counted in code points) |
 | `unavailable` | 503 | the database is unavailable |
 
 Send statuses: `queued` (accepted, waiting for the bot), `sending` (claimed by the bot, being
@@ -425,6 +428,33 @@ session's send included; 401 `unauthorized`.
 
     curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
       http://localhost:8001/chat/v1/messages/s7
+
+### `GET /chat/v1/notes`
+
+The notes of the room this session is bound to; the room is never a parameter, it is the
+session's active binding, so a session reaches only its own room's notes and a rebound room
+keeps them. 200 `{"room_id", "body", "version", "updated_at", "chars", "max_chars", "rule"}`
+(no notes yet: `body` empty, `version` 0, `updated_at` null); `rule` is the room memory rule
+(`MATRIX_ROOM_MEMORY_RULE`, else the built-in). 401 `unauthorized`; 409 `room_unbound`; 503
+`unavailable`.
+
+    curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      http://localhost:8001/chat/v1/notes
+
+### `PUT /chat/v1/notes`
+
+Replace the whole notes body of the session's bound room. Body `{"body": str,
+"expected_version": int}`: `expected_version` is the version read (0 when none exists yet); an
+empty `body` forgets the notes. The body is capped at `MATRIX_ROOM_NOTES_MAX_CHARS` characters
+(code points). 200 the same shape as the GET with the new version; 401 `unauthorized`; 409
+`room_unbound` or `version_conflict` (the stored body is unchanged); 413 `notes_too_large`; 422
+`invalid_request` (a missing or negative `expected_version`, an unknown field such as `room`);
+503 `unavailable`. Notes are never written to a log.
+
+    curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      -H 'content-type: application/json' \
+      -d '{"body": "## Requests\n- example", "expected_version": 0}' \
+      http://localhost:8001/chat/v1/notes
 
 ### Admin routes (`/chat/v1/admin`)
 
