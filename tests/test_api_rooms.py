@@ -680,5 +680,6 @@ async def test_messages_view_media_fields(api, conn):
             "media_reason": "download_failed",
         }
         assert by_body["hello 3"]["media_kind"] is None
-        if "answer 4" in by_body:
-            assert by_body["answer 4"]["media_status"] is None
+    room_messages = (await api.get(room_path(DM, "/messages"))).json()
+    answer = next(m for m in room_messages if m["body"] == "answer 4")
+    assert answer["media_status"] is None

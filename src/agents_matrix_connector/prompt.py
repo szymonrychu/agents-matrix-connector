@@ -123,9 +123,14 @@ def memory_block(rule: str, notes: str, skills: Sequence[tuple[str, str]]) -> st
     return "\n\n".join(parts)
 
 
-def _attachment(row: InboundRow, outcome: Outcome | None) -> str:
+MAX_MEDIA_NAME = 200
+"""Characters of the original file name shown to the agent (sender text, so bounded)."""
+
+
+def _attachment(row: InboundRow, outcome: Outcome | None, *, hide_name: bool = False) -> str:
     """The `<attachment/>` element of a media row (empty for other rows): the delivered file,
-    or `attached="no"` with its reason; the original name only when the row stored one."""
+    or `attached="no"` with its reason; the original name (cut to `MAX_MEDIA_NAME`) only when
+    the row stored one and `hide_name` is not set."""
     if row.media_kind is None:
         return ""
     attrs: list[tuple[str, object]] = []
@@ -134,7 +139,8 @@ def _attachment(row: InboundRow, outcome: Outcome | None) -> str:
     attrs.append(("kind", outcome.kind if outcome else row.media_kind))
     attrs.append(("mime", outcome.mime if outcome else row.media_mime))
     attrs.append(("size", outcome.size if outcome else row.media_size))
-    attrs.append(("original_name", row.media_name))
+    if not hide_name and row.media_name is not None:
+        attrs.append(("original_name", row.media_name[:MAX_MEDIA_NAME]))
     attached = outcome is not None and outcome.attachment is not None
     attrs.append(("attached", "yes" if attached else "no"))
     attrs.append(("reason", outcome.reason if outcome else None))
@@ -154,13 +160,14 @@ def render(
     is_admin: Callable[[InboundRow], bool] | None = None,
     memory: str = "",
     media: Mapping[int, Outcome] | None = None,
+    hide_media_names: bool = False,
 ) -> str:
     """`preamble` is the already rendered first-prompt preamble, used when `first`; `sender`
     names a message's sender (default its display name, else its user id); `is_admin` tells
     whether a message's sender is an owner or admin (the message then carries role="admin");
     `memory` is the room memory block, added after the trust rule of a first prompt only;
     `media` maps a row id to what became of its media (an `<attachment/>` element after the
-    body)."""
+    body); `hide_media_names` drops the original file names (anonymized rooms)."""
     name = sender or sender_name
     if not first:
         head = "New messages in the chat:"
@@ -180,7 +187,7 @@ def render(
             f'<message id="m{row.id}" from="{_esc(name(row))}" '
             f'facebook_id="{_esc(facebook_id(row.sender) or "")}" '
             f'at="{_esc(at)}"{role}>{_esc(row.body or "")}'
-            f"{_attachment(row, (media or {}).get(row.id))}</message>"
+            f"{_attachment(row, (media or {}).get(row.id), hide_name=hide_media_names)}</message>"
         )
     lines.append("</chat>")
     return "\n".join(lines)

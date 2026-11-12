@@ -1645,6 +1645,26 @@ async def test_worker_denied_sender_no_media_request(conn, hs, fake, preset, mak
     assert message["id"] not in fake.attachments
 
 
+async def test_worker_anonymized_room_never_shows_stored_media_name(
+    conn, hs, fake, preset, make_worker
+):
+    await preset()
+    await add_room(conn, DM)
+    await conn.execute(
+        "INSERT INTO room_settings (room_id, anonymize_names) VALUES (%s, true)", (DM,)
+    )
+    hs.put_media("hs", "pass", jpeg())
+    # Stored while the room was not anonymized, so the row keeps its original name.
+    await queue_media(conn, DM, "pass", name="John_Smith_passport.jpg")
+
+    await make_worker().tick()
+
+    [(_, _, _, session_id, *_)] = await room_runs(conn, DM)
+    [message] = session_messages(fake, session_id)
+    assert 'attached="yes"' in message["text"]
+    assert "John_Smith" not in message["text"] and "original_name" not in message["text"]
+
+
 async def test_worker_follow_run_attaches(conn, hs, fake, preset, make_worker):
     worker = make_worker()
     session_id, _ = await ready_follow(conn, fake, preset, worker)

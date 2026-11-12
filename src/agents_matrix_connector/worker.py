@@ -512,13 +512,15 @@ class Worker:
         self, batch: _Batch, *, first: bool, media: Sequence[inbound_media.Outcome] = ()
     ) -> str:
         """The prompt of the batch; in a room flagged `anonymize_names` the room name and every
-        sender are pseudonyms and no Facebook id is shown (bodies stay as written)."""
+        sender are pseudonyms, no Facebook id and no original file name is shown (bodies stay as
+        written)."""
         room = await directory.get_room(self._pool, batch.room_id)
         setting = await rules.get_room_settings(self._pool, batch.room_id)
         room_name = room.name if room else None
         sender: Callable[[InboundRow], str] = prompt.sender_name
         facebook_id: Callable[[str], str | None] = self._facebook_id
-        if setting is not None and setting.anonymize_names:
+        anonymized = setting is not None and setting.anonymize_names
+        if anonymized:
             labeler = anonymize.Labeler(self._settings.anonymize_admins, self._facebook_id)
             excluded = self._settings.self_ids() | set(self._settings.bridge_bots)
             members = room.members if room else []
@@ -535,6 +537,7 @@ class Worker:
             sender=sender,
             is_admin=self._is_admin,
             media={outcome.row_id: outcome for outcome in media},
+            hide_media_names=anonymized,
         )
 
     async def _memory(self, room_id: str) -> str:
