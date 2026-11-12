@@ -454,7 +454,8 @@ class Worker:
 
     async def _delivered(self, batch: _Batch, ref: agent_runs.RunRef) -> None:
         """The hive got the batch handed over: typing starts, and the batch is marked read only
-        when the session is already up (else the tracker marks it once the message is sent)."""
+        when an agent of the session already holds a wrapper session (else the tracker marks it
+        once the message is sent)."""
         for key in (f"run {batch.ref.id}", f"room {batch.room_id}", f"check {batch.room_id}"):
             self._logged.pop(key, None)
         try:

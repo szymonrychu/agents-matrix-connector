@@ -38,6 +38,13 @@ Lessons that outlive a session. Newest first.
 - Residual risk: a secret written into a workdir file can be sent, as it can be pasted into
   `text`. The flag (default off) is the control; the name deny list only catches accidents and
   the wrapper's workdir confinement is the hard boundary.
+- Read receipt needs a wrapper session (T-167, finding I2 of T-138): `Session.is_up` in
+  agents-common v0.16.0 now also requires `summary.ready_with_session > 0`, because a ready pod
+  says nothing about a wrapper session and the connector said "seen" while no agent could take
+  the message. `worker._delivered` is unchanged; a handoff into a ready pod without a wrapper
+  session sends no receipt and the tracker sends it once the message is `sent`. Deploy order:
+  agents-orchestrator with `ready_with_session` first, then this connector. Connector first is
+  safe but late: `is_up` is always false, so receipts come only from the tracker.
 - Attachments foundation (T-155): Pillow and pillow-heif are added because inbound photos must
   be re-encoded (EXIF stripped and orientation applied, long edge 2576, JPEG q85 stepping
   down) and iPhone HEIC must be readable; the agent's Read tool shows only jpeg/png/gif/webp.

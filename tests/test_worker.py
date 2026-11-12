@@ -19,6 +19,7 @@ from agents_matrix_connector.fake_homeserver import FakeHomeserver
 from agents_matrix_connector.matrix import MatrixClient
 from agents_matrix_connector.prompt import ADMIN_TRUST_RULE, DEFAULT_PREAMBLE, MEMORY_RULE
 from agents_matrix_connector.settings import BotSettings
+from agents_matrix_connector.tracker import Tracker
 from agents_matrix_connector.worker import Worker, binding_state, check_action
 
 T0 = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
@@ -500,6 +501,32 @@ async def test_first_run_handoff_booting_sends_no_receipt(conn, hs, matrix, pres
     assert matrix.typings == [(BOT, DM, True, 30000)]
     assert matrix.receipts == []
     assert hs.receipts(DM) == []
+
+
+async def test_handoff_into_ready_pod_without_session_sends_no_receipt(
+    conn, fake, hs, matrix, orchestrator, pool, clock, preset, make_worker
+):
+    worker = make_worker()
+    session_id, _ = await ready_follow(conn, fake, preset, worker)
+    # A ready pod whose bootstrapper has not recorded a wrapper session yet (T-167).
+    fake.set_session_ready(session_id, ready=1, ready_with_session=0)
+    newest = await queue_at(conn, DM, "b", T0 + timedelta(seconds=9))
+
+    await worker.tick()
+
+    runs_now = await room_runs(conn, DM)
+    assert [r[1] for r in runs_now] == ["first", "follow"]
+    follow_message_id = runs_now[-1][4]
+    assert follow_message_id is not None
+    assert matrix.typings == [(BOT, DM, True, 30000)] * 2
+    assert matrix.receipts == []
+    assert hs.receipts(DM) == []
+
+    # The receipt follows through the tracker once the orchestrator reports the message sent.
+    fake.mark_sent(int(follow_message_id))
+    await Tracker(orchestrator, matrix, pool, make_settings(), now=clock).tick()
+    assert matrix.receipts == [(DM, newest)]
+    assert hs.receipts(DM) == [newest]
 
 
 async def test_handoff_into_ready_session_sends_receipt(
