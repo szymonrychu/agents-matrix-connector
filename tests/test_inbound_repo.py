@@ -5,6 +5,7 @@ import pytest
 from agents_common.db.pool import open_pool
 
 from agents_matrix_connector.db import holds, inbound
+from agents_matrix_connector.discovery import Media
 
 PACKAGE = "agents_matrix_connector"
 T0 = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
@@ -220,3 +221,112 @@ async def test_denied_summary_groups_by_room(conn):
     assert (b.count, b.last_at, b.senders) == (1, T0, [("@s3:x", None)])
     only = await inbound.denied_summary(conn, ["!b:x", "!c:x"])
     assert set(only) == {"!b:x"}
+
+
+PHOTO = Media("image", "mxc://x/p", "image/jpeg", 1234, "IMG_1.jpg", 30, 20)
+
+
+async def put_media(
+    conn,
+    event_id,
+    at,
+    sender="@u:x",
+    status="ignored",
+    reason="not_mentioned",
+    media=PHOTO,
+    mentioned=False,
+    room="!a:x",
+):
+    return await inbound.insert(
+        conn,
+        event_id=event_id,
+        room_id=room,
+        sender=sender,
+        sender_name="U",
+        body="",
+        mentioned=mentioned,
+        origin_ts=at,
+        status=status,
+        reason=reason,
+        media=media,
+    )
+
+
+async def test_insert_media_round_trip(conn, pool):
+    await put_media(conn, "$m", T0, status="new", reason=None)
+    [row] = await inbound.list_messages(pool)
+    assert (row.media_kind, row.media_url, row.media_mime, row.media_size) == (
+        "image",
+        "mxc://x/p",
+        "image/jpeg",
+        1234,
+    )
+    assert (row.media_name, row.media_w, row.media_h) == ("IMG_1.jpg", 30, 20)
+    assert (row.media_status, row.media_reason) == (None, None)
+    await put(conn, "$t")
+    plain = [r for r in await inbound.list_messages(pool) if r.event_id == "$t"][0]
+    assert plain.media_kind is None and plain.media_url is None
+
+
+async def test_set_media_outcome_guarded(conn, pool):
+    await put_media(conn, "$m", T0, status="new", reason=None)
+    run_id = await new_run(conn)
+    other = await new_run(conn, "!b:x")
+    [row] = await inbound.claim_room(conn, "!a:x", run_id)
+    assert await inbound.set_media_outcome(conn, row.id, other, "attached", None) is False
+    assert await inbound.set_media_outcome(conn, row.id, run_id, "not_attached", "too_large")
+    [stored] = await inbound.list_messages(pool)
+    assert (stored.media_status, stored.media_reason) == ("not_attached", "too_large")
+    await inbound.finish_run_rows(conn, run_id, "handled")
+    assert await inbound.set_media_outcome(conn, row.id, run_id, "attached", None) is False
+    with pytest.raises(ValueError):
+        await inbound.set_media_outcome(conn, row.id, run_id, "bogus", None)
+
+
+async def test_promote_media_before_mention(conn):
+    mention = T0 + timedelta(minutes=10)
+    await put_media(conn, "$30", mention - timedelta(seconds=30))
+    await put_media(conn, "$100", mention - timedelta(seconds=100))
+    await put_media(conn, "$130", mention - timedelta(seconds=130))
+    await put_media(conn, "$text", mention - timedelta(seconds=10), media=None)
+    await put_media(conn, "$denied", mention - timedelta(seconds=10), reason="not_allowed")
+    assert await inbound.promote_media(conn, "!a:x", "@u:x", mention, 120, 10) == 2
+    got = await statuses(conn)
+    assert (got["$30"], got["$100"], got["$130"]) == ("new", "new", "ignored")
+    assert (got["$text"], got["$denied"]) == ("ignored", "ignored")
+    cur = await conn.execute("SELECT reason FROM inbound WHERE event_id = '$30'")
+    assert await cur.fetchone() == (None,)
+
+
+async def test_promote_media_other_sender_untouched(conn):
+    await put_media(conn, "$mine", T0, sender="@u:x")
+    await put_media(conn, "$theirs", T0, sender="@v:x")
+    await put_media(conn, "$other_room", T0, room="!b:x")
+    assert await inbound.promote_media(conn, "!a:x", "@u:x", T0, 120, 10) == 1
+    got = await statuses(conn)
+    assert (got["$mine"], got["$theirs"], got["$other_room"]) == ("new", "ignored", "ignored")
+
+
+async def test_promote_media_respects_queue_cap(conn):
+    mention = T0 + timedelta(minutes=10)
+    for seconds in (10, 20, 30):
+        await put_media(conn, f"${seconds}", mention - timedelta(seconds=seconds))
+    assert await inbound.promote_media(conn, "!a:x", "@u:x", mention, 120, 2) == 2
+    got = await statuses(conn)
+    assert (got["$10"], got["$20"], got["$30"]) == ("new", "new", "ignored")
+    assert await inbound.promote_media(conn, "!a:x", "@u:x", mention, 120, 0) == 0
+
+
+async def test_recent_accepted_mention(conn):
+    mention = T0
+    await put_media(conn, "$m", mention, status="new", reason=None, media=None, mentioned=True)
+    later = mention + timedelta(seconds=60)
+    assert await inbound.recent_accepted_mention(conn, "!a:x", "@u:x", later, 120) is True
+    assert await inbound.recent_accepted_mention(conn, "!a:x", "@v:x", later, 120) is False
+    assert await inbound.recent_accepted_mention(conn, "!b:x", "@u:x", later, 120) is False
+    too_late = mention + timedelta(seconds=121)
+    assert await inbound.recent_accepted_mention(conn, "!a:x", "@u:x", too_late, 120) is False
+    await conn.execute("UPDATE inbound SET status = 'handled'")
+    assert await inbound.recent_accepted_mention(conn, "!a:x", "@u:x", later, 120) is True
+    await conn.execute("UPDATE inbound SET status = 'ignored', reason = 'not_allowed'")
+    assert await inbound.recent_accepted_mention(conn, "!a:x", "@u:x", later, 120) is False

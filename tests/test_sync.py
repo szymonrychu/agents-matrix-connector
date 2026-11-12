@@ -26,6 +26,7 @@ DM = "!dm:hs"
 GROUP = "!group:hs"
 TYPES = [
     "m.room.message",
+    "m.sticker",
     "m.room.member",
     "m.room.name",
     "m.room.canonical_alias",
@@ -355,7 +356,7 @@ async def test_encrypted_infrastructure_unsupported(fake, client, pool):
 
     fake.post(enc, ALICE, text("encrypted room text"))
     fake.post(infra, ALICE, text("space text"))
-    fake.post(DM, ALICE, {"msgtype": "m.image", "body": "photo.jpg", "url": "mxc://hs/x"})
+    fake.post(DM, ALICE, {"msgtype": "m.image", "body": "photo.jpg", "file": {"url": "mxc://hs/x"}})
     await loop.run_once()
     assert sorted(await fetch(pool, "SELECT room_id, status, reason, body FROM inbound")) == sorted(
         [
@@ -933,3 +934,177 @@ async def test_join_after_allow(fake, client, pool, monkeypatch):
     assert spy.joined == [DM]
     await loop.run_once()
     assert await membership(pool, DM) == "join"
+
+
+MEDIA_COLUMNS = (
+    "SELECT sender, status, reason, body, media_kind, media_url, media_mime, media_size,"
+    " media_name, media_w, media_h FROM inbound ORDER BY id"
+)
+BASE = 1_800_000_000_000
+
+
+def photo(name: str = "IMG_1.jpg", caption: str | None = None, media_id: str = "p") -> dict:
+    content = {
+        "msgtype": "m.image",
+        "body": caption if caption is not None else name,
+        "url": f"mxc://hs/{media_id}",
+        "info": {"mimetype": "image/jpeg", "size": 1234, "w": 30, "h": 20},
+    }
+    if caption is not None:
+        content["filename"] = name
+    return content
+
+
+async def statuses_by_body(pool) -> list[tuple]:
+    return await fetch(pool, "SELECT status, reason, media_name FROM inbound ORDER BY id")
+
+
+async def test_media_stored_for_allowed_sender(fake, client, pool):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    fake.post(DM, ALICE, photo(caption="look at this"))
+    fake.post(DM, ALICE, {"body": "thumbs", "url": "mxc://hs/s"}, event_type="m.sticker")
+    await loop.run_once()
+    assert await fetch(pool, MEDIA_COLUMNS) == [
+        (
+            ALICE,
+            "new",
+            None,
+            "look at this",
+            "image",
+            "mxc://hs/p",
+            "image/jpeg",
+            1234,
+            "IMG_1.jpg",
+            30,
+            20,
+        ),
+        (ALICE, "new", None, "", "sticker", "mxc://hs/s", None, None, "thumbs", None, None),
+    ]
+    assert fake.media_downloads == []
+
+
+async def test_media_not_stored_for_denied_sender(fake, client, pool):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    await rules.add_rule(pool, "deny", "facebook", "1", None)
+    fake.post(DM, ALICE, photo(caption="secret caption"))
+    await loop.run_once()
+    assert await fetch(pool, MEDIA_COLUMNS) == [
+        (ALICE, "ignored", "denied: facebook", None, None, None, None, None, None, None, None)
+    ]
+    assert fake.media_downloads == []
+
+
+async def test_media_name_not_stored_in_anonymized_room(fake, client, pool):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    await rules.set_room_settings(pool, DM, preset_id=None, trigger=None, anonymize_names=True)
+    fake.post(DM, ALICE, photo(name="John_Smith_passport.jpg", caption="mine"))
+    fake.post(DM, ALICE, photo(name="John_Smith_id.jpg"))
+    await loop.run_once()
+    rows = await fetch(pool, "SELECT body, media_kind, media_name FROM inbound ORDER BY id")
+    assert rows == [("mine", "image", None), ("", "image", None)]
+
+
+async def _media_group(fake, client, pool):
+    return await _mention_room(fake, client, pool, aliases=["hermes"])
+
+
+async def test_media_before_mention_promoted(fake, client, pool):
+    loop = await _media_group(fake, client, pool)
+    fake.post(GROUP, ALICE, photo(media_id="old"), origin_ts=BASE - 130_000)
+    fake.post(GROUP, ALICE, photo(media_id="a"), origin_ts=BASE - 100_000)
+    fake.post(GROUP, BOB, photo(media_id="bob"), origin_ts=BASE - 90_000)
+    fake.post(GROUP, ALICE, photo(media_id="b"), origin_ts=BASE - 30_000)
+    fake.post(GROUP, ALICE, text("hermes look at these"), origin_ts=BASE)
+    await loop.run_once()
+    rows = await fetch(pool, "SELECT sender, status, reason, media_url FROM inbound ORDER BY id")
+    assert rows == [
+        (ALICE, "ignored", "not_mentioned", "mxc://hs/old"),
+        (ALICE, "new", None, "mxc://hs/a"),
+        (BOB, "ignored", "not_mentioned", "mxc://hs/bob"),
+        (ALICE, "new", None, "mxc://hs/b"),
+        (ALICE, "new", None, None),
+    ]
+
+
+async def test_media_before_mention_respects_queue_cap(fake, client, pool):
+    await _mention_room(fake, client, pool, aliases=["hermes"])
+    loop = make_loop(client, pool, max_queued_per_room=2)
+    for n in range(3):
+        fake.post(GROUP, ALICE, photo(media_id=f"p{n}"), origin_ts=BASE - 30_000 + n)
+    fake.post(GROUP, ALICE, text("hermes look"), origin_ts=BASE)
+    await loop.run_once()
+    rows = await fetch(pool, "SELECT status, media_url FROM inbound ORDER BY id")
+    assert rows == [
+        ("ignored", "mxc://hs/p0"),
+        ("ignored", "mxc://hs/p1"),
+        ("new", "mxc://hs/p2"),
+        ("new", None),
+    ]
+
+
+async def test_media_after_mention_accepted(fake, client, pool):
+    loop = await _media_group(fake, client, pool)
+    fake.post(GROUP, ALICE, text("hermes what is this"), origin_ts=BASE)
+    await loop.run_once()
+    fake.post(GROUP, ALICE, photo(media_id="soon"), origin_ts=BASE + 60_000)
+    fake.post(GROUP, BOB, photo(media_id="bob"), origin_ts=BASE + 61_000)
+    fake.post(GROUP, ALICE, photo(media_id="late"), origin_ts=BASE + 130_000)
+    fake.post(GROUP, ALICE, text("unrelated chatter"), origin_ts=BASE + 62_000)
+    await loop.run_once()
+    rows = await fetch(pool, "SELECT sender, status, reason, media_url FROM inbound ORDER BY id")
+    assert rows == [
+        (ALICE, "new", None, None),
+        (ALICE, "new", None, "mxc://hs/soon"),
+        (BOB, "ignored", "not_mentioned", "mxc://hs/bob"),
+        (ALICE, "ignored", "not_mentioned", "mxc://hs/late"),
+        (ALICE, "ignored", "not_mentioned", None),
+    ]
+
+
+async def test_media_after_denied_mention_ignored(fake, client, pool):
+    loop = await _media_group(fake, client, pool)
+    await rules.add_rule(pool, "deny", "facebook", "2", None)
+    fake.post(GROUP, BOB, text("hermes look"), origin_ts=BASE)
+    fake.post(GROUP, BOB, photo(media_id="b1"), origin_ts=BASE + 10_000)
+    await loop.run_once()
+    rows = await fetch(pool, "SELECT status, reason, media_url FROM inbound ORDER BY id")
+    assert rows == [("ignored", "denied: facebook", None), ("ignored", "denied: facebook", None)]
+
+
+async def test_media_after_queue_full_mention_ignored(fake, client, pool):
+    await _mention_room(fake, client, pool, aliases=["hermes"])
+    loop = make_loop(client, pool, max_queued_per_room=1)
+    fake.post(GROUP, BOB, text("hermes first"), origin_ts=BASE - 1000)
+    fake.post(GROUP, ALICE, text("hermes look"), origin_ts=BASE)
+    fake.post(GROUP, ALICE, photo(media_id="a1"), origin_ts=BASE + 10_000)
+    await loop.run_once()
+    rows = await fetch(pool, "SELECT sender, status, reason FROM inbound ORDER BY id")
+    assert rows == [
+        (BOB, "new", None),
+        (ALICE, "ignored", "queue_full"),
+        (ALICE, "ignored", "not_mentioned"),
+    ]
+
+
+async def test_media_dm_needs_no_window(fake, client, pool):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    fake.post(DM, ALICE, photo())
+    await loop.run_once()
+    assert await fetch(pool, "SELECT status, reason, mentioned FROM inbound") == [
+        ("new", None, False)
+    ]
+
+
+async def test_sticker_backfilled(fake, client, pool, monkeypatch):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    fake.limit_timeline(1)
+    fake.post(DM, ALICE, {"body": "sticker", "url": "mxc://hs/s"}, event_type="m.sticker")
+    fake.post(DM, ALICE, text("live"))
+    await loop.run_once()
+    rows = await fetch(pool, "SELECT body, media_kind FROM inbound ORDER BY id")
+    assert rows == [("", "sticker"), ("live", None)]

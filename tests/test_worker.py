@@ -1,3 +1,4 @@
+import io
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -11,10 +12,12 @@ from agents_common.orchestrator import (
     OrchestratorUnavailable,
     Session,
 )
+from PIL import Image
 
 from agents_matrix_connector.anonymize import pseudonym
 from agents_matrix_connector.db import bindings, holds, inbound, notes, runs, skills
 from agents_matrix_connector.db.bindings import BindingRow
+from agents_matrix_connector.discovery import Media
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
 from agents_matrix_connector.matrix import MatrixClient
 from agents_matrix_connector.prompt import ADMIN_TRUST_RULE, DEFAULT_PREAMBLE, MEMORY_RULE
@@ -57,6 +60,9 @@ class SpyMatrix:
     async def send_receipt(self, room_id: str, event_id: str) -> None:
         self.receipts.append((room_id, event_id))
         await self._client.send_receipt(room_id, event_id)
+
+    async def download_media(self, server: str, media_id: str, max_bytes: int) -> bytes:
+        return await self._client.download_media(server, media_id, max_bytes)
 
 
 class DiscardAfterCheck:
@@ -1515,3 +1521,177 @@ async def test_room_without_flag_keeps_names(conn, fake, make_worker, preset):
         f'Alice A / Alice A\n\n{ADMIN_TRUST_RULE}\n\n{MEMORY_RULE}\n\n<chat room="Alice A"'
     )
     assert 'from="Alice A" facebook_id="111"' in text
+
+
+def jpeg(w: int = 40, h: int = 30) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), (10, 120, 200)).save(buf, format="JPEG")
+    return buf.getvalue()
+
+
+async def queue_media(conn, room_id: str, media_id: str, body: str = "", **extra) -> str:
+    event_id = f"${uuid.uuid4().hex}"
+    values = dict(kind="image", mime="image/jpeg", size=None, name=f"{media_id}.jpg")
+    values.update(extra)
+    await inbound.insert(
+        conn,
+        event_id=event_id,
+        room_id=room_id,
+        sender=ALICE,
+        sender_name="Alice A",
+        body=body,
+        mentioned=False,
+        origin_ts=T0,
+        status="new",
+        reason=None,
+        media=Media(
+            values["kind"],
+            f"mxc://hs/{media_id}",
+            values["mime"],
+            values["size"],
+            values["name"],
+            None,
+            None,
+        ),
+    )
+    return event_id
+
+
+async def row_ids(conn, room_id: str) -> list[int]:
+    return [
+        r[0]
+        for r in await fetch(conn, "SELECT id FROM inbound WHERE room_id = %s ORDER BY id", room_id)
+    ]
+
+
+async def media_outcomes(conn, room_id: str) -> list[tuple]:
+    return await fetch(
+        conn,
+        "SELECT media_status, media_reason FROM inbound WHERE room_id = %s ORDER BY id",
+        room_id,
+    )
+
+
+async def test_worker_two_photos_and_text_one_message(conn, hs, fake, preset, make_worker):
+    await preset()
+    await add_room(conn, DM)
+    hs.put_media("hs", "p1", jpeg())
+    hs.put_media("hs", "p2", jpeg(3000, 2000))
+    await queue_media(conn, DM, "p1")
+    await queue_media(conn, DM, "p2", body="and this one")
+    await queue(conn, DM, "what are these?")
+
+    await make_worker().tick()
+
+    first, second, _ = await row_ids(conn, DM)
+    [(_, _, _, session_id, *_)] = await room_runs(conn, DM)
+    [message] = session_messages(fake, session_id)
+    atts = fake.attachments[message["id"]]
+    assert [(a.name, a.mime) for a in atts] == [
+        (f"m{first}.jpg", "image/jpeg"),
+        (f"m{second}.jpg", "image/jpeg"),
+    ]
+    assert max(Image.open(io.BytesIO(atts[1].data)).size) == 2576
+    text = message["text"]
+    assert text.count('attached="yes"') == 2
+    assert f'file="m{first}.jpg"' in text and f'file="m{second}.jpg"' in text
+    assert 'original_name="p2.jpg"' in text
+    assert "what are these?" in text
+
+
+async def test_worker_download_failure_still_delivers_text(conn, hs, fake, preset, make_worker):
+    await preset()
+    await add_room(conn, DM)
+    hs.fail_media("gone", 502)
+    await queue_media(conn, DM, "gone")
+    await queue(conn, DM, "see the photo")
+
+    await make_worker().tick()
+
+    [(run_id, _, _, session_id, _, status, *_)] = await room_runs(conn, DM)
+    assert status == "in-progress"
+    [message] = session_messages(fake, session_id)
+    assert message["id"] not in fake.attachments
+    assert 'attached="no" reason="download_failed"' in message["text"]
+    assert "see the photo" in message["text"]
+    assert hs.media_downloads == ["gone", "gone"]
+
+
+async def test_worker_denied_sender_no_media_request(conn, hs, fake, preset, make_worker):
+    await preset()
+    await add_room(conn, DM)
+    hs.put_media("hs", "secret", jpeg())
+    # What sync stores for a denied sender: no body, no media.
+    await inbound.insert(
+        conn,
+        event_id="$denied",
+        room_id=DM,
+        sender="@facebook_666:hs",
+        sender_name="Mallory",
+        body=None,
+        mentioned=False,
+        origin_ts=T0,
+        status="ignored",
+        reason="denied: facebook",
+    )
+    await queue(conn, DM, "hello")
+
+    await make_worker().tick()
+
+    assert hs.media_downloads == []
+    [(_, _, _, session_id, *_)] = await room_runs(conn, DM)
+    [message] = session_messages(fake, session_id)
+    assert "<attachment" not in message["text"]
+    assert message["id"] not in fake.attachments
+
+
+async def test_worker_anonymized_room_never_shows_stored_media_name(
+    conn, hs, fake, preset, make_worker
+):
+    await preset()
+    await add_room(conn, DM)
+    await conn.execute(
+        "INSERT INTO room_settings (room_id, anonymize_names) VALUES (%s, true)", (DM,)
+    )
+    hs.put_media("hs", "pass", jpeg())
+    # Stored while the room was not anonymized, so the row keeps its original name.
+    await queue_media(conn, DM, "pass", name="John_Smith_passport.jpg")
+
+    await make_worker().tick()
+
+    [(_, _, _, session_id, *_)] = await room_runs(conn, DM)
+    [message] = session_messages(fake, session_id)
+    assert 'attached="yes"' in message["text"]
+    assert "John_Smith" not in message["text"] and "original_name" not in message["text"]
+
+
+async def test_worker_follow_run_attaches(conn, hs, fake, preset, make_worker):
+    worker = make_worker()
+    session_id, _ = await ready_follow(conn, fake, preset, worker)
+    hs.put_media("hs", "f1", jpeg())
+    await queue_media(conn, DM, "f1", body="follow photo")
+
+    await worker.tick()
+
+    follow = session_messages(fake, session_id)[-1]
+    *_, row_id = await row_ids(conn, DM)
+    assert [a.name for a in fake.attachments[follow["id"]]] == [f"m{row_id}.jpg"]
+    assert f'file="m{row_id}.jpg"' in follow["text"]
+
+
+async def test_worker_media_outcome_stored(conn, hs, fake, preset, make_worker):
+    await preset()
+    await add_room(conn, DM)
+    hs.put_media("hs", "ok", jpeg())
+    await queue_media(conn, DM, "ok")
+    await queue_media(conn, DM, "vid", kind="video", mime="video/mp4")
+    await queue(conn, DM, "text only")
+
+    await make_worker().tick()
+
+    assert await media_outcomes(conn, DM) == [
+        ("attached", None),
+        ("not_attached", "unsupported_type"),
+        (None, None),
+    ]
+    assert hs.media_downloads == ["ok"]

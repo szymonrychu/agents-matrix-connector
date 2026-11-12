@@ -214,8 +214,19 @@ class FakeHomeserver:
     def invite(self, room_id: str, inviter: str) -> None:
         self._member_event(self._room(room_id), self.user_id, "invite", sender=inviter)
 
-    def post(self, room_id: str, sender: str, content: dict) -> str:
-        return self._append(self._room(room_id), "m.room.message", sender, content)["event_id"]
+    def post(
+        self,
+        room_id: str,
+        sender: str,
+        content: dict,
+        *,
+        event_type: str = "m.room.message",
+        origin_ts: int | None = None,
+    ) -> str:
+        """Post a timeline event (default `m.room.message`); `origin_ts` overrides the
+        event's `origin_server_ts` (milliseconds)."""
+        room = self._room(room_id)
+        return self._append(room, event_type, sender, content, origin_ts=origin_ts)["event_id"]
 
     def set_state(self, room_id: str, event_type: str, state_key: str, content: dict) -> None:
         room = self._room(room_id)
@@ -309,13 +320,14 @@ class FakeHomeserver:
         sender: str,
         content: dict,
         state_key: str | None = None,
+        origin_ts: int | None = None,
     ) -> dict:
         self._pos += 1
         event: dict[str, Any] = {
             "event_id": f"${self._pos}:{self.server_name}",
             "type": event_type,
             "sender": sender,
-            "origin_server_ts": BASE_TS + self._pos,
+            "origin_server_ts": BASE_TS + self._pos if origin_ts is None else origin_ts,
             "content": copy.deepcopy(content),
             "room_id": room.room_id,
             "unsigned": {},

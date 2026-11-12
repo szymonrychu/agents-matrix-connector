@@ -653,3 +653,33 @@ async def test_put_settings_send_files_flag(api, conn):
         "SELECT agents_may_send_files FROM room_settings WHERE room_id = %s", (DM,)
     )
     assert (await cur.fetchone())[0] is False
+
+
+async def test_messages_view_media_fields(api, conn):
+    await seed(conn)
+    await add_inbound(conn, 2)
+    await conn.execute(
+        "UPDATE inbound SET media_kind = 'image', media_url = 'mxc://hs/secret-id',"
+        " media_mime = 'image/jpeg', media_size = 1234, media_name = 'John_passport.jpg',"
+        " media_w = 30, media_h = 20, media_status = 'not_attached',"
+        " media_reason = 'download_failed'"
+    )
+    await add_inbound(conn, 3)
+    await add_outbound(conn, 4)
+    for path in (room_path(DM, "/messages"), "/messages"):
+        r = await api.get(path)
+        assert r.status_code == 200
+        assert "secret-id" not in r.text and "John_passport" not in r.text
+        by_body = {m["body"]: m for m in r.json()}
+        photo = by_body["hello 2"]
+        assert {k: v for k, v in photo.items() if k.startswith("media_")} == {
+            "media_kind": "image",
+            "media_mime": "image/jpeg",
+            "media_size": 1234,
+            "media_status": "not_attached",
+            "media_reason": "download_failed",
+        }
+        assert by_body["hello 3"]["media_kind"] is None
+    room_messages = (await api.get(room_path(DM, "/messages"))).json()
+    answer = next(m for m in room_messages if m["body"] == "answer 4")
+    assert answer["media_status"] is None

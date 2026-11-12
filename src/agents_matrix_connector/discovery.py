@@ -100,6 +100,20 @@ def facebook_id(user_id: str, pattern: re.Pattern[str], bridge_server: str) -> s
 
 
 @dataclass(frozen=True)
+class Media:
+    """The attachment of a media event as the sender declared it: everything but `kind` is
+    sender text, never trusted for the type (the worker sniffs the bytes)."""
+
+    kind: str
+    url: str
+    mime: str | None
+    size: int | None
+    name: str | None
+    w: int | None
+    h: int | None
+
+
+@dataclass(frozen=True)
 class Candidate:
     event_id: str
     room_id: str
@@ -108,6 +122,7 @@ class Candidate:
     formatted_body: str | None
     mention_ids: tuple[str, ...]
     origin_ts: int
+    media: Media | None = None
 
 
 @dataclass(frozen=True)
@@ -122,13 +137,49 @@ class Unsupported:
     sender: str
 
 
+MESSAGE_TYPES = ("m.room.message", "m.sticker")
+_TEXT_MSGTYPES = ("m.text", "m.emote")
+_MEDIA_MSGTYPES = {"m.image": "image", "m.file": "file", "m.video": "video", "m.audio": "audio"}
+
+
+def _int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _media(content: dict, kind: str, body: str) -> tuple[str, Media] | None:
+    """The row body and the media part of a media event; None without a plain string `url`
+    (an encrypted `file` object is not supported). Caption rule (Matrix v1.10): a `filename`
+    that differs from `body` makes `body` the caption, else `body` is the file name."""
+    url = content.get("url")
+    if not isinstance(url, str):
+        return None
+    filename = content.get("filename")
+    if isinstance(filename, str) and filename != body:
+        caption, name = body, filename
+    else:
+        caption, name = "", body
+    raw_info = content.get("info")
+    info = raw_info if isinstance(raw_info, dict) else {}
+    mime = info.get("mimetype")
+    return caption, Media(
+        kind=kind,
+        url=url,
+        mime=mime if isinstance(mime, str) else None,
+        size=_int(info.get("size")),
+        name=name,
+        w=_int(info.get("w")),
+        h=_int(info.get("h")),
+    )
+
+
 def parse_message(
     room_id: str, event: dict, self_ids: frozenset[str], bridge_bots: Sequence[str]
 ) -> Candidate | Skip | Unsupported:
     event_id = str(event.get("event_id", ""))
     sender = str(event.get("sender", ""))
     skip = Skip(event_id, sender)
-    if event.get("type") != "m.room.message":
+    event_type = event.get("type")
+    if event_type not in MESSAGE_TYPES:
         return skip
     if sender in self_ids or sender in bridge_bots:
         return skip
@@ -139,7 +190,15 @@ def parse_message(
     body = content.get("body")
     if not isinstance(body, str):
         return skip
-    if content.get("msgtype") not in ("m.text", "m.emote"):
+    msgtype = content.get("msgtype")
+    media: Media | None = None
+    if event_type == "m.sticker" or msgtype in _MEDIA_MSGTYPES:
+        kind = "sticker" if event_type == "m.sticker" else _MEDIA_MSGTYPES[msgtype]
+        parsed = _media(content, kind, body)
+        if parsed is None:
+            return Unsupported(event_id, sender)
+        body, media = parsed
+    elif msgtype not in _TEXT_MSGTYPES:
         return Unsupported(event_id, sender)
     formatted = content.get("formatted_body")
     mentions = content.get("m.mentions")
@@ -152,6 +211,7 @@ def parse_message(
         formatted_body=formatted if isinstance(formatted, str) else None,
         mention_ids=tuple(i for i in ids if isinstance(i, str)) if isinstance(ids, list) else (),
         origin_ts=int(event.get("origin_server_ts") or 0),
+        media=media,
     )
 
 

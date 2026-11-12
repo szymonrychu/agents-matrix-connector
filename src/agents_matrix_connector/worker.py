@@ -31,6 +31,10 @@ usage quota (`UsageQuotaRefused`) fails `usage_quota`, returns its rows to `new`
 reservation and holds the room (`room_holds`) until the refusal's `retry_at`; `rooms_ready`
 skips a held room, so its messages stay `new` until the hold has passed. The worker never deletes
 sessions.
+
+Before a batch is rendered, its media rows are downloaded and prepared (`inbound_media.attach`),
+each row's outcome is stored, and the files travel as attachments of the same orchestrator
+message; a media failure never holds the text back.
 """
 
 from __future__ import annotations
@@ -49,6 +53,7 @@ import psycopg
 from agents_common import runs as agent_runs
 from agents_common.db.queue import transition
 from agents_common.orchestrator import (
+    Attachment,
     NotFound,
     OrchestratorClient,
     OrchestratorError,
@@ -59,7 +64,7 @@ from agents_common.orchestrator import (
 from agents_common.templating import TemplateError
 from psycopg_pool import AsyncConnectionPool
 
-from agents_matrix_connector import anonymize, discovery, prompt
+from agents_matrix_connector import anonymize, discovery, inbound_media, prompt
 from agents_matrix_connector.clock import utcnow
 from agents_matrix_connector.db import (
     bindings,
@@ -157,6 +162,11 @@ class _Batch:
     kind: str
     ref: agent_runs.RunRef
     rows: Sequence[InboundRow]
+
+
+def _attachments(outcomes: Sequence[inbound_media.Outcome]) -> list[Attachment] | None:
+    attachments = [o.attachment for o in outcomes if o.attachment is not None]
+    return attachments or None
 
 
 class Worker:
@@ -343,7 +353,8 @@ class Worker:
 
     async def _dispatch(self, batch: _Batch) -> None:
         """Create the run's session `mx-<run id>` and post the first prompt."""
-        text = await self._render(batch, first=True)
+        outcomes = await self._attach(batch)
+        text = await self._render(batch, first=True, media=outcomes)
         try:
             ref = await agent_runs.dispatch(
                 self._orchestrator,
@@ -352,6 +363,7 @@ class Worker:
                 text,
                 self._marker(batch),
                 from_user=True,
+                attachments=_attachments(outcomes),
             )
         except OrchestratorUnavailable as exc:
             self._unavailable(f"run {batch.ref.id}", exc)
@@ -378,7 +390,8 @@ class Worker:
             return
         async with self._pool.connection() as conn:
             seen = await runs.has_other_run(conn, session_id, batch.room_id, int(batch.ref.id))
-        text = await self._render(batch, first=not seen)
+        outcomes = await self._attach(batch)
+        text = await self._render(batch, first=not seen, media=outcomes)
         try:
             delivered = await agent_runs.deliver(
                 self._orchestrator,
@@ -388,6 +401,7 @@ class Worker:
                 text,
                 self._marker(batch),
                 from_user=True,
+                attachments=_attachments(outcomes),
             )
         except OrchestratorUnavailable as exc:
             self._unavailable(f"run {batch.ref.id}", exc)
@@ -475,15 +489,38 @@ class Worker:
         if session.is_up:
             await self._receipts.mark_read(int(ref.id), batch.room_id, batch.rows)
 
-    async def _render(self, batch: _Batch, *, first: bool) -> str:
+    async def _attach(self, batch: _Batch) -> list[inbound_media.Outcome]:
+        """Download and prepare the batch's media and record each row's outcome (guarded on
+        the row still being in progress for this run). The text never waits on media: every
+        failure is an outcome with a reason."""
+        outcomes = await inbound_media.attach(
+            batch.rows, self._matrix, self._settings, self._bridge_server
+        )
+        if outcomes:
+            async with self._pool.connection() as conn, conn.transaction():
+                for outcome in outcomes:
+                    await inbound.set_media_outcome(
+                        conn,
+                        outcome.row_id,
+                        int(batch.ref.id),
+                        "attached" if outcome.attachment is not None else "not_attached",
+                        outcome.reason,
+                    )
+        return outcomes
+
+    async def _render(
+        self, batch: _Batch, *, first: bool, media: Sequence[inbound_media.Outcome] = ()
+    ) -> str:
         """The prompt of the batch; in a room flagged `anonymize_names` the room name and every
-        sender are pseudonyms and no Facebook id is shown (bodies stay as written)."""
+        sender are pseudonyms, no Facebook id and no original file name is shown (bodies stay as
+        written)."""
         room = await directory.get_room(self._pool, batch.room_id)
         setting = await rules.get_room_settings(self._pool, batch.room_id)
         room_name = room.name if room else None
         sender: Callable[[InboundRow], str] = prompt.sender_name
         facebook_id: Callable[[str], str | None] = self._facebook_id
-        if setting is not None and setting.anonymize_names:
+        anonymized = setting is not None and setting.anonymize_names
+        if anonymized:
             labeler = anonymize.Labeler(self._settings.anonymize_admins, self._facebook_id)
             excluded = self._settings.self_ids() | set(self._settings.bridge_bots)
             members = room.members if room else []
@@ -499,6 +536,8 @@ class Worker:
             preamble=await self._preamble(batch, room_name, sender) if first else "",
             sender=sender,
             is_admin=self._is_admin,
+            media={outcome.row_id: outcome for outcome in media},
+            hide_media_names=anonymized,
         )
 
     async def _memory(self, room_id: str) -> str:
