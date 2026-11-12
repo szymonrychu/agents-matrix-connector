@@ -12,6 +12,7 @@ from agents_matrix_connector.chunks import split
 from agents_matrix_connector.db import inbound, runs, sends
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
 from agents_matrix_connector.matrix import MatrixAuthError, MatrixClient
+from agents_matrix_connector.receipts import ReadReceipts
 from agents_matrix_connector.sender import Sender
 from agents_matrix_connector.settings import BotSettings
 from agents_matrix_connector.tracker import NOTICE, Tracker
@@ -33,16 +34,18 @@ class Clock:
 
 
 class SpyMatrix:
-    """Records the bot's send and typing calls and forwards them to the real client.
+    """Records the bot's send, typing and receipt calls and forwards them to the real client.
 
     `events` records every `send_event` call; `sends` keeps the text view
-    `(room, txn id, body)` of each `m.room.message` sent either way."""
+    `(room, txn id, body)` of each `m.room.message` sent either way; `calls` keeps the order of
+    receipts (`"receipt"`) and event sends (`"send"`)."""
 
     def __init__(self, client: MatrixClient):
         self._client = client
         self.sends: list[tuple[str, str, str]] = []
         self.events: list[tuple[str, str, str, dict]] = []
         self.typings: list[tuple[str, bool, int]] = []
+        self.calls: list[str] = []
 
     async def send_text(self, room_id: str, txn_id: str, body: str) -> str:
         self.sends.append((room_id, txn_id, body))
@@ -50,6 +53,7 @@ class SpyMatrix:
 
     async def send_event(self, room_id: str, event_type: str, txn_id: str, content: dict) -> str:
         self.events.append((room_id, event_type, txn_id, content))
+        self.calls.append("send")
         if event_type == "m.room.message":
             self.sends.append((room_id, txn_id, content["body"]))
         return await self._client.send_event(room_id, event_type, txn_id, content)
@@ -59,6 +63,10 @@ class SpyMatrix:
     ) -> None:
         self.typings.append((room_id, typing, timeout_ms))
         await self._client.typing(user_id, room_id, typing, timeout_ms)
+
+    async def send_receipt(self, room_id: str, event_id: str) -> None:
+        self.calls.append("receipt")
+        await self._client.send_receipt(room_id, event_id)
 
 
 def make_settings(**overrides) -> BotSettings:
@@ -594,6 +602,91 @@ async def test_typing_refreshed(tracker, pool, orch, orch_client, hs, matrix):
     await tracker.tick()
     assert matrix.typings[-1] == (ROOM, True, 30000)
     assert hs.typing_state(ROOM) is True
+
+
+def newest_event(run_id: int, bodies: int = 1) -> str:
+    """The newest event of a seeded run: its rows have no origin time, so the greatest id."""
+    return f"$e{run_id}-{bodies - 1}"
+
+
+async def test_no_receipt_while_queued(tracker, pool, orch, orch_client, hs, matrix):
+    await seed(pool, orch, orch_client)
+    await tracker.tick()
+    assert hs.receipts(ROOM) == []
+    assert matrix.typings == [(ROOM, True, 30000)]
+
+
+async def test_receipt_on_sent_once(tracker, pool, orch, orch_client, hs):
+    run_id, message_id, _ = await seed(pool, orch, orch_client, bodies=("one", "two"))
+    await tracker.tick()
+    orch.mark_sent(message_id)
+    await tracker.tick()
+    assert hs.receipts(ROOM) == [newest_event(run_id, 2)]
+    await tracker.tick()
+    assert hs.receipts(ROOM) == [newest_event(run_id, 2)]
+    assert await run_state(pool, run_id) == ("in-progress", None)
+
+
+async def test_receipt_before_reply_when_completed_between_ticks(
+    tracker, pool, orch, orch_client, hs, matrix
+):
+    run_id, message_id, _ = await seed(pool, orch, orch_client)
+    orch.complete_turn(message_id, "hello")
+    await tracker.tick()
+    assert hs.receipts(ROOM) == [newest_event(run_id)]
+    assert matrix.calls.index("receipt") < matrix.calls.index("send")
+    assert bodies(hs) == ["hello"]
+    assert await run_state(pool, run_id) == ("handled", None)
+
+
+async def test_no_receipt_for_failed_message_without_turn(tracker, pool, orch, orch_client, hs):
+    run_id, message_id, _ = await seed(pool, orch, orch_client)
+    orch.fail_turn(message_id)
+    await tracker.tick()
+    assert bodies(hs) == [NOTICE]
+    assert await run_state(pool, run_id) == ("failed", "message_failed")
+    assert hs.receipts(ROOM) == []
+
+
+async def test_no_receipt_when_worker_marked(orch_client, matrix, pool, clock, orch, hs):
+    receipts = ReadReceipts(matrix)
+    tracker = Tracker(orch_client, matrix, pool, make_settings(), now=clock, receipts=receipts)
+    run_id, message_id, _ = await seed(pool, orch, orch_client)
+    async with pool.connection() as conn:
+        rows = await inbound.run_rows(conn, run_id)
+    assert await receipts.mark_read(run_id, ROOM, rows)
+    orch.mark_sent(message_id)
+    await tracker.tick()
+    await tracker.tick()
+    assert hs.receipts(ROOM) == [newest_event(run_id)]
+
+
+async def test_restarted_tracker_sends_at_most_one(orch_client, matrix, pool, clock, orch, hs):
+    run_id, message_id, _ = await seed(pool, orch, orch_client)
+    orch.mark_sent(message_id)
+    await Tracker(orch_client, matrix, pool, make_settings(), now=clock).tick()
+    restarted = Tracker(orch_client, matrix, pool, make_settings(), now=clock)
+    await restarted.tick()
+    await restarted.tick()
+    assert hs.receipts(ROOM) == [newest_event(run_id)] * 2
+
+
+async def test_tracker_receipt_failure_logged_once(tracker, pool, orch, orch_client, hs, caplog):
+    caplog.set_level(logging.WARNING, logger="agents_matrix_connector")
+    run_id, message_id, _ = await seed(pool, orch, orch_client)
+    hs.fail_next("receipt", 403, "M_FORBIDDEN")
+    orch.mark_sent(message_id)
+    await tracker.tick()
+    await tracker.tick()
+    warnings = [r.getMessage() for r in caplog.records if "receipt" in r.getMessage()]
+    assert len(warnings) == 1 and ROOM in warnings[0] and "403" in warnings[0]
+    assert TOKEN not in warnings[0]
+    assert hs.receipts(ROOM) == []
+    assert await run_state(pool, run_id) == ("in-progress", None)
+    orch.complete_turn(message_id, "hello")
+    await tracker.tick()
+    assert bodies(hs) == ["hello"]
+    assert hs.receipts(ROOM) == []
 
 
 async def test_daily_prune(tracker, pool, clock, hs):

@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse, Response
 
 from agents_matrix_connector.bridge import BridgeError, ProvisioningClient
 from agents_matrix_connector.matrix import MatrixAuthError, MatrixClient
+from agents_matrix_connector.receipts import ReadReceipts
 from agents_matrix_connector.room_requests import RoomRequests
 from agents_matrix_connector.sender import Sender
 from agents_matrix_connector.settings import BotSettings
@@ -224,9 +225,10 @@ async def _main(settings, pool, orchestrator, matrix, stop, bridge=None) -> int:
         )
         return EXIT_BAD_SETTINGS
     sync = SyncLoop(matrix, pool, settings, auto_join_source=lambda: _management_room(bridge))
-    worker = Worker(orchestrator, matrix, pool, settings)
+    receipts = ReadReceipts(matrix)
+    worker = Worker(orchestrator, matrix, pool, settings, receipts=receipts)
     sender = Sender(pool, settings)
-    tracker = Tracker(orchestrator, matrix, pool, settings)
+    tracker = Tracker(orchestrator, matrix, pool, settings, receipts=receipts)
     room_requests = RoomRequests(pool, matrix, bridge, settings)
     held = asyncio.Event()
     body = asyncio.create_task(

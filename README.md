@@ -771,11 +771,14 @@ rules still decide who is heard.
 
 ### Read receipts
 
-The bot marks a message read (a public Matrix `m.read` receipt on the newest message of the
-batch, which mautrix-meta bridges to Messenger as "seen") when it hands it to the agent, in the
-same step that starts the typing indicator. It never sends a receipt in chats it does not
-route: denied chats, chats without a preset, and messages that were ignored or refused. A
-failed receipt is logged and never costs the agent its reply.
+The bot marks the newest message of a batch read (a public Matrix `m.read` receipt, which
+mautrix-meta bridges to Messenger as "seen") once the agent has it: at handoff when the session
+is already up, else when the orchestrator reports the message sent (polled every
+`MATRIX_POLL_SECONDS`). It never marks read while the session is still starting, never waits
+for the reply, and never marks a message that failed before the agent got it. One receipt per
+batch. The typing indicator is unchanged: it starts at handoff. It never sends a receipt in
+chats it does not route: denied chats, chats without a preset, and messages that were ignored
+or refused. A failed receipt is logged and never costs the agent its reply.
 
 ### Handing the identity back to Hermes
 

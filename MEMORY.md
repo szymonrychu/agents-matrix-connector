@@ -14,6 +14,21 @@ Lessons that outlive a session. Newest first.
   (`ChatMember.Nickname` unused). Whole word, casefold, Unicode `\w` boundary, optional leading
   `@`, max 10 aliases x 64 chars; none keeps and `[]` clears, like `anonymize_names`. Aliases
   never grant access, only wake an already allowed room.
+- Read receipt once the hive has the message (T-138, Q5 B), replacing the 2026-10-26 "on
+  handoff" rule: the 202 at handoff only means queued, and live run 636 showed "seen" ~95 s
+  before the answer while the pod was still starting. At handoff the receipt is sent only when
+  `get_session(...).is_up` (active, start finished, a ready agent); else the tracker sends it
+  when the polled message is `sent` or has a turn. `sent` counts as received because the
+  connector posts on the regular lane, which types into a busy agent mid-turn, and both
+  orchestrator pick queries need a ready agent with a wrapper session. Never while the hive is
+  starting, never waiting for the reply, never for a message that failed or was cancelled
+  without a turn. `is_up` at handoff may mark read during a slash-command 409 requeue,
+  accepted by the user. Once per run through an in-memory set in `receipts.ReadReceipts`
+  shared by worker and tracker, marked before the send (a failed send is logged once, not
+  retried) and forgotten when the tracker closes the run; a restart may resend one receipt per
+  in-flight run, which the bridge ignores (not after LastRead). Typing is unchanged (Q6 No).
+  agents-common v0.7.0 -> v0.14.0 for `Session.summary`/`is_up` (v0.8-v0.13 add nothing that
+  breaks amc: project adoption only applies with `project=`, which amc never passes).
 
 ## 2026-11-11 decisions
 
@@ -271,6 +286,7 @@ Lessons that outlive a session. Newest first.
   receipt for the newest event of a batch in `Worker._delivered`, next to the typing
   indicator, so "seen" means the agent has the message. Best-effort like typing, and only for
   handed-off rows, so a denied stranger never sees "seen" from the bot's Facebook account.
+  Amended 2026-11-12 (T-138): sent when the hive has the message, not at handoff.
 
 ## 2026-10-25 decisions
 
