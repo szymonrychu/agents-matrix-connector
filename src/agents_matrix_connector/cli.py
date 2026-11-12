@@ -14,7 +14,7 @@ from agents_common.settings import SettingsError, load_settings
 from pydantic import Field, SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from agents_matrix_connector import __version__
+from agents_matrix_connector import __version__, media
 from agents_matrix_connector.api.agent import create_agent_app
 from agents_matrix_connector.api.app import create_api_app
 from agents_matrix_connector.bot import run_bot, serve_asgi
@@ -137,6 +137,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(
         level=settings.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s %(message)s"
     )
+    media.quiet_file_urls()
     return run(settings)
 
 

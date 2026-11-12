@@ -1094,7 +1094,7 @@ def build_admin_router(
     the routes the superleader needs (`_ADMIN_ROUTES`)."""
     admin = APIRouter()
     for router in (
-        build_rooms_router(pool, orchestrator, settings),
+        build_rooms_router(pool, orchestrator, settings, admin=True),
         build_rules_router(pool, orchestrator),
         build_room_requests_router(pool, settings),
     ):
@@ -1109,7 +1109,6 @@ def build_admin_router(
 def create_agent_app(
     pool: AsyncConnectionPool, orchestrator: Any, settings: ApiSettings
 ) -> FastAPI:
-    media.quiet_file_urls()
     app = FastAPI(
         title="agents-matrix-connector agent API",
         openapi_url=f"{CHAT_PREFIX}/openapi.json",

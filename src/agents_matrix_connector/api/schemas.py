@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from agents_matrix_connector.discovery import normalize_aliases
 
@@ -105,7 +105,7 @@ class RoomDetail(RoomView):
     members: list[MemberView]
 
 
-class RoomSettingsIn(BaseModel):
+class _RoomSettingsBase(BaseModel):
     preset_id: uuid.UUID | None = None
     trigger: Literal["all", "mention"] | None = None
     agents_may_initiate: bool | None = None
@@ -114,13 +114,24 @@ class RoomSettingsIn(BaseModel):
     """None (or omitted) keeps the stored value."""
     agent_aliases: list[str] | None = None
     """None (or omitted) keeps the stored aliases, a list replaces them, `[]` clears them."""
-    agents_may_send_files: bool | None = None
-    """None (or omitted) keeps the stored value: the flag is an authorisation grant."""
 
     @field_validator("agent_aliases")
     @classmethod
     def _clean_aliases(cls, value: list[str] | None) -> list[str] | None:
         return None if value is None else list(normalize_aliases(value))
+
+
+class RoomSettingsIn(_RoomSettingsBase):
+    agents_may_send_files: bool | None = None
+    """None (or omitted) keeps the stored value: the flag is an authorisation grant."""
+
+
+class AdminRoomSettingsIn(_RoomSettingsBase):
+    """The agent admin body: as `RoomSettingsIn` without `agents_may_send_files`, which only the
+    web listener may set (an agent must not grant itself file sends); a request carrying it is
+    refused with 422 and a save leaves the stored value unchanged."""
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class RoomAllowIn(BaseModel):

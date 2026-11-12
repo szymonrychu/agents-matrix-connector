@@ -43,6 +43,77 @@
         "title": "AccessView",
         "type": "object"
       },
+      "AdminRoomSettingsIn": {
+        "additionalProperties": false,
+        "description": "The agent admin body: as `RoomSettingsIn` without `agents_may_send_files`, which only the\nweb listener may set (an agent must not grant itself file sends); a request carrying it is\nrefused with 422 and a save leaves the stored value unchanged.",
+        "properties": {
+          "agent_aliases": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Aliases"
+          },
+          "agents_may_initiate": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agents May Initiate"
+          },
+          "anonymize_names": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anonymize Names"
+          },
+          "preset_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preset Id"
+          },
+          "trigger": {
+            "anyOf": [
+              {
+                "enum": [
+                  "all",
+                  "mention"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger"
+          }
+        },
+        "title": "AdminRoomSettingsIn",
+        "type": "object"
+      },
       "BindingView": {
         "description": "The room's active binding; a reservation by a first run in progress has no session yet.",
         "properties": {
@@ -1215,86 +1286,6 @@
         "title": "RoomRequestView",
         "type": "object"
       },
-      "RoomSettingsIn": {
-        "properties": {
-          "agent_aliases": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Agent Aliases"
-          },
-          "agents_may_initiate": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Agents May Initiate"
-          },
-          "agents_may_send_files": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Agents May Send Files"
-          },
-          "anonymize_names": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Anonymize Names"
-          },
-          "preset_id": {
-            "anyOf": [
-              {
-                "format": "uuid",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Preset Id"
-          },
-          "trigger": {
-            "anyOf": [
-              {
-                "enum": [
-                  "all",
-                  "mention"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Trigger"
-          }
-        },
-        "title": "RoomSettingsIn",
-        "type": "object"
-      },
       "RoomSkill": {
         "properties": {
           "body": {
@@ -2360,7 +2351,7 @@
     },
     "/chat/v1/admin/rooms/{room_id}/settings": {
       "put": {
-        "operationId": "put_settings_chat_v1_admin_rooms__room_id__settings_put",
+        "operationId": "put_admin_settings_chat_v1_admin_rooms__room_id__settings_put",
         "parameters": [
           {
             "in": "path",
@@ -2376,7 +2367,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/RoomSettingsIn"
+                "$ref": "#/components/schemas/AdminRoomSettingsIn"
               }
             }
           },
@@ -2404,7 +2395,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Put Settings"
+        "summary": "Put Admin Settings"
       }
     },
     "/chat/v1/admin/rules": {

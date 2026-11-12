@@ -35,7 +35,7 @@ from agents_common.orchestrator import (
 )
 from psycopg_pool import AsyncConnectionPool
 
-from agents_matrix_connector import anonymize, media
+from agents_matrix_connector import anonymize
 from agents_matrix_connector.chunks import split
 from agents_matrix_connector.clock import utcnow
 from agents_matrix_connector.db import bindings, inbound, rules, runs, send_files, sends
@@ -125,7 +125,6 @@ class Tracker:
         self._timeout = timedelta(seconds=settings.run_timeout_seconds)
         self._last_prune: datetime | None = None
         self._upload_limit = upload_limit
-        media.quiet_file_urls()
 
     async def tick(self) -> None:
         async with self._pool.connection() as conn:

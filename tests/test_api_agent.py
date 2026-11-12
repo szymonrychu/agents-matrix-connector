@@ -20,6 +20,7 @@ import pytest
 from api_helpers import BOT, DM, GRP, make_settings
 from psycopg_pool import AsyncConnectionPool
 
+from agents_matrix_connector import media
 from agents_matrix_connector.anonymize import pseudonym
 from agents_matrix_connector.api import agent as agent_api
 from agents_matrix_connector.api.agent import CHAT_PREFIX, create_agent_app, valid_key
@@ -1980,6 +1981,7 @@ async def test_send_files_refused_send_files_failed(agent, conn, fake):
 
 
 async def test_send_files_audit_log_has_no_path_or_bytes(agent, conn, fake, caplog):
+    media.quiet_file_urls()  # the bot and api entry point installs it at startup
     caplog.set_level(logging.DEBUG)
     room, session = await files_room(conn, fake)
     data = b"CANARY-T155-audit secret words\n"

@@ -588,7 +588,9 @@ As `POST /matrix/api/v1/rooms/{room_id}/allow`.
 
 ### `PUT /chat/v1/admin/rooms/{room_id}/settings`
 
-As `PUT /matrix/api/v1/rooms/{room_id}/settings`.
+As `PUT /matrix/api/v1/rooms/{room_id}/settings` without `agents_may_send_files`: only the
+web listener may set that flag, so an agent body carrying it is 422 `invalid_request` and a save
+leaves the stored value unchanged.
 
 ### `GET /chat/v1/admin/users`
 
