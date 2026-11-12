@@ -178,3 +178,23 @@ async def test_ui_app_keeps_source_allowlist():
             assert r.status_code == 404, path
             assert r.json()["error"]["code"] == "not_found"
         assert not any(getattr(route, "path", "").startswith(CHAT_PREFIX) for route in app.routes)
+
+
+async def test_agent_header_documented_only_on_message_send():
+    token, digest = make_token()
+    async with agent_client(digest) as c:
+        r = await c.get(f"{CHAT_PREFIX}/openapi.json", headers=bearer(token))
+    paths = r.json()["paths"]
+    with_agent = {
+        (path, method)
+        for path, ops in paths.items()
+        for method, op in ops.items()
+        if any(p["name"] == "X-Orch-Agent" for p in op.get("parameters", []))
+    }
+    assert with_agent == {(f"{CHAT_PREFIX}/messages", "post")}
+    [header] = [
+        p
+        for p in paths[f"{CHAT_PREFIX}/messages"]["post"]["parameters"]
+        if p["name"] == "X-Orch-Agent"
+    ]
+    assert header["in"] == "header" and header["required"] is False

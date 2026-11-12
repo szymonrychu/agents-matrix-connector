@@ -473,6 +473,10 @@
             "title": "Agents May Initiate",
             "type": "boolean"
           },
+          "agents_may_send_files": {
+            "title": "Agents May Send Files",
+            "type": "boolean"
+          },
           "alias": {
             "anyOf": [
               {
@@ -645,6 +649,7 @@
           "agents_may_initiate",
           "anonymize_names",
           "agent_aliases",
+          "agents_may_send_files",
           "session",
           "binding",
           "last_event_at",
@@ -671,6 +676,10 @@
           },
           "agents_may_initiate": {
             "title": "Agents May Initiate",
+            "type": "boolean"
+          },
+          "agents_may_send_files": {
+            "title": "Agents May Send Files",
             "type": "boolean"
           },
           "alias": {
@@ -841,6 +850,7 @@
           "agents_may_initiate",
           "anonymize_names",
           "agent_aliases",
+          "agents_may_send_files",
           "session",
           "binding",
           "last_event_at",
@@ -877,6 +887,17 @@
               }
             ],
             "title": "Agents May Initiate"
+          },
+          "agents_may_send_files": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agents May Send Files"
           },
           "anonymize_names": {
             "anyOf": [
@@ -934,6 +955,10 @@
           },
           "agents_may_initiate": {
             "title": "Agents May Initiate",
+            "type": "boolean"
+          },
+          "agents_may_send_files": {
+            "title": "Agents May Send Files",
             "type": "boolean"
           },
           "alias": {
@@ -1097,6 +1122,7 @@
           "agents_may_initiate",
           "anonymize_names",
           "agent_aliases",
+          "agents_may_send_files",
           "session",
           "binding",
           "last_event_at",

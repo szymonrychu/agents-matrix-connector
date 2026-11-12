@@ -185,3 +185,25 @@ async def test_allow_room_aliases_keep_and_replace(pool):
             agent_aliases=["Agent"],
         )
     assert (await rules.get_room_settings(pool, "!r:x")).agent_aliases == ("Agent",)
+
+
+async def test_send_files_flag_round_trip(pool):
+    fresh = await rules.set_room_settings(pool, "!r:x", preset_id=None, trigger=None)
+    assert fresh.agents_may_send_files is False
+    on = await rules.set_room_settings(
+        pool, "!r:x", preset_id=None, trigger="all", agents_may_send_files=True
+    )
+    assert on.agents_may_send_files is True
+    assert await rules.get_room_settings(pool, "!r:x") == on
+    kept = await rules.set_room_settings(pool, "!r:x", preset_id=None, trigger=None)
+    assert kept.agents_may_send_files is True
+    async with pool.connection() as conn, conn.transaction():
+        await rules.allow_room(
+            conn, "!r:x", preset_id=None, trigger=None, agents_may_initiate=True, note="n"
+        )
+    assert (await rules.get_room_settings(pool, "!r:x")).agents_may_send_files is True
+    off = await rules.set_room_settings(
+        pool, "!r:x", preset_id=None, trigger=None, agents_may_send_files=False
+    )
+    assert off.agents_may_send_files is False
+    assert (await rules.get_room_settings(pool, "!r:x")).agents_may_send_files is False

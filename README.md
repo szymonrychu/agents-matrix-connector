@@ -152,8 +152,8 @@ Bot user, homeserver, default policy, group trigger, rule kinds per list and syn
 
 Discovered rooms. Query: `kind` (`dm`, `group`, `matrix`, `infrastructure`), `access`
 (`allowed`, `denied`, `default`). 200 list of rooms with `access`, `preset_id`, `trigger`,
-`effective_trigger`, `agents_may_initiate`, `anonymize_names` (false when the room has no
-settings) and `agent_aliases` (`[]` without settings), `session`
+`effective_trigger`, `agents_may_initiate`, `anonymize_names`, `agents_may_send_files` (false
+when the room has no settings) and `agent_aliases` (`[]` without settings), `session`
 (the latest run: `id`, `slug`, `status`, or null), `binding` (the room's active session binding:
 `session_id`, `slug`, `origin` `inbound` or `agent`, `since`; `session_id` null while a first run
 reserves the room; null when the room is unbound), `queued` (messages waiting),
@@ -176,12 +176,14 @@ One room (the fields of the list, `pending` included) with its `members` (`user_
 ### `PUT /matrix/api/v1/rooms/{room_id}/settings`
 
 Body `{"preset_id": uuid|null, "trigger": "all"|"mention"|null, "agents_may_initiate":
-true|false|null, "anonymize_names": true|false|null, "agent_aliases": [string]|null}`: the room's preset and trigger override
+true|false|null, "anonymize_names": true|false|null, "agent_aliases": [string]|null,
+"agents_may_send_files": true|false|null}`: the room's preset and trigger override
 (null or omitted clears), whether agents may start a chat in the room while it is unbound
-(`agents_may_initiate`, off by default) and whether the chat agent sees pseudonyms instead of
-the people's names (`anonymize_names`, off by default, see "Name anonymization"). An omitted or
-null flag keeps its stored value (false for a room without settings), so a save of the preset or
-trigger never changes either. `agent_aliases` (at most 10 names of up to 64 characters, see
+(`agents_may_initiate`, off by default), whether the chat agent sees pseudonyms instead of
+the people's names (`anonymize_names`, off by default, see "Name anonymization") and whether
+agents may send workdir files to the room (`agents_may_send_files`, off by default, see "Agent
+files"). An omitted or null flag keeps its stored value (false for a room without settings), so a
+save of the preset or trigger never changes any of them. `agent_aliases` (at most 10 names of up to 64 characters, see
 "Mentions") are cleaned (trimmed, one leading `@` dropped, spaces collapsed, case-insensitive
 duplicates dropped); null or omitted keeps the stored list, `[]` clears it, an invalid one is 422
 `invalid_request`. 200 room; 404
@@ -311,7 +313,9 @@ The UI app on `MATRIX_HTTP_PORT` serves no `/chat/v1` path. Every `/chat/v1` cal
 `X-Orch-Session: <session uuid>` (missing or malformed: `401 unauthorized`) and `X-Orch-Slug:
 <slug>` (stored with the send; may be absent, else the orchestrator's session slug rules: a
 DNS-1123 label of at most 40 characters, not `orchestrator` or `orchestrator-*`, or `400
-invalid_slug`). The agent's own token never reaches the
+invalid_slug`). A message with `files` also needs `X-Orch-Agent: <agent uuid>`, the calling
+agent whose workdir holds the files (missing or malformed: `422 files_unavailable`; ignored
+without files). The agent's own token never reaches the
 connector.
 
 Message ids: `m<n>` is a chat message (the `id` the prompt shows on each `<message>`), `s<n>`
@@ -335,8 +339,13 @@ send that created it reached nobody); turning `agents_may_initiate` off does not
 Checks run in this order and a refusal queues nothing: `X-Orch-Session` (`401 unauthorized`),
 `X-Orch-Slug` (`400 invalid_slug`), body (`422 invalid_request`, `422 invalid_key`, `422 invalid_text`), references (`422 bad_reference`), room choice
 (`422 room_required`), (a) (`403 room_not_allowed`), (b) (`409 room_bound`, `403
-room_not_authorised`, `409 session_bound`, in that order), duplicate (`202` with the existing
-send), rate (`429 rate_limited`), room chunk cap (`429 room_chunk_limit`). The (b) check is
+room_not_authorised`, `409 session_bound`, in that order), then for a message with `files`: the
+room's `agents_may_send_files` (`403 files_not_allowed`), pseudonyms in `text` and file names
+(`422 pseudonym_disclosed`), path rules (`422 invalid_file_path`), a pre-check of rate and room
+bytes (`429 rate_limited`, `429 room_file_bytes_limit`), the download of each file (`422
+files_unavailable`, `404 file_not_found`, `413 file_too_large`, `503 unavailable`); then
+duplicate (`202` with the existing send), rate (`429 rate_limited`), room chunk cap (`429
+room_chunk_limit`), room file bytes (`429 room_file_bytes_limit`). The (b) check is
 advisory: the bot's claim re-checks it, refusing a send that lost a race with reason
 `room_bound`, `session_bound` or `room_not_authorised`. The duplicate lookup, the rate count and
 the room chunk count run under transaction-scoped advisory locks on the session and on the room,
@@ -347,8 +356,9 @@ whose room check fails answers `422 bad_reference`, the same as an unknown id, s
 cannot probe which ids exist in other rooms. In the session's own room the specific code applies.
 
 Duplicate rule: a request identical to a send of the same session, room and kind, with the same
-`text` (message) or `key` (reaction) and the same `reply_to` (a reaction's `to`), compared
-exactly, whose status is `queued`, `sending` or `sent` and that was created in the last 60 s,
+`text` (message) or `key` (reaction), the same `reply_to` (a reaction's `to`) and the same
+files (the ordered list of their sha256, so the same path with new content is a new send),
+compared exactly, whose status is `queued`, `sending` or `sent` and that was created in the last 60 s,
 answers `202` with the existing send's id and current status and stores nothing, so a retry after
 a timeout never posts twice. A `failed` or `refused` send is not a duplicate. A duplicate is not
 counted by the rate limit and is answered even at the limit.
@@ -358,8 +368,30 @@ status) per session in the last 60 s.
 
 Room chunk cap: at most `MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR` Matrix events per room in the last
 hour, summed over every session that sent there. A message counts one per chunk (its text split
-at `MATRIX_REPLY_CHUNK_CHARS`, so one 16000-character message is 4 chunks at the default), a
-reaction one; `refused` sends do not count. A send that would pass the cap is refused whole.
+at `MATRIX_REPLY_CHUNK_CHARS`, so one 16000-character message is 4 chunks at the default) plus
+one per file, a reaction one; `refused` sends do not count. A send that would pass the cap is
+refused whole.
+
+Agent files: a message may carry `files`, at most `MATRIX_AGENT_FILES_PER_SEND` (4; the schema
+caps the list at 4) relative paths in the calling agent's workdir, only in a room flagged
+`agents_may_send_files` (off by default, set with the room settings route or the agents-web
+switch). Path rules: relative, at most 512 characters, no NUL, no empty, `.` or `..` component,
+no component starting with `.` except a leading `.attachments/` (files the agent received), and
+no `.env`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*` or `credentials*` name; a refusal names
+the index (`files[<i>]`), never the path. The api downloads each file through the orchestrator
+at request time, holding no database connection, types it from its bytes (`m.image` for jpeg,
+png, gif and webp, `m.video`, `m.audio`, else `m.file`), caps an image at
+`MATRIX_AGENT_IMAGE_MAX_BYTES` (8000000) and any other file at `MATRIX_AGENT_FILE_MAX_BYTES`
+(25000000), strips image metadata (EXIF, XMP, text chunks), and stores the bytes with the send
+until it settles. Each file is one Matrix event after the text (no captions), named after the
+path's basename (`[A-Za-z0-9._-]`, at most 128 characters); the quoted reply relation stays on
+the first event. Room file bytes: at most `MATRIX_AGENT_ROOM_FILE_BYTES_PER_HOUR` per room in the
+last hour, all sessions together, `refused` sends not counted. The bot re-checks the flag when it
+claims the send (`refused`, `files_not_allowed`), uploads each file once (a retry reuses the
+stored content uri), fails a file over the homeserver's `m.upload.size`
+(`too_large_for_homeserver`) and clears the stored bytes once the send is `sent`, `failed` or
+`refused`. One INFO line per accepted file names the session, send id, position, size, mime and
+the first 12 hex of its sha256; never the path or the bytes.
 
 Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
 
@@ -369,7 +401,7 @@ Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
 | `invalid_slug` | 400 | `X-Orch-Slug` is sent but is not a valid session slug |
 | `not_found` | 404 | the id is not one of this session's sends, or the path does not exist |
 | `invalid_request` | 422 | a body field failed validation: `text` empty or over 16000 characters, a wrong type, an unknown field |
-| `invalid_text` | 422 | the message `text` has no non-whitespace character, so it could never be delivered |
+| `invalid_text` | 422 | the message has no `files` and its `text` is missing or has no non-whitespace character, so it could never be delivered |
 | `invalid_key` | 422 | the reaction `key` is not 1 to 16 code points, or has ASCII, whitespace or control characters |
 | `bad_reference` | 422 | `reply_to` or `to` is not an `m<n>` or `s<n>` this session can reference: unknown, another session's send, a send not yet `sent`, a reaction, of another room than the given `room`, an `m<n>` whose room is refused to a session that is not bound to it, or a raw event id |
 | `room_required` | 422 | no `room`, no `reply_to`, and the session is bound to no room |
@@ -379,14 +411,20 @@ Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
 | `session_bound` | 409 | the room is unbound and flagged, but the session is already bound to another room |
 | `rate_limited` | 429 | the session reached `MATRIX_AGENT_RATE_PER_MINUTE` sends in the last 60 s |
 | `room_chunk_limit` | 429 | the send would take the room past `MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR` chunks in the last hour |
-| `pseudonym_disclosed` | 422 | the room has `anonymize_names` and the message `text` contains a pseudonym (`user-<sha>`, `admin-<sha>`); the message names the tokens found, refer to the person differently |
+| `files_not_allowed` | 403 | the message has `files` and the room is not flagged `agents_may_send_files` |
+| `invalid_file_path` | 422 | a `files` entry breaks the path rules; the message names the index only |
+| `files_unavailable` | 422 | `files` without a valid `X-Orch-Agent`, or the orchestrator refused the download (the agent is not usable), or an image could not be read |
+| `file_not_found` | 404 | a `files` entry does not exist in the agent's workdir |
+| `file_too_large` | 413 | a file is over `MATRIX_AGENT_IMAGE_MAX_BYTES` (images) or `MATRIX_AGENT_FILE_MAX_BYTES` (other files) |
+| `room_file_bytes_limit` | 429 | the send would take the room past `MATRIX_AGENT_ROOM_FILE_BYTES_PER_HOUR` file bytes in the last hour |
+| `pseudonym_disclosed` | 422 | the room has `anonymize_names` and the message `text` or a file name contains a pseudonym (`user-<sha>`, `admin-<sha>`); the message names the tokens found, refer to the person differently |
 | `room_unbound` | 409 | the notes or skills routes need the session to be bound to a chat room, and it is bound to none |
 | `version_conflict` | 409 | `expected_version` is not the stored version: re-read and merge, then write again |
 | `skill_not_found` | 404 | the room has no skill of that name (also a PUT with `expected_version` above 0 on a missing one) |
 | `skill_too_large` | 413 | the skill `body` is over `MATRIX_ROOM_SKILL_MAX_CHARS` characters (counted in code points) |
 | `skill_limit` | 409 | creating the skill would pass `MATRIX_ROOM_SKILLS_MAX` skills in the room: delete one first |
 | `notes_too_large` | 413 | the notes `body` is over `MATRIX_ROOM_NOTES_MAX_CHARS` characters (counted in code points) |
-| `unavailable` | 503 | the database is unavailable |
+| `unavailable` | 503 | the database (or, for `files`, the orchestrator) is unavailable |
 
 Send statuses: `queued` (accepted, waiting for the bot), `sending` (claimed by the bot, being
 delivered), `sent` (every Matrix event delivered), `failed` (delivery failed), `refused` (the bot's
@@ -395,8 +433,12 @@ claim or send-time check refused it). Reasons:
 - `room_bound`, `session_bound`, `room_not_authorised`: refused, (b) failed at the bot's claim
 - `room_infrastructure`, `room_encrypted`, `denied: <kind>`, `not_allowed`: refused, (a)
   failed at the claim or before a Matrix event was sent
-- `forbidden`: failed, the homeserver refused the event; another failure carries the
-  homeserver's errcode, or `send_failed`
+- `files_not_allowed`: refused, the room's `agents_may_send_files` was off when the bot claimed
+  a send with files
+- `too_large_for_homeserver`: failed, a file is over the homeserver's `m.upload.size`
+- `file_unavailable`: failed, a file's bytes were gone before it was uploaded
+- `forbidden`: failed, the homeserver refused the event or upload; another failure carries the
+  homeserver's errcode, or `send_failed` (`upload_failed` for an upload without one)
 
 ### `GET /chat/v1/rooms`
 
@@ -405,22 +447,25 @@ true) when it passes (a), else, while the session is bound to no room, every unb
 room passing (a). The bound room comes first, then by `name` (code point order, rooms without a
 name last), then `room_id`. A room with `anonymize_names` is named with its people's
 pseudonyms (a DM after the other person, a group with member names replaced). 200
-`{"rooms": [{"room_id", "name", "kind", "bound", "agents_may_initiate"}]}`; 401 `unauthorized`.
+`{"rooms": [{"room_id", "name", "kind", "bound", "agents_may_initiate",
+"agents_may_send_files"}]}`; 401 `unauthorized`.
 
     curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
       http://localhost:8001/chat/v1/rooms
 
 ### `POST /chat/v1/messages`
 
-Body `{"text": str, "room": str|null, "reply_to": "m<n>"|"s<n>"|null}`: `text` 1 to 16000
-characters, stored unchanged and split into `MATRIX_REPLY_CHUNK_CHARS` chunks by the bot.
+Body `{"text": str|null, "files": [str], "room": str|null, "reply_to": "m<n>"|"s<n>"|null}`:
+`text` 1 to 16000 characters, stored unchanged and split into `MATRIX_REPLY_CHUNK_CHARS` chunks
+by the bot; optional when `files` is given (see "Agent files"; needs `X-Orch-Agent`).
 `room` is a Matrix room id; omitted, the room of `reply_to`, else the session's bound room. A
 `reply_to` sends a quoted reply to that message. 202 `{"id": "s<n>", "status": "queued"}` (a
 duplicate: the existing id and its status `queued`, `sending` or `sent`); 401 `unauthorized`;
 422 `invalid_request`, `invalid_text`, `bad_reference`, `room_required` or `pseudonym_disclosed`
-(checked after the room); 403 `room_not_allowed` or
-`room_not_authorised`; 409 `room_bound` or `session_bound`; 429 `rate_limited`; 503
-`unavailable`.
+(checked after the room), `invalid_file_path` or `files_unavailable`; 403 `room_not_allowed`,
+`room_not_authorised` or `files_not_allowed`; 404 `file_not_found`; 409 `room_bound` or
+`session_bound`; 413 `file_too_large`; 429 `rate_limited`, `room_chunk_limit` or
+`room_file_bytes_limit`; 503 `unavailable`.
 
     curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
       -H 'content-type: application/json' -d '{"text": "Build finished", "reply_to": "m42"}' \
@@ -442,7 +487,9 @@ reaction goes to the message's room, which passes (a) and (b) like a given room.
 ### `GET /chat/v1/messages/{id}`
 
 One of this session's sends by `s<n>`: 200 `{"id", "kind" ("message" or "reaction"), "status",
-"reason", "room_id", "created_at", "sent_at"}`; 404 `not_found` for any other id, another
+"reason", "room_id", "created_at", "sent_at", "files"}`, `files` a list of `{"name", "mime",
+"size", "status"}` in order (status `queued`, `uploaded`, `sent` or `failed`; empty without
+files); 404 `not_found` for any other id, another
 session's send included; 401 `unauthorized`.
 
     curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \

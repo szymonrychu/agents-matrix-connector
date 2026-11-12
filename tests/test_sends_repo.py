@@ -211,3 +211,56 @@ async def test_prune_ended_sends(conn):
     cur = await conn.execute("SELECT id FROM sends ORDER BY id")
     assert [r[0] for r in await cur.fetchall()] == [sending_old, sent_new, queued_old]
     assert await sends.prune(conn, cutoff) == 0
+
+
+async def add_file(conn, send_id, position, sha):
+    await conn.execute(
+        "INSERT INTO send_files (send_id, position, path, name, mime, msgtype, size, sha256)"
+        " VALUES (%s, %s, 'out/f', 'f', 'text/plain', 'm.file', 1, %s)",
+        (send_id, position, sha),
+    )
+
+
+async def test_find_duplicate_compares_ordered_file_shas(conn):
+    session = uuid.uuid4()
+
+    async def dup(text="hi", shas=()):
+        found = await sends.find_duplicate(
+            conn,
+            session_id=session,
+            room_id=ROOM,
+            kind="message",
+            text=text,
+            key=None,
+            reply_to=None,
+            seconds=60,
+            file_shas=shas,
+        )
+        return None if found is None else found.id
+
+    plain = await put(conn, session)
+    with_files = await put(conn, session)
+    await add_file(conn, with_files, 0, "aa")
+    await add_file(conn, with_files, 1, "bb")
+    files_only = await put(conn, session, text=None)
+    await add_file(conn, files_only, 0, "cc")
+
+    assert await dup() == plain
+    assert await dup(shas=["aa", "bb"]) == with_files
+    assert await dup(shas=["bb", "aa"]) is None
+    assert await dup(shas=["aa"]) is None
+    assert await dup(text=None, shas=["cc"]) == files_only
+    assert await dup(text=None) is None
+
+
+async def test_prune_cascades_to_send_files(conn):
+    session = uuid.uuid4()
+    old = await put(conn, session)
+    await add_file(conn, old, 0, "aa")
+    await conn.execute(
+        "UPDATE sends SET status = 'sent', created_at = %s WHERE id = %s",
+        (T0 - timedelta(days=40), old),
+    )
+    assert await sends.prune(conn, T0 - timedelta(days=30)) == 1
+    cur = await conn.execute("SELECT count(*) FROM send_files")
+    assert (await cur.fetchone())[0] == 0

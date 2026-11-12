@@ -4,6 +4,40 @@ Lessons that outlive a session. Newest first.
 
 ## 2026-11-12 decisions
 
+- Outbound agent files (T-155 step 3): the api downloads each file through the orchestrator
+  at request time (gate Q4), outside any pool connection: the room checks, flag, names, path
+  rules and a rate/room-bytes pre-check run on one connection, which is released before the
+  downloads, and the locked transaction re-checks duplicate, rate, chunks and room bytes on a
+  second one. Why: a download can take seconds for a 25 MB file and must not starve the pool
+  (2026-10-28 one-connection rule). The pre-check runs only for sends with files, so a text
+  duplicate is still answered at the rate limit.
+- A file counts as one chunk toward `MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR`, plus a new per-room
+  `MATRIX_AGENT_ROOM_FILE_BYTES_PER_HOUR` (refused sends do not count). Chunks bound Matrix
+  events, bytes bound bandwidth and Postgres growth from a looping agent.
+- Bytes live in `send_files.data` until the send settles; the sender's sweep (`clear_settled`,
+  every tick) nulls them for sent, failed and refused sends, so a crash between settle and clear
+  still ends with no bytes.
+- Upload once: the tracker stores `content_uri` right after the upload and sends the event with
+  the deterministic `mxa-<send>-f<position>` txn id, so a crash after the upload reuses the uri
+  and Synapse's txn dedup still holds.
+- No captions: text chunks go first as `m.text`, then one event per file; the quoted reply
+  relation is on the very first row (a file when there is no text). The bridge drops captions on
+  audio and marks them unreliable.
+- `agents_may_send_files` (gate Q3, default off) is checked by the api (403 files_not_allowed,
+  before any download) and re-checked at the bot's claim (refused `files_not_allowed`); it is
+  not re-checked per event at send time (room policy still is).
+- `X-Orch-Agent` is read only by `POST /chat/v1/messages` (a route header, not the shared
+  `caller` dependency), so the OpenAPI document shows it only where it matters; it is needed
+  only with `files` (422 files_unavailable when missing or not a uuid).
+- `text` keeps `min_length=1` (an empty string stays 422 invalid_request); a whitespace text
+  with files is stored as NULL; neither text nor files is 422 invalid_text, checked in the
+  handler (a pydantic model validator would answer invalid_request).
+- File URLs never reach logs: httpx logs every request URL at INFO, and the download URL holds
+  the workdir path, the upload URL the file name; `media.quiet_file_urls()` (installed by the
+  agent app and the tracker) drops those records from the `httpx` and matrix loggers.
+- Residual risk: a secret written into a workdir file can be sent, as it can be pasted into
+  `text`. The flag (default off) is the control; the name deny list only catches accidents and
+  the wrapper's workdir confinement is the hard boundary.
 - Attachments foundation (T-155): Pillow and pillow-heif are added because inbound photos must
   be re-encoded (EXIF stripped and orientation applied, long edge 2576, JPEG q85 stepping
   down) and iPhone HEIC must be readable; the agent's Read tool shows only jpeg/png/gif/webp.

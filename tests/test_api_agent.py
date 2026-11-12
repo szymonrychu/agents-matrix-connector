@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
+import logging
 import secrets
 import uuid
 from datetime import datetime
@@ -174,11 +176,13 @@ async def bindings_snapshot(conn) -> list[tuple]:
 
 
 @pytest.fixture
-async def agent_for(pool):
+async def agent_for(pool, orchestrator):
     clients = []
 
     def make(**extra) -> httpx.AsyncClient:
-        app = create_agent_app(pool, None, make_settings(agent_token_sha256=DIGEST, **extra))
+        app = create_agent_app(
+            pool, orchestrator, make_settings(agent_token_sha256=DIGEST, **extra)
+        )
         client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://agents" + CHAT_PREFIX
         )
@@ -951,8 +955,6 @@ async def test_validation(agent, conn):
         {"text": ""},
         {"text": "a" * 16001},
         {"text": "\U0001f600" * 16001},
-        {},
-        {"room": home},
         {"text": 5},
         {"text": "x", "extra": 1},
         {"text": "x", "room": 5},
@@ -961,6 +963,10 @@ async def test_validation(agent, conn):
     ):
         r = await agent.post("/messages", json=body, headers=as_(session))
         refused(r, 422, "invalid_request")
+    # Text is optional since files may be sent alone; neither text nor files is invalid_text.
+    for body in ({}, {"room": home}):
+        r = await agent.post("/messages", json=body, headers=as_(session))
+        refused(r, 422, "invalid_text")
     r = await agent.post(
         "/messages",
         content=b"{not json",
@@ -1080,6 +1086,7 @@ async def test_rooms_listing_order(agent, conn):
         "kind": "group",
         "bound": False,
         "agents_may_initiate": True,
+        "agents_may_send_files": False,
     }
     assert all(r["bound"] is False and r["agents_may_initiate"] for r in unbound_rooms)
 
@@ -1090,6 +1097,7 @@ async def test_rooms_listing_order(agent, conn):
             "kind": "dm",
             "bound": True,
             "agents_may_initiate": False,
+            "agents_may_send_files": False,
         }
     ]
     assert await listed(agent, bound_denied) == []
@@ -1173,6 +1181,7 @@ async def test_status_own_sends_only(agent, conn):
         "reason": None,
         "room_id": home,
         "sent_at": None,
+        "files": [],
     }
 
     await set_send(conn, send_id, status="sent", event_id="$out", sent_at=created)
@@ -1591,3 +1600,444 @@ async def test_skill_body_never_logged(agent, agent_for, conn, caplog):
         assert SKILL_CANARY not in response.text
     await skill_delete(agent, session, "deck-tune")
     assert SKILL_CANARY not in caplog.text
+
+
+# --- files (T-155 outbound) --------------------------------------------------------------------
+
+AGENT = uuid.UUID("00000000-0000-4000-8000-00000000a6e1")
+REFUSED_PATHS = [
+    "../x",
+    "/etc/passwd",
+    "a/../b",
+    ".env",
+    ".git/config",
+    "x/.hidden",
+    "keys/id_rsa",
+    "keys/id_ed25519.pub",
+    "c.PEM",
+    "d.key",
+    "credentials.json",
+    "a\x00b",
+    "a" * 513,
+    "a//b",
+    "",
+]
+
+
+def as_agent(session_id, agent: uuid.UUID | str | None = AGENT) -> dict[str, str]:
+    headers = as_(session_id)
+    if agent is not None:
+        headers["X-Orch-Agent"] = str(agent)
+    return headers
+
+
+def png(w: int = 20, h: int = 10) -> bytes:
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), (10, 20, 30)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def jpeg_with_gps() -> bytes:
+    from PIL import Image
+
+    exif = Image.Exif()
+    exif.get_ifd(0x8825)[1] = "N"
+    exif.get_ifd(0x8825)[2] = (52.0, 13.0, 0.0)
+    buf = io.BytesIO()
+    Image.new("RGB", (30, 20), (200, 100, 50)).save(buf, format="JPEG", exif=exif)
+    return buf.getvalue()
+
+
+async def allow_files(conn, room_id, allowed=True):
+    await conn.execute(
+        "INSERT INTO room_settings (room_id, agents_may_send_files) VALUES (%s, %s)"
+        " ON CONFLICT (room_id)"
+        " DO UPDATE SET agents_may_send_files = EXCLUDED.agents_may_send_files",
+        (room_id, allowed),
+    )
+
+
+async def files_room(conn, fake, room="!home:x", *, allowed=True) -> tuple[str, uuid.UUID]:
+    """A room bound to a new session whose files the fake orchestrator serves."""
+    await add_room(conn, room)
+    await allow_room(conn, room)
+    session = uuid.uuid4()
+    await bind(conn, room, session)
+    if allowed is not None:
+        await allow_files(conn, room, allowed)
+    fake.sessions[str(session)] = {"id": str(session)}
+    return room, session
+
+
+async def send_files(agent, session, files, text=None, *, headers=None, **body):
+    payload = {"files": files, **body}
+    if text is not None:
+        payload["text"] = text
+    return await agent.post("/messages", json=payload, headers=headers or as_agent(session))
+
+
+async def file_rows(conn, send_ref) -> list[dict]:
+    cur = await conn.execute(
+        "SELECT position, path, name, mime, msgtype, size, sha256, w, h, data, content_uri"
+        " FROM send_files WHERE send_id = %s ORDER BY position",
+        (int(send_ref[1:]),),
+    )
+    names = [d.name for d in cur.description]
+    return [dict(zip(names, row, strict=True)) for row in await cur.fetchall()]
+
+
+async def test_send_files_happy_path(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    chart = png()
+    fake.put_file(str(session), "out/chart.png", chart)
+
+    send_id = accepted(await send_files(agent, session, ["out/chart.png"], "see the chart"))
+
+    assert fake.downloads == [(str(session), "out/chart.png", str(AGENT))]
+    assert (await send_row(conn, send_id))["text"] == "see the chart"
+    assert await file_rows(conn, send_id) == [
+        {
+            "position": 0,
+            "path": "out/chart.png",
+            "name": "chart.png",
+            "mime": "image/png",
+            "msgtype": "m.image",
+            "size": len(chart),
+            "sha256": hashlib.sha256(chart).hexdigest(),
+            "w": 20,
+            "h": 10,
+            "data": chart,
+            "content_uri": None,
+        }
+    ]
+
+
+async def test_send_files_only_no_text(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    fake.put_file(str(session), "out/a.png", png())
+    fake.put_file(str(session), "out/b.txt", b"plain words\n")
+
+    send_id = accepted(await send_files(agent, session, ["out/a.png", "out/b.txt"]))
+
+    assert (await send_row(conn, send_id))["text"] is None
+    rows = await file_rows(conn, send_id)
+    assert [(r["position"], r["name"], r["mime"], r["msgtype"]) for r in rows] == [
+        (0, "a.png", "image/png", "m.image"),
+        (1, "b.txt", "text/plain", "m.file"),
+    ]
+    assert rows[1]["w"] is None and rows[1]["h"] is None
+
+
+async def test_send_requires_text_or_files(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    for body in ({}, {"files": []}, {"text": " \n", "files": []}, {"room": room}):
+        r = await agent.post("/messages", json=body, headers=as_agent(session))
+        refused(r, 422, "invalid_text")
+    assert await count_sends(conn) == 0
+
+
+async def test_send_files_flag_off(agent, conn, fake):
+    _, session = await files_room(conn, fake, allowed=False)
+    _, other_session = await files_room(conn, fake, "!other:x", allowed=None)
+    for s in (session, other_session):
+        fake.put_file(str(s), "out/a.png", png())
+        r = await send_files(agent, s, ["out/a.png"], "hi")
+        refused(r, 403, "files_not_allowed")
+    assert fake.downloads == []
+    assert await count_sends(conn) == 0
+    accepted(await say(agent, session, "text alone still goes"))
+
+
+@pytest.mark.parametrize("path", REFUSED_PATHS)
+async def test_send_files_path_rules(agent, conn, fake, path):
+    room, session = await files_room(conn, fake)
+    r = await send_files(agent, session, [path])
+    refused(r, 422, "invalid_file_path")
+    message = r.json()["error"]["message"]
+    assert "files[0]" in message
+    if path:
+        assert path not in message
+    assert fake.downloads == []
+    assert await count_sends(conn) == 0
+
+
+async def test_send_files_path_rules_name_the_index(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    fake.put_file(str(session), "out/a.png", png())
+    r = await send_files(agent, session, ["out/a.png", ".env"])
+    refused(r, 422, "invalid_file_path")
+    assert r.json()["error"]["message"].startswith("files[1]")
+    assert fake.downloads == []
+
+
+async def test_send_files_attachments_path_allowed(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    path = ".attachments/orch-5/m42.jpg"
+    fake.put_file(str(session), path, jpeg_with_gps())
+    send_id = accepted(await send_files(agent, session, [path]))
+    [row] = await file_rows(conn, send_id)
+    assert row["name"] == "m42.jpg" and row["msgtype"] == "m.image"
+
+
+async def test_send_files_missing_agent_header(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    fake.put_file(str(session), "out/a.png", png())
+    for agent_header in (None, "not-a-uuid", ""):
+        r = await send_files(agent, session, ["out/a.png"], headers=as_agent(session, agent_header))
+        refused(r, 422, "files_unavailable")
+    assert fake.downloads == []
+    assert await count_sends(conn) == 0
+    # Without files the header is not needed, and a malformed one is ignored.
+    accepted(await agent.post("/messages", json={"text": "hi"}, headers=as_agent(session, "x")))
+
+
+async def test_send_files_not_found(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    r = await send_files(agent, session, ["out/missing.png"])
+    refused(r, 404, "file_not_found")
+    message = r.json()["error"]["message"]
+    assert "files[0]" in message and "missing" not in message
+    assert await count_sends(conn) == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (413, (413, "file_too_large")),
+        (409, (422, "files_unavailable")),
+        (422, (422, "files_unavailable")),
+    ],
+)
+async def test_send_files_orchestrator_refusals(agent, conn, fake, status, expected):
+    room, session = await files_room(conn, fake)
+    fake.put_file(str(session), "out/a.png", png())
+    fake.fail_next("download_file", status)
+    r = await send_files(agent, session, ["out/a.png"])
+    refused(r, *expected)
+    assert await count_sends(conn) == 0
+
+
+async def test_send_files_orchestrator_unavailable(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    fake.put_file(str(session), "out/a.png", png())
+    fake.fail_next("download_file", 503)
+    refused(await send_files(agent, session, ["out/a.png"]), 503, "unavailable")
+    assert await count_sends(conn) == 0
+
+
+async def test_send_files_too_large_image(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    big = b"\x89PNG\r\n\x1a\n" + b"\x00" * (8000001 - 8)
+    fake.put_file(str(session), "out/big.png", big)
+    r = await send_files(agent, session, ["out/big.png"])
+    refused(r, 413, "file_too_large")
+    assert "files[0]" in r.json()["error"]["message"]
+    assert await count_sends(conn) == 0
+
+
+async def test_send_files_pdf_under_file_cap(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    pdf = b"%PDF-1.4\n" + b"0" * (9_000_000 - 9)
+    fake.put_file(str(session), "out/report.pdf", pdf)
+    send_id = accepted(await send_files(agent, session, ["out/report.pdf"]))
+    [row] = await file_rows(conn, send_id)
+    assert (row["mime"], row["msgtype"], row["size"]) == ("application/pdf", "m.file", 9_000_000)
+
+
+async def test_send_files_count_cap(agent_for, conn, fake):
+    agent = agent_for()
+    room, session = await files_room(conn, fake)
+    paths = [f"out/{n}.txt" for n in range(5)]
+    for n, path in enumerate(paths):
+        fake.put_file(str(session), path, f"file {n}\n".encode())
+    refused(await send_files(agent, session, paths), 422, "invalid_request")
+    narrow = agent_for(agent_files_per_send=2)
+    refused(await send_files(narrow, session, paths[:3]), 422, "invalid_request")
+    assert fake.downloads == []
+    accepted(await send_files(agent, session, paths[:4]))
+
+
+async def test_send_files_room_chunk_counts_files(agent_for, conn, fake):
+    agent = agent_for(agent_room_chunks_per_hour=3)
+    room, session = await files_room(conn, fake)
+    for n in range(3):
+        fake.put_file(str(session), f"out/{n}.txt", f"file {n}\n".encode())
+    accepted(await send_files(agent, session, ["out/0.txt", "out/1.txt"], "text"))
+    r = await send_files(agent, session, ["out/2.txt"])
+    refused(r, 429, "room_chunk_limit")
+    assert await count_sends(conn) == 1
+
+
+async def test_send_files_room_bytes_limit(agent_for, conn, fake):
+    agent = agent_for(agent_room_file_bytes_per_hour=1000)
+    room, session = await files_room(conn, fake)
+    fake.put_file(str(session), "out/a.txt", b"a" * 600)
+    fake.put_file(str(session), "out/b.txt", b"b" * 600)
+    fake.put_file(str(session), "out/c.txt", b"c" * 400)
+    first = accepted(await send_files(agent, session, ["out/a.txt"]))
+    refused(await send_files(agent, session, ["out/b.txt"]), 429, "room_file_bytes_limit")
+    accepted(await send_files(agent, session, ["out/c.txt"]))
+    # At the cap the request is refused before anything is downloaded.
+    downloads = len(fake.downloads)
+    refused(await send_files(agent, session, ["out/b.txt"]), 429, "room_file_bytes_limit")
+    assert len(fake.downloads) == downloads
+    # A refused send delivered nothing and does not count.
+    await set_send(conn, first, status="refused", reason="files_not_allowed")
+    accepted(await send_files(agent, session, ["out/b.txt"]))
+
+
+async def test_send_files_duplicate_same_sha(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    fake.put_file(str(session), "out/a.png", png())
+    first = accepted(await send_files(agent, session, ["out/a.png"], "look"))
+    r = await send_files(agent, session, ["out/a.png"], "look")
+    assert r.status_code == 202 and r.json() == {"id": first, "status": "queued"}
+    assert await count_sends(conn) == 1
+
+    fake.put_file(str(session), "out/a.png", png(21, 10))
+    changed = accepted(await send_files(agent, session, ["out/a.png"], "look"))
+    assert changed != first
+    text_only = accepted(await say(agent, session, "look"))
+    assert text_only not in (first, changed)
+    assert await count_sends(conn) == 3
+
+
+async def test_send_files_anonymized_name_pseudonym_refused(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    await anonymize(conn, room)
+    fake.put_file(str(session), "out/user-0123456789ab.png", png())
+    r = await send_files(agent, session, ["out/user-0123456789ab.png"])
+    refused(r, 422, "pseudonym_disclosed")
+    assert r.json()["error"]["message"].startswith("files[0]: ")
+    assert fake.downloads == []
+    assert await count_sends(conn) == 0
+
+
+async def test_send_files_metadata_stripped(agent, conn, fake):
+    from PIL import Image
+
+    room, session = await files_room(conn, fake)
+    original = jpeg_with_gps()
+    assert b"Exif" in original
+    fake.put_file(str(session), "out/photo.jpg", original)
+    send_id = accepted(await send_files(agent, session, ["out/photo.jpg"]))
+    [row] = await file_rows(conn, send_id)
+    assert b"Exif" not in row["data"]
+    assert not Image.open(io.BytesIO(row["data"])).getexif().get_ifd(0x8825)
+    assert row["size"] == len(row["data"])
+    assert row["sha256"] == hashlib.sha256(row["data"]).hexdigest()
+    assert (row["w"], row["h"]) == (30, 20)
+
+
+async def test_send_status_lists_files(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    chart = png()
+    fake.put_file(str(session), "out/chart.png", chart)
+    fake.put_file(str(session), "out/notes.txt", b"notes\n")
+    send_id = accepted(await send_files(agent, session, ["out/chart.png", "out/notes.txt"], "hi"))
+
+    async def files():
+        r = await agent.get(f"/messages/{send_id}", headers=as_(session))
+        assert r.status_code == 200, r.text
+        return [(f["name"], f["mime"], f["size"], f["status"]) for f in r.json()["files"]]
+
+    assert await files() == [
+        ("chart.png", "image/png", len(chart), "queued"),
+        ("notes.txt", "text/plain", 6, "queued"),
+    ]
+    send = int(send_id[1:])
+    await conn.execute(
+        "UPDATE send_files SET content_uri = 'mxc://x/1' WHERE send_id = %s AND position = 0",
+        (send,),
+    )
+    await conn.execute(
+        "INSERT INTO outbound (room_id, send_id, kind, body, txn_id, status, file_position)"
+        " VALUES (%s, %s, 'agent', 'notes.txt', %s, 'failed', 1)",
+        (room, send, f"mxa-{send}-f1"),
+    )
+    assert [status for *_, status in await files()] == ["uploaded", "failed"]
+    await conn.execute(
+        "INSERT INTO outbound (room_id, send_id, kind, body, txn_id, status, file_position)"
+        " VALUES (%s, %s, 'agent', 'chart.png', %s, 'sent', 0)",
+        (room, send, f"mxa-{send}-f0"),
+    )
+    assert [status for *_, status in await files()] == ["sent", "failed"]
+
+    text_only = accepted(await say(agent, session, "no files"))
+    r = await agent.get(f"/messages/{text_only}", headers=as_(session))
+    assert r.json()["files"] == []
+
+
+async def test_send_files_refused_send_files_failed(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    fake.put_file(str(session), "out/a.png", png())
+    send_id = accepted(await send_files(agent, session, ["out/a.png"]))
+    await set_send(conn, send_id, status="refused", reason="files_not_allowed")
+    r = await agent.get(f"/messages/{send_id}", headers=as_(session))
+    assert [f["status"] for f in r.json()["files"]] == ["failed"]
+
+
+async def test_send_files_audit_log_has_no_path_or_bytes(agent, conn, fake, caplog):
+    caplog.set_level(logging.DEBUG)
+    room, session = await files_room(conn, fake)
+    data = b"CANARY-T155-audit secret words\n"
+    fake.put_file(str(session), "out/private-name.txt", data)
+    send_id = accepted(await send_files(agent, session, ["out/private-name.txt"]))
+    digest = hashlib.sha256(data).hexdigest()
+    lines = [r.getMessage() for r in caplog.records if "agent send file" in r.getMessage()]
+    assert len(lines) == 1
+    assert f"id={send_id}" in lines[0] and "position=0" in lines[0]
+    assert f"size={len(data)}" in lines[0] and "mime=text/plain" in lines[0]
+    assert f"sha256={digest[:12]}" in lines[0] and digest not in lines[0]
+    logged = caplog.text
+    assert "private-name" not in logged and "CANARY-T155-audit" not in logged
+
+
+class SlowOrchestrator:
+    """Holds every download until `release` is set; `started` is set once one began."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def download_file(self, session_id, path, agent_id=None, *, max_bytes):
+        self.started.set()
+        await asyncio.wait_for(self.release.wait(), timeout=10)
+        return self.data
+
+
+async def test_send_files_no_pool_connection_during_download(url, conn):
+    small = AsyncConnectionPool(url, min_size=1, max_size=1, timeout=3, open=False)
+    await small.open(wait=True)
+    slow = SlowOrchestrator(png())
+    try:
+        room = "!home:x"
+        await add_room(conn, room)
+        await allow_room(conn, room)
+        session = uuid.uuid4()
+        await bind(conn, room, session)
+        await allow_files(conn, room)
+        app = create_agent_app(small, slow, make_settings(agent_token_sha256=DIGEST))
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://agents" + CHAT_PREFIX
+        ) as client:
+            sending = asyncio.create_task(send_files(client, session, ["out/a.png"]))
+            await asyncio.wait_for(slow.started.wait(), timeout=5)
+            listing = await asyncio.wait_for(client.get("/rooms", headers=as_(session)), 5)
+            assert listing.status_code == 200, listing.text
+            slow.release.set()
+            accepted(await sending)
+    finally:
+        await small.close()
+
+
+async def test_rooms_listing_shows_send_files_flag(agent, conn, fake):
+    room, session = await files_room(conn, fake)
+    [listed_room] = await listed(agent, session)
+    assert listed_room["room_id"] == room and listed_room["agents_may_send_files"] is True
+    await allow_files(conn, room, False)
+    [listed_room] = await listed(agent, session)
+    assert listed_room["agents_may_send_files"] is False

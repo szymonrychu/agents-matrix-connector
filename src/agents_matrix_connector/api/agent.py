@@ -14,6 +14,7 @@ listing. The api inserts `sends` rows and writes `room_notes` and `room_skills`,
 The notes and skills routes never take a room: it is the caller session's active binding.
 """
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -25,12 +26,13 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 
 import psycopg
+from agents_common.orchestrator import OrchestratorError, OrchestratorUnavailable
 from fastapi import APIRouter, Depends, FastAPI, Header
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from agents_matrix_connector import anonymize, discovery, policy
+from agents_matrix_connector import anonymize, discovery, media, policy
 from agents_matrix_connector.api.app import (
     EXEMPT_PATHS,
     add_error_handlers,
@@ -45,7 +47,15 @@ from agents_matrix_connector.api.rooms import agent_room_decision, build_rooms_r
 from agents_matrix_connector.api.rules import build_rules_router
 from agents_matrix_connector.api.schemas import ApiError
 from agents_matrix_connector.chunks import split
-from agents_matrix_connector.db import bindings, directory, notes, rules, sends, skills
+from agents_matrix_connector.db import (
+    bindings,
+    directory,
+    notes,
+    rules,
+    send_files,
+    sends,
+    skills,
+)
 from agents_matrix_connector.prompt import memory_rule
 from agents_matrix_connector.settings import ApiSettings, ConnectorSettings
 
@@ -72,6 +82,8 @@ _ADMIN_ROUTES = frozenset(
 HEALTH_METHODS = frozenset({"GET", "HEAD"})
 
 MAX_TEXT_CHARS = 16000
+MAX_FILES_PER_SEND = 4
+"""The schema cap of `files`; `MATRIX_AGENT_FILES_PER_SEND` may set a lower one."""
 MAX_KEY_CODE_POINTS = 16
 DUPLICATE_SECONDS = 60
 RATE_WINDOW_SECONDS = 60
@@ -191,7 +203,21 @@ class _Body(BaseModel):
 
 
 class MessageIn(_Body):
-    text: str = Field(min_length=1, max_length=MAX_TEXT_CHARS)
+    text: str | None = Field(
+        None,
+        min_length=1,
+        max_length=MAX_TEXT_CHARS,
+        description="Needs a non-whitespace character unless files are given (else 422 "
+        "invalid_text).",
+    )
+    files: list[str] = Field(
+        default_factory=list,
+        max_length=MAX_FILES_PER_SEND,
+        description="Relative paths of files in the calling agent's workdir, sent after the "
+        "text, one Matrix event each. Needs the room's agents_may_send_files and the "
+        "X-Orch-Agent header. Images at most 8000000 bytes, other files 25000000 "
+        "(MATRIX_AGENT_IMAGE_MAX_BYTES, MATRIX_AGENT_FILE_MAX_BYTES).",
+    )
     room: str | None = None
     """A Matrix room id; omitted, the room of `reply_to`, else the session's bound room."""
     reply_to: str | None = None
@@ -215,10 +241,18 @@ class ChatRoom(BaseModel):
     kind: str | None
     bound: bool
     agents_may_initiate: bool
+    agents_may_send_files: bool
 
 
 class ChatRooms(BaseModel):
     rooms: list[ChatRoom]
+
+
+class SentFile(BaseModel):
+    name: str
+    mime: str
+    size: int
+    status: Literal["queued", "uploaded", "sent", "failed"]
 
 
 class SendStatus(BaseModel):
@@ -229,6 +263,8 @@ class SendStatus(BaseModel):
     room_id: str
     created_at: datetime
     sent_at: datetime | None
+    files: list[SentFile]
+    """The message's files in order; empty for a reaction or a message without files."""
 
 
 class NotesIn(_Body):
@@ -389,13 +425,20 @@ def _skill_not_found() -> ApiError:
     return ApiError(404, "skill_not_found", "no skill with that name in this room")
 
 
+def _too_large(field: str, cap: int) -> ApiError:
+    return ApiError(413, "file_too_large", f"{field}: larger than {cap} bytes")
+
+
 def _bad_reference(field: str, why: str) -> ApiError:
     return ApiError(422, "bad_reference", f"{field}: {why}")
 
 
-def _chunk_count(kind: str, text: str | None, chunk_chars: int) -> int:
-    """Matrix events one send puts into its room: a reaction is one, a message one per chunk."""
-    return 1 if kind == "reaction" else max(1, len(split(text or "", chunk_chars)))
+def _chunk_count(kind: str, text: str | None, chunk_chars: int, files: int = 0) -> int:
+    """Matrix events one send puts into its room: a reaction is one, a message one per text
+    chunk plus one per file (a files-only message has no text chunk)."""
+    if kind == "reaction":
+        return 1
+    return max(1, len(split(text or "", chunk_chars)) + files)
 
 
 async def _room_chunks_last_hour(
@@ -404,11 +447,23 @@ async def _room_chunks_last_hour(
     """Chunks sent or queued to the room in the last hour, by any session; a refused send
     delivered nothing and does not count."""
     cur = await conn.execute(
-        "SELECT kind, text FROM sends WHERE room_id = %s AND status <> 'refused'"
+        "SELECT kind, text, (SELECT count(*) FROM send_files f WHERE f.send_id = sends.id)"
+        " FROM sends WHERE room_id = %s AND status <> 'refused'"
         " AND created_at > now() - make_interval(secs => %s)",
         (room_id, ROOM_WINDOW_SECONDS),
     )
-    return sum(_chunk_count(kind, text, chunk_chars) for kind, text in await cur.fetchall())
+    return sum(
+        _chunk_count(kind, text, chunk_chars, files) for kind, text, files in await cur.fetchall()
+    )
+
+
+def _file_status(send: sends.SendRow, file: send_files.SendFile, delivered: str | None) -> str:
+    """A file's delivery: its outbound row's end, else uploaded once the homeserver has it."""
+    if delivered == "sent":
+        return "sent"
+    if delivered == "failed" or (delivered is None and send.status in ("failed", "refused")):
+        return "failed"
+    return "uploaded" if file.content_uri is not None else "queued"
 
 
 async def _lock(conn: psycopg.AsyncConnection, kind: str, key: str) -> None:
@@ -438,9 +493,13 @@ async def _resolve(
     return resolved
 
 
-def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRouter:
+def build_chat_router(
+    pool: AsyncConnectionPool, orchestrator: Any, settings: ApiSettings
+) -> APIRouter:
+    """`orchestrator` is the api's `OrchestratorClient`: the send route downloads an agent's
+    files through it."""
     router = APIRouter(prefix=CHAT_PREFIX)
-    send_errors = _errors(400, 401, 403, 409, 422, 429, 503)
+    send_errors = _errors(400, 401, 403, 404, 409, 413, 422, 429, 503)
     puppet = re.compile(settings.puppet_pattern)
     bridge_server = settings.user_id.split(":", 1)[1]
     excluded = settings.self_ids() | set(settings.bridge_bots)
@@ -459,9 +518,17 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
         reply_to: str | None,
         ref_event_id: str | None,
         masked_field: str | None = None,
+        files: list[str] | None = None,
+        agent: str | None = None,
     ) -> SendAccepted:
         """The room checks, then, under the session's and the room's advisory locks, the
         duplicate, the per-session rate limit and the per-room hourly chunk cap; then the insert.
+
+        With `files`: after the room checks, the room's `agents_may_send_files`, the file names
+        in an anonymized room, the path rules and a pre-check of the rate and room byte limits;
+        then each file is downloaded through the orchestrator from the agent `agent` with no
+        pool connection held, and the locked transaction re-checks everything, the room byte
+        cap included, before it inserts the send with its `send_files` rows.
 
         A request holds at most one pool connection at a time: the room is read before this
         request takes its connection, and the callers release theirs before calling.
@@ -490,19 +557,45 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
                     status, outcome, message, {"occupier": str(occupier)} if occupier else None
                 )
             setting = await rules.get_room_settings(conn, room_id)
-            if text is not None and setting is not None and setting.anonymize_names:
-                found = anonymize.pseudonyms_in(text)
-                if found:
-                    log.info(
-                        "agent send refused session=%s code=%s",
-                        who.session_id,
-                        anonymize.PSEUDONYM_DISCLOSED,
-                    )
+            paths = files or []
+            if paths and (setting is None or not setting.agents_may_send_files):
+                log.info("agent send refused session=%s code=files_not_allowed", who.session_id)
+                raise ApiError(
+                    403,
+                    "files_not_allowed",
+                    "files: this room does not accept files from agents (agents_may_send_files)",
+                )
+            if setting is not None and setting.anonymize_names:
+                named = [("text", text)] if text is not None else []
+                named += [(f"files[{n}]", media.safe_name(p)) for n, p in enumerate(paths)]
+                for field, value in named:
+                    found = anonymize.pseudonyms_in(value)
+                    if found:
+                        log.info(
+                            "agent send refused session=%s code=%s",
+                            who.session_id,
+                            anonymize.PSEUDONYM_DISCLOSED,
+                        )
+                        raise ApiError(
+                            422,
+                            anonymize.PSEUDONYM_DISCLOSED,
+                            f"{field}: " + anonymize.disclosure_message(found),
+                        )
+            for n, path in enumerate(paths):
+                try:
+                    media.check_agent_path(path)
+                except ValueError:
+                    log.info("agent send refused session=%s code=invalid_file_path", who.session_id)
                     raise ApiError(
                         422,
-                        anonymize.PSEUDONYM_DISCLOSED,
-                        "text: " + anonymize.disclosure_message(found),
-                    )
+                        "invalid_file_path",
+                        f"files[{n}]: a relative workdir path without '..', hidden components"
+                        " (except a leading .attachments/) or key and env file names",
+                    ) from None
+            if paths:
+                await _precheck(conn, who, room_id)
+        new_files = await _fetch_all(who, agent, paths) if paths else []
+        async with pool.connection() as conn:
             async with conn.transaction():
                 await _lock(conn, "session", str(who.session_id))
                 await _lock(conn, "room", room_id)
@@ -515,6 +608,7 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
                     key=key,
                     reply_to=reply_to,
                     seconds=DUPLICATE_SECONDS,
+                    file_shas=[f.sha256 for f in new_files],
                 )
                 if duplicate is not None:
                     log.info("agent send duplicate session=%s id=s%s", who.session_id, duplicate.id)
@@ -528,7 +622,7 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
                         f"at most {settings.agent_rate_per_minute} sends per session in 60 s",
                     )
                 cap = settings.agent_room_chunks_per_hour
-                chunks = _chunk_count(kind, text, settings.reply_chunk_chars)
+                chunks = _chunk_count(kind, text, settings.reply_chunk_chars, len(new_files))
                 if (
                     await _room_chunks_last_hour(conn, room_id, settings.reply_chunk_chars) + chunks
                     > cap
@@ -537,6 +631,12 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
                     raise ApiError(
                         429, "room_chunk_limit", f"room: at most {cap} chunks per hour to one room"
                     )
+                if new_files:
+                    size = sum(f.size for f in new_files)
+                    if await send_files.room_bytes_last_hour(conn, room_id) + size > (
+                        settings.agent_room_file_bytes_per_hour
+                    ):
+                        raise _room_bytes_limit(who)
                 send_id = await sends.insert(
                     conn,
                     session_id=who.session_id,
@@ -548,8 +648,123 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
                     reply_to=reply_to,
                     ref_event_id=ref_event_id,
                 )
+                await send_files.insert_many(conn, send_id, new_files)
             log.info("agent send queued session=%s id=s%s kind=%s", who.session_id, send_id, kind)
+            for f in new_files:
+                log.info(
+                    "agent send file session=%s id=s%s position=%s size=%s mime=%s sha256=%s",
+                    who.session_id,
+                    send_id,
+                    f.position,
+                    f.size,
+                    f.mime,
+                    f.sha256[:12],
+                )
             return SendAccepted(id=f"s{send_id}", status="queued")
+
+    def _room_bytes_limit(who: Caller) -> ApiError:
+        log.info("agent send refused session=%s code=room_file_bytes_limit", who.session_id)
+        return ApiError(
+            429,
+            "room_file_bytes_limit",
+            f"room: at most {settings.agent_room_file_bytes_per_hour} file bytes per hour to"
+            " one room",
+        )
+
+    async def _precheck(conn: psycopg.AsyncConnection, who: Caller, room_id: str) -> None:
+        """Refuse before any download when the rate or the room byte budget is already spent;
+        the locked transaction re-checks both."""
+        if (
+            await sends.count_recent(conn, who.session_id, RATE_WINDOW_SECONDS)
+            >= settings.agent_rate_per_minute
+        ):
+            log.info("agent send refused session=%s code=rate_limited", who.session_id)
+            raise ApiError(
+                429,
+                "rate_limited",
+                f"at most {settings.agent_rate_per_minute} sends per session in 60 s",
+            )
+        if (
+            await send_files.room_bytes_last_hour(conn, room_id)
+            >= settings.agent_room_file_bytes_per_hour
+        ):
+            raise _room_bytes_limit(who)
+
+    async def _fetch_all(
+        who: Caller, agent: str | None, paths: list[str]
+    ) -> list[send_files.NewFile]:
+        try:
+            agent_id = uuid.UUID(agent or "")
+        except ValueError:
+            log.info("agent send refused session=%s code=files_unavailable", who.session_id)
+            raise ApiError(
+                422,
+                "files_unavailable",
+                "X-Orch-Agent: the calling agent's uuid is required to send files",
+            ) from None
+        return [await _fetch(who, agent_id, n, path) for n, path in enumerate(paths)]
+
+    async def _fetch(
+        who: Caller, agent_id: uuid.UUID, position: int, path: str
+    ) -> send_files.NewFile:
+        """One file from the agent's workdir, typed from its bytes, capped, its image metadata
+        stripped and hashed. Errors name `files[<position>]`, never the path."""
+        field = f"files[{position}]"
+        try:
+            data = await orchestrator.download_file(
+                who.session_id, path, agent_id, max_bytes=settings.agent_file_max_bytes
+            )
+        except OrchestratorUnavailable as exc:
+            log.warning(
+                "agent send file download: orchestrator unavailable (%s)", type(exc).__name__
+            )
+            raise ApiError(503, "unavailable", "orchestrator unavailable") from None
+        except OrchestratorError as exc:
+            # Status and code only: the message may echo the path.
+            log.info(
+                "agent send file download refused session=%s position=%s status=%s code=%s",
+                who.session_id,
+                position,
+                exc.status,
+                exc.code,
+            )
+            if exc.status == 404:
+                raise ApiError(
+                    404, "file_not_found", f"{field}: no such file in the agent's workdir"
+                ) from None
+            if exc.status == 413:
+                raise _too_large(field, settings.agent_file_max_bytes) from None
+            raise ApiError(
+                422, "files_unavailable", f"{field}: the orchestrator could not provide the file"
+            ) from None
+        name = media.safe_name(path)
+        mime = media.outbound_mime(data, name)
+        msgtype = media.outbound_msgtype(mime)
+        cap = media.outbound_cap(
+            msgtype, settings.agent_image_max_bytes, settings.agent_file_max_bytes
+        )
+        if len(data) > cap:
+            raise _too_large(field, cap)
+        try:
+            data, w, h = await asyncio.to_thread(media.strip_outbound_metadata, data, mime)
+        except media.MediaRefused:
+            raise ApiError(
+                422, "files_unavailable", f"{field}: the image could not be read"
+            ) from None
+        if len(data) > cap:
+            raise _too_large(field, cap)
+        return send_files.NewFile(
+            position=position,
+            path=path,
+            name=name,
+            mime=mime,
+            msgtype=msgtype,
+            size=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),
+            w=w,
+            h=h,
+            data=data,
+        )
 
     @router.get("/rooms", response_model=ChatRooms, responses=_errors(400, 401, 503))
     async def list_rooms(who: Annotated[Caller, Depends(caller)]) -> ChatRooms:
@@ -579,6 +794,7 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
                         kind=room.kind,
                         bound=own is not None and own.room_id == room.room_id,
                         agents_may_initiate=setting is not None and setting.agents_may_initiate,
+                        agents_may_send_files=setting is not None and setting.agents_may_send_files,
                     )
                 )
         found.sort(key=lambda r: (not r.bound, r.name is None, r.name or "", r.room_id))
@@ -586,13 +802,31 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
 
     @router.post("/messages", status_code=202, response_model=SendAccepted, responses=send_errors)
     async def send_message(
-        who: Annotated[Caller, Depends(caller)], body: MessageIn
+        who: Annotated[Caller, Depends(caller)],
+        body: MessageIn,
+        agent: Annotated[
+            str | None,
+            Header(
+                alias="X-Orch-Agent",
+                description="the calling agent's uuid, whose workdir holds `files`; required "
+                "(else 422 files_unavailable) only when files are sent",
+            ),
+        ] = None,
     ) -> SendAccepted:
-        """Queue a message, optionally a quoted reply. In a room with `anonymize_names`, a text
-        containing a pseudonym (`user-<sha>`, `admin-<sha>`) is 422 `pseudonym_disclosed`."""
-        if not body.text.strip():
+        """Queue a message, optionally a quoted reply, with up to `MATRIX_AGENT_FILES_PER_SEND`
+        workdir files sent after the text. In a room with `anonymize_names`, a text or file
+        name containing a pseudonym (`user-<sha>`, `admin-<sha>`) is 422
+        `pseudonym_disclosed`."""
+        text = body.text if body.text is not None and body.text.strip() else None
+        if text is None and not body.files:
             raise ApiError(
                 422, "invalid_text", "text: needs a non-whitespace character to be delivered"
+            )
+        if len(body.files) > settings.agent_files_per_send:
+            raise ApiError(
+                422,
+                "invalid_request",
+                f"files: at most {settings.agent_files_per_send} files per message",
             )
         async with pool.connection() as conn:
             ref = None
@@ -613,11 +847,13 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
             who,
             kind="message",
             room_id=room_id,
-            text=body.text,
+            text=text,
             key=None,
             reply_to=body.reply_to,
             ref_event_id=ref.event_id if ref else None,
             masked_field="reply_to" if ref is not None and ref.source == "inbound" else None,
+            files=body.files,
+            agent=agent,
         )
 
     @router.post("/reactions", status_code=202, response_model=SendAccepted, responses=send_errors)
@@ -649,9 +885,21 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
         """One of this session's sends; any other id is 404."""
         parsed = sends.parse_ref(id)
         row = None
+        files: list[SentFile] = []
         if parsed is not None and parsed[0] == "s":
             async with pool.connection() as conn:
                 row = await sends.get(conn, parsed[1])
+                if row is not None and row.session_id == who.session_id:
+                    delivered = await send_files.delivery(conn, row.id)
+                    files = [
+                        SentFile(
+                            name=f.name,
+                            mime=f.mime,
+                            size=f.size,
+                            status=_file_status(row, f, delivered.get(f.position)),
+                        )
+                        for f in await send_files.list_for_send(conn, row.id)
+                    ]
         if row is None or row.session_id != who.session_id:
             raise ApiError(404, "not_found", f"no send {id!r} of this session")
         return SendStatus(
@@ -662,6 +910,7 @@ def build_chat_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRo
             room_id=row.room_id,
             created_at=row.created_at,
             sent_at=row.sent_at,
+            files=files,
         )
 
     notes_errors = _errors(400, 401, 409, 413, 422, 503)
@@ -860,13 +1109,14 @@ def build_admin_router(
 def create_agent_app(
     pool: AsyncConnectionPool, orchestrator: Any, settings: ApiSettings
 ) -> FastAPI:
+    media.quiet_file_urls()
     app = FastAPI(
         title="agents-matrix-connector agent API",
         openapi_url=f"{CHAT_PREFIX}/openapi.json",
         docs_url=None,
         redoc_url=None,
     )
-    app.include_router(build_chat_router(pool, settings))
+    app.include_router(build_chat_router(pool, orchestrator, settings))
     app.include_router(build_admin_router(pool, orchestrator, settings), prefix=ADMIN_PREFIX)
     app.include_router(build_internal_router(pool), prefix=INTERNAL_PREFIX)
     app.add_middleware(AgentGate, token_sha256=settings.agent_token_sha256.get_secret_value())

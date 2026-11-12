@@ -11,7 +11,7 @@ from pathlib import Path
 from api_helpers import make_settings
 from fastapi.routing import APIRoute
 
-from agents_matrix_connector import anonymize, policy, sync, tracker, worker
+from agents_matrix_connector import anonymize, policy, sender, sync, tracker, worker
 from agents_matrix_connector.api import openapi
 from agents_matrix_connector.api.agent import CHAT_PREFIX, create_agent_app
 from agents_matrix_connector.api.app import PREFIX, create_api_app
@@ -98,6 +98,10 @@ def test_readme_lists_every_reason() -> None:
         tracker.FORBIDDEN,
         tracker.MESSAGE_FAILED,
         tracker.MESSAGE_CANCELLED,
+        tracker.TOO_LARGE_FOR_HOMESERVER,
+        tracker.FILE_UNAVAILABLE,
+        tracker.UPLOAD_FAILED,
+        sender.FILES_NOT_ALLOWED,
         anonymize.PSEUDONYM_DISCLOSED,
         PRESET_NOT_FOUND,
     }
@@ -130,6 +134,12 @@ def test_agent_openapi_committed_matches() -> None:
     for path in (f"{CHAT_PREFIX}/messages", f"{CHAT_PREFIX}/reactions"):
         parameters = {p["name"] for p in paths[path]["post"]["parameters"]}
         assert {"X-Orch-Session", "X-Orch-Slug"} <= parameters
+    messages = paths[f"{CHAT_PREFIX}/messages"]["post"]
+    assert {"404", "413"} <= set(messages["responses"])
+    schemas = json.loads(committed)["components"]["schemas"]
+    assert schemas["MessageIn"]["properties"]["files"]["maxItems"] == 4
+    assert "files" in schemas["SendStatus"]["properties"]
+    assert "agents_may_send_files" in schemas["ChatRoom"]["properties"]
     exported = subprocess.run(
         [sys.executable, "-m", "agents_matrix_connector.api.openapi", "--agent"],
         capture_output=True,
@@ -189,6 +199,12 @@ def test_readme_lists_every_agent_route() -> None:
         "skill_not_found",
         "skill_too_large",
         "skill_limit",
+        "files_not_allowed",
+        "file_not_found",
+        "file_too_large",
+        "invalid_file_path",
+        "files_unavailable",
+        "room_file_bytes_limit",
     ):
         assert f"`{code}`" in agent, f"README Agent API does not name error code {code}"
     for status in ("queued", "sending", "sent", "failed", "refused"):
@@ -202,6 +218,9 @@ def test_readme_lists_every_agent_route() -> None:
         policy.NOT_ALLOWED,
         policy.denied("<kind>"),
         tracker.FORBIDDEN,
+        sender.FILES_NOT_ALLOWED,
+        tracker.TOO_LARGE_FOR_HOMESERVER,
+        tracker.FILE_UNAVAILABLE,
     ):
         assert f"`{reason}`" in agent, f"README Agent API does not name send reason {reason}"
     for phrase in (
@@ -212,6 +231,13 @@ def test_readme_lists_every_agent_route() -> None:
         "MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR",
         "agents_may_initiate",
         "anonymize_names",
+        "agents_may_send_files",
+        "X-Orch-Agent",
+        "MATRIX_AGENT_FILES_PER_SEND",
+        "MATRIX_AGENT_IMAGE_MAX_BYTES",
+        "MATRIX_AGENT_FILE_MAX_BYTES",
+        "MATRIX_AGENT_ROOM_FILE_BYTES_PER_HOUR",
+        ".attachments/",
     ):
         assert phrase in agent, phrase
     duplicate = re.search(r"^Duplicate rule:.*?(?=\n\n|\Z)", agent, re.MULTILINE | re.DOTALL)

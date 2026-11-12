@@ -631,3 +631,25 @@ async def test_allow_room_version_12_id_without_server(api, conn):
     r = await api.post(room_path(room_id, "/allow"), json={})
     assert r.status_code == 200
     assert len(await _rule_ids(conn, room_id)) == 1
+
+
+async def test_put_settings_send_files_flag(api, conn):
+    await seed(conn)
+    assert (await api.get(room_path(DM))).json()["agents_may_send_files"] is False
+    assert (await _listed(api, DM))["agents_may_send_files"] is False
+
+    on = await api.put(room_path(DM, "/settings"), json={"agents_may_send_files": True})
+    assert on.status_code == 200 and on.json()["agents_may_send_files"] is True
+    assert (await _listed(api, DM))["agents_may_send_files"] is True
+
+    other = await api.put(room_path(DM, "/settings"), json={"trigger": "all"})
+    assert other.json()["agents_may_send_files"] is True
+    null = await api.put(room_path(DM, "/settings"), json={"agents_may_send_files": None})
+    assert null.json()["agents_may_send_files"] is True
+
+    off = await api.put(room_path(DM, "/settings"), json={"agents_may_send_files": False})
+    assert off.json()["agents_may_send_files"] is False
+    cur = await conn.execute(
+        "SELECT agents_may_send_files FROM room_settings WHERE room_id = %s", (DM,)
+    )
+    assert (await cur.fetchone())[0] is False

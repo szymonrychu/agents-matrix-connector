@@ -24,6 +24,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Any
 
 from agents_common.orchestrator import (
     Message,
@@ -34,10 +35,10 @@ from agents_common.orchestrator import (
 )
 from psycopg_pool import AsyncConnectionPool
 
-from agents_matrix_connector import anonymize
+from agents_matrix_connector import anonymize, media
 from agents_matrix_connector.chunks import split
 from agents_matrix_connector.clock import utcnow
-from agents_matrix_connector.db import bindings, inbound, rules, runs, sends
+from agents_matrix_connector.db import bindings, inbound, rules, runs, send_files, sends
 from agents_matrix_connector.matrix import (
     MatrixAuthError,
     MatrixClient,
@@ -46,7 +47,12 @@ from agents_matrix_connector.matrix import (
     MatrixUnavailable,
 )
 from agents_matrix_connector.receipts import ReadReceipts
-from agents_matrix_connector.sender import RoomPolicy, event_content, refuse_sending
+from agents_matrix_connector.sender import (
+    RoomPolicy,
+    event_content,
+    file_content,
+    refuse_sending,
+)
 from agents_matrix_connector.settings import BotSettings
 
 log = logging.getLogger(__name__)
@@ -59,6 +65,10 @@ ALREADY_SENT = "already_sent"
 FORBIDDEN = "forbidden"
 MESSAGE_FAILED = "message_failed"
 MESSAGE_CANCELLED = "message_cancelled"
+TOO_LARGE_FOR_HOMESERVER = "too_large_for_homeserver"
+FILE_UNAVAILABLE = "file_unavailable"
+UPLOAD_FAILED = "upload_failed"
+_RETRY = object()
 _MESSAGE_REASONS = {"failed": MESSAGE_FAILED, "cancelled": MESSAGE_CANCELLED}
 NOTICE = "Sorry, the agent could not answer that message."
 TYPING_TIMEOUT_MS = 30000
@@ -102,7 +112,10 @@ class Tracker:
         *,
         now: Callable[[], datetime] = utcnow,
         receipts: ReadReceipts | None = None,
+        upload_limit: int | None = None,
     ):
+        """`upload_limit` is the homeserver's `m.upload.size`, read once at start; None skips
+        the check."""
         self._orchestrator = orchestrator
         self._matrix = matrix
         self._pool = pool
@@ -111,6 +124,8 @@ class Tracker:
         self._receipts = receipts or ReadReceipts(matrix)
         self._timeout = timedelta(seconds=settings.run_timeout_seconds)
         self._last_prune: datetime | None = None
+        self._upload_limit = upload_limit
+        media.quiet_file_urls()
 
     async def tick(self) -> None:
         async with self._pool.connection() as conn:
@@ -284,7 +299,15 @@ class Tracker:
                     refused.add(row.send_id)
                     await self._refuse(row.send_id, refusal)
                     continue
-            content = event_content(row.event_type, row.body, row.relates_to)
+            if row.file_position is not None:
+                prepared = await self._file_event(row)
+                if prepared is _RETRY:
+                    return
+                if prepared is None:
+                    continue
+                content = prepared
+            else:
+                content = event_content(row.event_type, row.body, row.relates_to)
             try:
                 event_id = await self._matrix.send_event(
                     row.room_id, row.event_type, row.txn_id, content
@@ -308,6 +331,50 @@ class Tracker:
             left[row.run_id] -= 1
             if row.run_id is not None and left[row.run_id] == 0:
                 await self._typing(row.room_id, False)
+
+    async def _file_event(self, row: runs.OutboundRow) -> Any:
+        """The content of a file row, uploading the bytes first unless an earlier tick did
+        (`content_uri` is stored, so a retry never uploads twice). None when the row failed
+        (`too_large_for_homeserver`, `file_unavailable`, the upload's errcode), `_RETRY` when
+        the homeserver is unavailable. Logs name the send and position, never the file."""
+        assert row.send_id is not None and row.file_position is not None
+        async with self._pool.connection() as conn:
+            found = await send_files.get(conn, row.send_id, row.file_position)
+        if found is None:
+            await self._mark_failed(row.id, FILE_UNAVAILABLE)
+            return None
+        file, data = found
+        if self._upload_limit is not None and file.size > self._upload_limit:
+            log.info("send s%s file %s: %s", row.send_id, file.position, TOO_LARGE_FOR_HOMESERVER)
+            await self._mark_failed(row.id, TOO_LARGE_FOR_HOMESERVER)
+            return None
+        uri = file.content_uri
+        if uri is None:
+            if data is None:
+                log.info("send s%s file %s: %s", row.send_id, file.position, FILE_UNAVAILABLE)
+                await self._mark_failed(row.id, FILE_UNAVAILABLE)
+                return None
+            try:
+                uri = await self._matrix.upload_media(data, file.mime, file.name)
+            except MatrixUnavailable as exc:
+                log.warning(
+                    "matrix unavailable uploading %s, retrying next tick (%s)",
+                    row.txn_id,
+                    type(exc).__name__,
+                )
+                return _RETRY
+            except MatrixAuthError:
+                raise
+            except MatrixError as exc:
+                log.warning("matrix rejected the upload of %s: %s", row.txn_id, exc.errcode)
+                await self._mark_failed(
+                    row.id, FORBIDDEN if exc.status == 403 else exc.errcode or UPLOAD_FAILED
+                )
+                return None
+            async with self._pool.connection() as conn:
+                await send_files.set_content_uri(conn, row.send_id, file.position, uri)
+            log.info("send s%s file %s uploaded size=%s", row.send_id, file.position, file.size)
+        return file_content(file, uri, row.relates_to)
 
     async def _refuse(self, send_id: int, reason: str) -> None:
         async with self._pool.connection() as conn, conn.transaction():

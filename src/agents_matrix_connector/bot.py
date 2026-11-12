@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
 
 from agents_matrix_connector.bridge import BridgeError, ProvisioningClient
-from agents_matrix_connector.matrix import MatrixAuthError, MatrixClient
+from agents_matrix_connector.matrix import MatrixAuthError, MatrixClient, MatrixError
 from agents_matrix_connector.receipts import ReadReceipts
 from agents_matrix_connector.room_requests import RoomRequests
 from agents_matrix_connector.sender import Sender
@@ -211,6 +211,18 @@ async def _management_room(bridge: ProvisioningClient | None) -> frozenset[str] 
     return frozenset({room}) if isinstance(room, str) and room else frozenset()
 
 
+async def upload_limit(matrix: MatrixClient) -> int | None:
+    """The homeserver's `m.upload.size`, read once at start; None when it states none or cannot
+    say (a too large file then fails at upload instead). A lost token propagates."""
+    try:
+        return await matrix.media_config()
+    except MatrixAuthError:
+        raise
+    except MatrixError as exc:
+        log.warning("matrix media config unavailable (%s); no upload size check", exc)
+        return None
+
+
 async def _main(settings, pool, orchestrator, matrix, stop, bridge=None) -> int:
     try:
         who = await matrix.whoami()
@@ -228,7 +240,14 @@ async def _main(settings, pool, orchestrator, matrix, stop, bridge=None) -> int:
     receipts = ReadReceipts(matrix)
     worker = Worker(orchestrator, matrix, pool, settings, receipts=receipts)
     sender = Sender(pool, settings)
-    tracker = Tracker(orchestrator, matrix, pool, settings, receipts=receipts)
+    tracker = Tracker(
+        orchestrator,
+        matrix,
+        pool,
+        settings,
+        receipts=receipts,
+        upload_limit=await upload_limit(matrix),
+    )
     room_requests = RoomRequests(pool, matrix, bridge, settings)
     held = asyncio.Event()
     body = asyncio.create_task(

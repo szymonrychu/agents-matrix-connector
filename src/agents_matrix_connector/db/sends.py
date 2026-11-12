@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
@@ -183,9 +184,11 @@ async def find_duplicate(
     key: str | None,
     reply_to: str | None,
     seconds: int,
+    file_shas: Sequence[str] = (),
 ) -> SendRow | None:
     """The newest queued, sending or sent send of the session created in the last `seconds`
-    whose room, kind, text, key and reply_to equal the given ones exactly (design D5)."""
+    whose room, kind, text, key and reply_to equal the given ones exactly (design D5) and whose
+    files have the given sha256 list, in position order (none for a send without files)."""
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             f"SELECT {_COLUMNS} FROM sends"
@@ -193,6 +196,8 @@ async def find_duplicate(
             " AND text IS NOT DISTINCT FROM %(text)s::text"
             " AND key IS NOT DISTINCT FROM %(key)s::text"
             " AND reply_to IS NOT DISTINCT FROM %(reply_to)s::text"
+            " AND COALESCE((SELECT array_agg(f.sha256 ORDER BY f.position) FROM send_files f"
+            " WHERE f.send_id = sends.id), '{}') = %(shas)s::text[]"
             " AND status IN ('queued', 'sending', 'sent')"
             " AND created_at > now() - make_interval(secs => %(seconds)s)"
             " ORDER BY id DESC LIMIT 1",
@@ -204,6 +209,7 @@ async def find_duplicate(
                 "key": key,
                 "reply_to": reply_to,
                 "seconds": seconds,
+                "shas": list(file_shas),
             },
         )
         row = await cur.fetchone()
@@ -250,6 +256,7 @@ async def resolve(conn: psycopg.AsyncConnection, ref: str) -> Ref | None:
 
 
 async def prune(conn: psycopg.AsyncConnection, older_than: datetime) -> int:
+    """Delete settled sends older than `older_than`; their `send_files` rows cascade."""
     cur = await conn.execute(
         "DELETE FROM sends WHERE created_at < %s AND status IN ('sent', 'failed', 'refused')",
         (older_than,),

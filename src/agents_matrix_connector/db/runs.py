@@ -30,7 +30,7 @@ _RUN_COLUMNS = (
 )
 _OUTBOUND_COLUMNS = (
     "id, room_id, run_id, send_id, kind, event_type, body, relates_to, txn_id, event_id, status,"
-    " reason, created_at, sent_at"
+    " reason, created_at, sent_at, file_position"
 )
 
 
@@ -65,6 +65,8 @@ class OutboundRow:
     reason: str | None
     created_at: datetime
     sent_at: datetime | None
+    file_position: int | None = None
+    """Set on a file row of an agent send: the row sends `send_files(send_id, file_position)`."""
 
 
 class PgRunStore:
@@ -206,22 +208,30 @@ async def add_outbound(
     chunks: Sequence[str],
     event_type: str = "m.room.message",
     relates_to: dict[str, Any] | None = None,
+    files: Sequence[tuple[int, str]] = (),
 ) -> list[int]:
-    """Store the chunks pending, `relates_to` on the first only; re-adding the same chunks
-    returns the existing ids. Replies and notices belong to a run, agent messages and reactions
-    to a send."""
-    txn_ids = _txn_ids(kind, run_id, send_id, len(chunks))
+    """Store the chunks pending, then one row per file `(position, name)` of an agent message
+    (`mxa-<send>-f<position>`, body the file name), `relates_to` on the very first row only;
+    re-adding the same rows returns the existing ids. Replies and notices belong to a run,
+    agent messages and reactions to a send."""
+    txn_ids = _txn_ids(kind, run_id, send_id, len(chunks)) if chunks else []
+    if files and (kind != "agent" or send_id is None or run_id is not None):
+        raise ValueError("files belong to an agent message of a send")
+    rows: list[tuple[str, str, int | None]] = [
+        (txn_id, body, None) for txn_id, body in zip(txn_ids, chunks, strict=True)
+    ]
+    rows += [(f"mxa-{send_id}-f{position}", name, position) for position, name in files]
     ids = []
-    for n, (txn_id, body) in enumerate(zip(txn_ids, chunks, strict=True)):
+    for n, (txn_id, body, position) in enumerate(rows):
         relation = Jsonb(relates_to) if relates_to is not None and n == 0 else None
         await conn.execute(
             """
             INSERT INTO outbound (room_id, run_id, send_id, kind, event_type, body, relates_to,
-                                  txn_id, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending')
+                                  txn_id, status, file_position)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s)
             ON CONFLICT (txn_id) DO NOTHING
             """,
-            (room_id, run_id, send_id, kind, event_type, body, relation, txn_id),
+            (room_id, run_id, send_id, kind, event_type, body, relation, txn_id, position),
         )
         cur = await conn.execute("SELECT id FROM outbound WHERE txn_id = %s", (txn_id,))
         ids.append((await cur.fetchone())[0])

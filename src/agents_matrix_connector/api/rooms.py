@@ -161,6 +161,7 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
             "agents_may_initiate": setting.agents_may_initiate if setting else False,
             "anonymize_names": setting.anonymize_names if setting else False,
             "agent_aliases": list(setting.agent_aliases) if setting else [],
+            "agents_may_send_files": setting.agents_may_send_files if setting else False,
             "session": (
                 SessionView(
                     id=room.session.session_id, slug=room.session.slug, status=room.session.status
@@ -274,6 +275,7 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
             agents_may_initiate=body.agents_may_initiate,
             anonymize_names=body.anonymize_names,
             agent_aliases=body.agent_aliases,
+            agents_may_send_files=body.agents_may_send_files,
         )
         return await detail(await require_room(room_id), await rules.list_rules(pool))
 

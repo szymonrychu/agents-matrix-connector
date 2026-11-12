@@ -19,7 +19,7 @@ from agents_common.fake_orchestrator import FakeOrchestrator
 from agents_common.orchestrator import OrchestratorClient
 
 from agents_matrix_connector import bot
-from agents_matrix_connector.db import inbound, runs, sends
+from agents_matrix_connector.db import inbound, runs, send_files, sends
 from agents_matrix_connector.db.sends import SendRow
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
 from agents_matrix_connector.matrix import MatrixAuthError, MatrixClient, MatrixError
@@ -834,3 +834,100 @@ async def test_whitespace_message_fails_without_rows_or_binding(sender, tracker,
     assert await outbound_of(pool, blank) == []
     assert await all_bindings(pool) == []
     assert hs.sent(R1) == []
+
+
+# --- files (T-155 outbound) --------------------------------------------------------------------
+
+
+async def allow_files(pool, room_id, allowed=True):
+    await execute(
+        pool,
+        "INSERT INTO room_settings (room_id, agents_may_send_files) VALUES (%s, %s)"
+        " ON CONFLICT (room_id)"
+        " DO UPDATE SET agents_may_send_files = EXCLUDED.agents_may_send_files",
+        room_id,
+        allowed,
+    )
+
+
+async def add_files(pool, send_id, *names):
+    files = [
+        send_files.NewFile(
+            position=n,
+            path=f"out/{name}",
+            name=name,
+            mime="text/plain",
+            msgtype="m.file",
+            size=4,
+            sha256=f"{n:064x}",
+            w=None,
+            h=None,
+            data=b"data",
+        )
+        for n, name in enumerate(names)
+    ]
+    async with pool.connection() as conn:
+        await send_files.insert_many(conn, send_id, files)
+
+
+async def file_outbound(pool, send_id) -> list[tuple]:
+    return await execute(
+        pool,
+        "SELECT body, txn_id, relates_to, file_position, status FROM outbound"
+        " WHERE send_id = %s ORDER BY id",
+        send_id,
+    )
+
+
+async def test_plan_text_then_files(sender, pool):
+    session = uuid.uuid4()
+    await allowed_room(pool, R1)
+    await allow_files(pool, R1)
+    await bind(pool, R1, session)
+    a, b = "A" * 60, "B" * 60
+    send = await queue(pool, session, R1, text=f"{a}\n\n{b}", reply_to="m4", ref_event_id="$t")
+    await add_files(pool, send, "chart.png", "notes.txt")
+
+    await sender.tick()
+    relation = {"m.in_reply_to": {"event_id": "$t"}}
+    assert await file_outbound(pool, send) == [
+        (a, f"mxa-{send}-1", relation, None, "pending"),
+        (b, f"mxa-{send}-2", None, None, "pending"),
+        ("chart.png", f"mxa-{send}-f0", None, 0, "pending"),
+        ("notes.txt", f"mxa-{send}-f1", None, 1, "pending"),
+    ]
+    assert await send_state(pool, send) == ("sending", None)
+
+
+async def test_plan_files_only_reply_on_first_file(sender, pool):
+    session = uuid.uuid4()
+    await allowed_room(pool, R1)
+    await allow_files(pool, R1)
+    await bind(pool, R1, session)
+    send = await queue(pool, session, R1, text=None, reply_to="m4", ref_event_id="$t")
+    await add_files(pool, send, "a.png", "b.png")
+
+    await sender.tick()
+    assert await file_outbound(pool, send) == [
+        ("a.png", f"mxa-{send}-f0", {"m.in_reply_to": {"event_id": "$t"}}, 0, "pending"),
+        ("b.png", f"mxa-{send}-f1", None, 1, "pending"),
+    ]
+
+
+async def test_sender_refuses_files_after_flag_off(sender, tracker, pool, hs):
+    session = uuid.uuid4()
+    await allowed_room(pool, R1, flag=True)
+    await allow_files(pool, R1, False)
+    with_files = await queue(pool, session, R1, text="here")
+    await add_files(pool, with_files, "a.png")
+    text_only = await queue(pool, session, R1, text="just text")
+
+    await deliver(sender, tracker)
+    assert await send_state(pool, with_files) == ("refused", "files_not_allowed")
+    assert await file_outbound(pool, with_files) == []
+    assert await send_state(pool, text_only) == ("sent", None)
+    assert hs.sent(R1) == [text_event("just text")]
+    # The refused send created no binding; the text send bound the flagged room.
+    assert (await active_binding(pool, R1))[3] == text_only
+    async with pool.connection() as conn:
+        assert (await send_files.get(conn, with_files, 0))[1] is None  # swept

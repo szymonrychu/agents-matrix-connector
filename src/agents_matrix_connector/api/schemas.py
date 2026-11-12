@@ -84,6 +84,8 @@ class RoomView(BaseModel):
     agent_aliases: list[str]
     """Names people use to call the agent in this room, matched as whole words; the bot's own
     tag and replies to it always count."""
+    agents_may_send_files: bool
+    """Agents may send workdir files (images, documents) to this room; default false."""
     session: SessionView | None
     binding: BindingView | None
     last_event_at: datetime | None
@@ -112,6 +114,8 @@ class RoomSettingsIn(BaseModel):
     """None (or omitted) keeps the stored value."""
     agent_aliases: list[str] | None = None
     """None (or omitted) keeps the stored aliases, a list replaces them, `[]` clears them."""
+    agents_may_send_files: bool | None = None
+    """None (or omitted) keeps the stored value: the flag is an authorisation grant."""
 
     @field_validator("agent_aliases")
     @classmethod

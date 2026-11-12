@@ -98,6 +98,10 @@
             "title": "Agents May Initiate",
             "type": "boolean"
           },
+          "agents_may_send_files": {
+            "title": "Agents May Send Files",
+            "type": "boolean"
+          },
           "bound": {
             "title": "Bound",
             "type": "boolean"
@@ -134,7 +138,8 @@
           "name",
           "kind",
           "bound",
-          "agents_may_initiate"
+          "agents_may_initiate",
+          "agents_may_send_files"
         ],
         "title": "ChatRoom",
         "type": "object"
@@ -338,6 +343,15 @@
       "MessageIn": {
         "additionalProperties": false,
         "properties": {
+          "files": {
+            "description": "Relative paths of files in the calling agent's workdir, sent after the text, one Matrix event each. Needs the room's agents_may_send_files and the X-Orch-Agent header. Images at most 8000000 bytes, other files 25000000 (MATRIX_AGENT_IMAGE_MAX_BYTES, MATRIX_AGENT_FILE_MAX_BYTES).",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 4,
+            "title": "Files",
+            "type": "array"
+          },
           "reply_to": {
             "anyOf": [
               {
@@ -361,15 +375,20 @@
             "title": "Room"
           },
           "text": {
-            "maxLength": 16000,
-            "minLength": 1,
-            "title": "Text",
-            "type": "string"
+            "anyOf": [
+              {
+                "maxLength": 16000,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Needs a non-whitespace character unless files are given (else 422 invalid_text).",
+            "title": "Text"
           }
         },
-        "required": [
-          "text"
-        ],
         "title": "MessageIn",
         "type": "object"
       },
@@ -560,6 +579,10 @@
             "title": "Agents May Initiate",
             "type": "boolean"
           },
+          "agents_may_send_files": {
+            "title": "Agents May Send Files",
+            "type": "boolean"
+          },
           "alias": {
             "anyOf": [
               {
@@ -732,6 +755,7 @@
           "agents_may_initiate",
           "anonymize_names",
           "agent_aliases",
+          "agents_may_send_files",
           "session",
           "binding",
           "last_event_at",
@@ -758,6 +782,10 @@
           },
           "agents_may_initiate": {
             "title": "Agents May Initiate",
+            "type": "boolean"
+          },
+          "agents_may_send_files": {
+            "title": "Agents May Send Files",
             "type": "boolean"
           },
           "alias": {
@@ -928,6 +956,7 @@
           "agents_may_initiate",
           "anonymize_names",
           "agent_aliases",
+          "agents_may_send_files",
           "session",
           "binding",
           "last_event_at",
@@ -1213,6 +1242,17 @@
             ],
             "title": "Agents May Initiate"
           },
+          "agents_may_send_files": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agents May Send Files"
+          },
           "anonymize_names": {
             "anyOf": [
               {
@@ -1349,6 +1389,10 @@
           },
           "agents_may_initiate": {
             "title": "Agents May Initiate",
+            "type": "boolean"
+          },
+          "agents_may_send_files": {
+            "title": "Agents May Send Files",
             "type": "boolean"
           },
           "alias": {
@@ -1512,6 +1556,7 @@
           "agents_may_initiate",
           "anonymize_names",
           "agent_aliases",
+          "agents_may_send_files",
           "session",
           "binding",
           "last_event_at",
@@ -1678,6 +1723,13 @@
             "title": "Created At",
             "type": "string"
           },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/SentFile"
+            },
+            "title": "Files",
+            "type": "array"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -1736,9 +1788,44 @@
           "reason",
           "room_id",
           "created_at",
-          "sent_at"
+          "sent_at",
+          "files"
         ],
         "title": "SendStatus",
+        "type": "object"
+      },
+      "SentFile": {
+        "properties": {
+          "mime": {
+            "title": "Mime",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "uploaded",
+              "sent",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "mime",
+          "size",
+          "status"
+        ],
+        "title": "SentFile",
         "type": "object"
       },
       "SessionView": {
@@ -2570,9 +2657,27 @@
     },
     "/chat/v1/messages": {
       "post": {
-        "description": "Queue a message, optionally a quoted reply. In a room with `anonymize_names`, a text\ncontaining a pseudonym (`user-<sha>`, `admin-<sha>`) is 422 `pseudonym_disclosed`.",
+        "description": "Queue a message, optionally a quoted reply, with up to `MATRIX_AGENT_FILES_PER_SEND`\nworkdir files sent after the text. In a room with `anonymize_names`, a text or file\nname containing a pseudonym (`user-<sha>`, `admin-<sha>`) is 422\n`pseudonym_disclosed`.",
         "operationId": "send_message_chat_v1_messages_post",
         "parameters": [
+          {
+            "description": "the calling agent's uuid, whose workdir holds `files`; required (else 422 files_unavailable) only when files are sent",
+            "in": "header",
+            "name": "X-Orch-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "the calling agent's uuid, whose workdir holds `files`; required (else 422 files_unavailable) only when files are sent",
+              "title": "X-Orch-Agent"
+            }
+          },
           {
             "description": "the calling session's uuid; missing or malformed is 401 unauthorized",
             "in": "header",
@@ -2661,6 +2766,16 @@
             },
             "description": "Forbidden"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -2670,6 +2785,16 @@
               }
             },
             "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
           },
           "422": {
             "content": {
@@ -3146,6 +3271,16 @@
             },
             "description": "Forbidden"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -3155,6 +3290,16 @@
               }
             },
             "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
           },
           "422": {
             "content": {

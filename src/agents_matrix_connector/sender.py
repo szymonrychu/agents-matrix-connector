@@ -5,22 +5,25 @@ that transaction: (a) the room must pass `agent_room_decision` (else `refused` w
 reason); (b) the room must be bound to the send's session, or be unbound, flagged
 `agents_may_initiate` and the session bound to no room, in which case the claim binds the room
 to the session (else `refused` with `room_bound`, `room_not_authorised` or `session_bound`).
-An accepted send gets its outbound rows (`mxa-<send>-<n>` message chunks, the quoted reply
-relation on the first only, or one `mxa-<send>-r` reaction), which the tracker sends. A refused
-send gets no outbound row and changes no binding.
+An accepted send gets its outbound rows (`mxa-<send>-<n>` message chunks, then one
+`mxa-<send>-f<position>` row per file, the quoted reply relation on the first row only, or one
+`mxa-<send>-r` reaction), which the tracker sends. A send with files also needs the room's
+`agents_may_send_files` at claim (else `refused` with `files_not_allowed`). A refused send gets
+no outbound row and changes no binding.
 
 The tick then settles every sending send whose rows have all ended: `sent` with the first row's
 event id when all were sent, else `failed` with the first failed row's reason. A send that ends
 `failed` or `refused` with none of its rows sent releases the binding it created
 (`send_failed`), in the transaction that ends it, unless a later send of the same session
 reached the same room (the user can already reply there). Sends never wait for a room's chat run.
+Last, the sweep drops the bytes of every file whose send has settled (`send_files.data`).
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -31,7 +34,7 @@ from agents_matrix_connector import policy
 from agents_matrix_connector.api.rooms import agent_room_decision
 from agents_matrix_connector.chunks import split
 from agents_matrix_connector.clock import utcnow
-from agents_matrix_connector.db import bindings, directory, rules, runs, sends
+from agents_matrix_connector.db import bindings, directory, rules, runs, send_files, sends
 from agents_matrix_connector.settings import BotSettings
 
 log = logging.getLogger(__name__)
@@ -41,29 +44,41 @@ EMPTY_TEXT = "empty_text"
 ROOM_NOT_ALLOWED = "room_not_allowed"
 ROOM_BOUND = "room_bound"
 ROOM_NOT_AUTHORISED = "room_not_authorised"
+FILES_NOT_ALLOWED = "files_not_allowed"
 MESSAGE = "m.room.message"
 REACTION = "m.reaction"
 
 
 @dataclass(frozen=True)
 class Plan:
-    """The outbound rows of a send: their kind, event type, bodies and first-row relation."""
+    """The outbound rows of a send: their kind, event type, bodies, files `(position, name)`
+    after the text chunks, and the first row's relation."""
 
     kind: str
     event_type: str
     chunks: list[str]
     relates_to: dict[str, Any] | None
+    files: list[tuple[int, str]] = field(default_factory=list)
 
 
-def outbound_plan(send: sends.SendRow, chunk_chars: int) -> Plan:
-    """A message splits into chunks of `chunk_chars` with a quoted reply relation when it
-    replies; a reaction is one `m.annotation` of its key on the referenced event."""
+def outbound_plan(
+    send: sends.SendRow, chunk_chars: int, files: Sequence[send_files.SendFile] = ()
+) -> Plan:
+    """A message splits into chunks of `chunk_chars`, then one row per file (no captions: the
+    text goes first), with a quoted reply relation on the first row when it replies; a reaction
+    is one `m.annotation` of its key on the referenced event."""
     if send.kind == "reaction":
         assert send.key is not None and send.ref_event_id is not None
         relation = {"rel_type": "m.annotation", "event_id": send.ref_event_id, "key": send.key}
         return Plan("reaction", REACTION, [send.key], relation)
     reply = {"m.in_reply_to": {"event_id": send.ref_event_id}} if send.ref_event_id else None
-    return Plan("agent", MESSAGE, split(send.text or "", chunk_chars), reply)
+    return Plan(
+        "agent",
+        MESSAGE,
+        split(send.text or "", chunk_chars),
+        reply,
+        [(f.position, f.name) for f in files],
+    )
 
 
 def event_content(event_type: str, body: str, relates_to: dict[str, Any] | None) -> dict:
@@ -79,6 +94,26 @@ def event_content(event_type: str, body: str, relates_to: dict[str, Any] | None)
             raise ValueError("a reaction needs its m.annotation relation")
         return {"m.relates_to": relates_to}
     raise ValueError(f"outbound event type must be {MESSAGE} or {REACTION}, got {event_type!r}")
+
+
+def file_content(
+    file: send_files.SendFile, content_uri: str, relates_to: dict[str, Any] | None
+) -> dict:
+    """The event content of a file row: `m.image`, `m.video`, `m.audio` or `m.file` with the
+    uploaded `mxc://` uri; width and height only for an image."""
+    info: dict[str, Any] = {"mimetype": file.mime, "size": file.size}
+    if file.msgtype == "m.image" and file.w is not None and file.h is not None:
+        info |= {"w": file.w, "h": file.h}
+    content: dict[str, Any] = {
+        "msgtype": file.msgtype,
+        "body": file.name,
+        "filename": file.name,
+        "url": content_uri,
+        "info": info,
+    }
+    if relates_to is not None:
+        content["m.relates_to"] = relates_to
+    return content
 
 
 class RoomPolicy:
@@ -154,6 +189,14 @@ class Sender:
     async def tick(self) -> None:
         await self._claim()
         await self._settle()
+        await self._sweep()
+
+    async def _sweep(self) -> None:
+        """Drop the bytes of files whose send settled, here or at send time in the tracker."""
+        async with self._pool.connection() as conn:
+            cleared = await send_files.clear_settled(conn)
+        if cleared:
+            log.info("cleared the bytes of %s sent file(s)", cleared)
 
     async def _claim(self) -> None:
         room_policy = RoomPolicy(self._pool, self._settings)
@@ -171,12 +214,13 @@ class Sender:
         refusal = await room_policy.refusal(send.room_id)
         if refusal is not None:
             return refusal
-        plan = outbound_plan(send, self._settings.reply_chunk_chars)
-        if not plan.chunks:
+        files = await send_files.list_for_send(conn, send.id) if send.kind == "message" else []
+        plan = outbound_plan(send, self._settings.reply_chunk_chars, files)
+        if not plan.chunks and not plan.files:
             await sends.mark_failed(conn, send.id, EMPTY_TEXT)
             log.info("send s%s failed at claim: %s", send.id, EMPTY_TEXT)
             return None
-        refusal = await self._authorise(conn, send)
+        refusal = await self._authorise(conn, send, has_files=bool(plan.files))
         if refusal is not None:
             return refusal
         await runs.add_outbound(
@@ -187,15 +231,22 @@ class Sender:
             chunks=plan.chunks,
             event_type=plan.event_type,
             relates_to=plan.relates_to,
+            files=plan.files,
         )
         return None
 
-    async def _authorise(self, conn: psycopg.AsyncConnection, send: sends.SendRow) -> str | None:
-        """(b), binding an unbound flagged room to a session bound to no room (D9)."""
+    async def _authorise(
+        self, conn: psycopg.AsyncConnection, send: sends.SendRow, *, has_files: bool = False
+    ) -> str | None:
+        """The room's `agents_may_send_files` for a send with files (the api checked it at
+        request time; the room may have been switched off since), then (b), binding an unbound
+        flagged room to a session bound to no room (D9)."""
+        setting = await rules.get_room_settings(conn, send.room_id)
+        if has_files and (setting is None or not setting.agents_may_send_files):
+            return FILES_NOT_ALLOWED
         binding = await bindings.active_for_room(conn, send.room_id)
         if binding is not None:
             return None if binding.session_id == send.session_id else ROOM_BOUND
-        setting = await rules.get_room_settings(conn, send.room_id)
         if setting is None or not setting.agents_may_initiate:
             return ROOM_NOT_AUTHORISED
         outcome = await bindings.bind_for_send(
