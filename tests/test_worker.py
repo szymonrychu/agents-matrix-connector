@@ -433,10 +433,57 @@ async def test_typing_on_after_dispatch(conn, hs, matrix, preset, make_worker):
     assert hs.typing_state(OTHER) is False
 
 
-async def test_handoff_sends_read_receipt(conn, hs, matrix, preset, make_worker):
+class FailAfterCheck:
+    """The orchestrator client, but the readiness lookup at handoff fails: the next
+    `get_session` after the binding check answers `status`."""
+
+    def __init__(self, client: OrchestratorClient, fake, status: int):
+        self._client = client
+        self._fake = fake
+        self._status = status
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    async def get_session(self, session_id):
+        session = await self._client.get_session(session_id)
+        self._fake.fail_next("get_session", self._status)
+        return session
+
+
+async def ready_follow(conn, fake, preset, worker) -> tuple[str, int]:
+    """Dispatch a first run in DM, finish it and make its session ready: the room's next batch
+    is a follow run into a session that is up. Returns (session id, first run id)."""
     await preset()
     await add_room(conn, DM)
+    await queue(conn, DM, "first")
+    await worker.tick()
+    [(run_id, _, _, session_id, *_)] = await room_runs(conn, DM)
+    await finish_handled(conn, run_id)
+    fake.set_session_ready(str(session_id))
+    return str(session_id), run_id
+
+
+async def test_first_run_handoff_booting_sends_no_receipt(conn, hs, matrix, preset, make_worker):
+    await preset()
+    await add_room(conn, DM)
+    await queue(conn, DM, "one")
+
+    await make_worker().tick()
+
+    [(_, _, _, _, message_id, status, *_)] = await room_runs(conn, DM)
+    assert message_id is not None and status == "in-progress"
+    assert matrix.typings == [(BOT, DM, True, 30000)]
+    assert matrix.receipts == []
+    assert hs.receipts(DM) == []
+
+
+async def test_handoff_into_ready_session_sends_receipt(
+    conn, fake, hs, matrix, preset, make_worker
+):
     worker = make_worker()
+    await ready_follow(conn, fake, preset, worker)
+    assert matrix.receipts == []
     # The newest event is not the last one inserted; a NULL timestamp sorts lowest.
     await queue_at(conn, DM, "a", T0 + timedelta(seconds=5))
     newest = await queue_at(conn, DM, "b", T0 + timedelta(seconds=9))
@@ -445,22 +492,9 @@ async def test_handoff_sends_read_receipt(conn, hs, matrix, preset, make_worker)
 
     await worker.tick()
 
+    assert [r[1] for r in await room_runs(conn, DM)] == ["first", "follow"]
     assert matrix.receipts == [(DM, newest)]
     assert hs.receipts(DM) == [newest]
-    assert matrix.typings == [(BOT, DM, True, 30000)]
-
-    # A delivery into the running session marks the newest event of its batch.
-    [(run_id, *_)] = await room_runs(conn, DM)
-    await finish_handled(conn, run_id)
-    await queue_at(conn, DM, "e", T0 + timedelta(seconds=20))
-    tie_a = await queue_at(conn, DM, "f", None)
-    tie_b = await queue_at(conn, DM, "g", None)
-    assert tie_a != tie_b
-    await worker.tick()
-
-    follow_newest = (await fetch(conn, "SELECT event_id FROM inbound WHERE body = 'e'"))[0][0]
-    assert hs.receipts(DM) == [newest, follow_newest]
-    assert matrix.receipts == [(DM, newest), (DM, follow_newest)]
     assert matrix.typings == [(BOT, DM, True, 30000)] * 2
 
     # Equal timestamps, and all-NULL timestamps: the greatest row id wins.
@@ -471,25 +505,49 @@ async def test_handoff_sends_read_receipt(conn, hs, matrix, preset, make_worker)
         last = await queue_at(conn, DM, "y", ts)
         await worker.tick()
         assert hs.receipts(DM)[-1] == last
+    assert len(hs.receipts(DM)) == 3
+    assert matrix.typings == [(BOT, DM, True, 30000)] * 4
 
 
-async def test_receipt_failure_does_not_fail_run(conn, hs, matrix, preset, make_worker, caplog):
-    caplog.set_level(logging.WARNING, logger="agents_matrix_connector.worker")
-    await preset()
-    await add_room(conn, DM)
-    await queue(conn, DM, "one")
+async def test_receipt_failure_does_not_fail_run(
+    conn, fake, hs, matrix, preset, make_worker, caplog
+):
+    caplog.set_level(logging.WARNING, logger="agents_matrix_connector")
+    worker = make_worker()
+    await ready_follow(conn, fake, preset, worker)
+    await queue(conn, DM, "two")
     hs.fail_next("receipt", 403, "M_FORBIDDEN")
 
-    await make_worker().tick()
+    await worker.tick()
 
-    [(_, _, _, _, message_id, status, *_)] = await room_runs(conn, DM)
-    assert message_id is not None and status == "in-progress"
+    [_, (_, kind, _, _, message_id, status, *_)] = await room_runs(conn, DM)
+    assert kind == "follow" and message_id is not None and status == "in-progress"
     assert hs.receipts(DM) == []
-    assert matrix.typings == [(BOT, DM, True, 30000)]
+    assert matrix.typings == [(BOT, DM, True, 30000)] * 2
     assert hs.typing_state(DM) is True
     warnings = [r.getMessage() for r in caplog.records if "receipt" in r.getMessage()]
     assert len(warnings) == 1 and DM in warnings[0] and "403" in warnings[0]
     assert TOKEN not in warnings[0]
+
+
+async def test_readiness_lookup_failure_sends_no_receipt(
+    conn, fake, orchestrator, hs, matrix, preset, make_worker, caplog
+):
+    caplog.set_level(logging.INFO, logger="agents_matrix_connector.worker")
+    await ready_follow(conn, fake, preset, make_worker())
+    await queue(conn, DM, "two")
+
+    await make_worker(FailAfterCheck(orchestrator, fake, 503)).tick()
+
+    [_, (run_id, kind, _, _, message_id, status, *_)] = await room_runs(conn, DM)
+    assert kind == "follow" and message_id is not None and status == "in-progress"
+    assert matrix.receipts == []
+    assert hs.receipts(DM) == []
+    assert matrix.typings[-1] == (BOT, DM, True, 30000)
+    assert hs.typing_state(DM) is True
+    assert any(
+        r.getMessage().startswith(f"run {run_id}: readiness unknown (") for r in caplog.records
+    )
 
 
 async def test_no_receipt_without_handoff(conn, hs, matrix, fake, make_worker):

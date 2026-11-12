@@ -42,7 +42,7 @@ import re
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Literal
 
 import psycopg
@@ -74,6 +74,7 @@ from agents_matrix_connector.db import (
 from agents_matrix_connector.db.bindings import BindingRow
 from agents_matrix_connector.db.inbound import InboundRow
 from agents_matrix_connector.matrix import MatrixClient, MatrixError
+from agents_matrix_connector.receipts import ReadReceipts
 from agents_matrix_connector.settings import BotSettings
 from agents_matrix_connector.tracker import SESSION_GONE
 
@@ -167,12 +168,14 @@ class Worker:
         settings: BotSettings,
         *,
         now: Callable[[], datetime] = utcnow,
+        receipts: ReadReceipts | None = None,
     ):
         self._orchestrator = orchestrator
         self._matrix = matrix
         self._pool = pool
         self._settings = settings
         self._now = now
+        self._receipts = receipts or ReadReceipts(matrix)
         self._store = _RoomRunStore(pool)
         self._puppet = re.compile(settings.puppet_pattern)
         self._bridge_server = settings.user_id.split(":", 1)[1]
@@ -342,7 +345,7 @@ class Worker:
         """Create the run's session `mx-<run id>` and post the first prompt."""
         text = await self._render(batch, first=True)
         try:
-            await agent_runs.dispatch(
+            ref = await agent_runs.dispatch(
                 self._orchestrator, self._store, batch.ref, text, self._marker(batch)
             )
         except OrchestratorUnavailable as exc:
@@ -358,7 +361,7 @@ class Worker:
             log.warning("run %s refused: %s %s", batch.ref.id, exc.status, exc.code)
             await self._store.finish(batch.ref.id, "failed", exc.code)
             return
-        await self._delivered(batch)
+        await self._delivered(batch, ref)
 
     async def _deliver(self, batch: _Batch) -> None:
         """Post the batch into the room's running session, with the preamble when the session
@@ -385,7 +388,7 @@ class Worker:
         if delivered is None:
             await self._session_gone(batch)
             return
-        await self._delivered(batch)
+        await self._delivered(batch, delivered)
 
     @staticmethod
     async def _fail_and_requeue(
@@ -438,7 +441,9 @@ class Worker:
             requeued,
         )
 
-    async def _delivered(self, batch: _Batch) -> None:
+    async def _delivered(self, batch: _Batch, ref: agent_runs.RunRef) -> None:
+        """The hive got the batch handed over: typing starts, and the batch is marked read only
+        when the session is already up (else the tracker marks it once the message is sent)."""
         for key in (f"run {batch.ref.id}", f"room {batch.room_id}", f"check {batch.room_id}"):
             self._logged.pop(key, None)
         try:
@@ -447,13 +452,16 @@ class Worker:
             )
         except MatrixError as exc:
             log.warning("matrix typing in %s failed: %s", batch.room_id, exc)
-        newest = max(
-            batch.rows, key=lambda row: (row.origin_ts or datetime.min.replace(tzinfo=UTC), row.id)
-        )
+        if ref.session_id is None:
+            return
         try:
-            await self._matrix.send_receipt(batch.room_id, newest.event_id)
-        except MatrixError as exc:
-            log.warning("matrix read receipt in %s failed: %s", batch.room_id, exc.status)
+            session = await self._orchestrator.get_session(ref.session_id)
+        except (OrchestratorError, OrchestratorUnavailable) as exc:
+            reason = exc.status if isinstance(exc, OrchestratorError) else type(exc).__name__
+            log.info("run %s: readiness unknown (%s)", ref.id, reason)
+            return
+        if session.is_up:
+            await self._receipts.mark_read(int(ref.id), batch.room_id, batch.rows)
 
     async def _render(self, batch: _Batch, *, first: bool) -> str:
         """The prompt of the batch; in a room flagged `anonymize_names` the room name and every

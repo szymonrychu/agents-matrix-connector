@@ -66,6 +66,9 @@ class SpyMatrix:
     ) -> None:
         await self._client.typing(user_id, room_id, typing, timeout_ms)
 
+    async def send_receipt(self, room_id: str, event_id: str) -> None:
+        await self._client.send_receipt(room_id, event_id)
+
 
 def make_settings(**overrides) -> BotSettings:
     values = dict(

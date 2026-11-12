@@ -1,8 +1,10 @@
 """The bot's reply tracker: agent results back into the Matrix room (design D7, D9, D10).
 
-Each tick polls every in-progress run's orchestrator message. A finished run is closed in
-one transaction that also settles its inbound rows and stores its outbound rows, whose
-transaction ids (`mxc-<run id>-<n>`, `mxc-<run id>-notice`) are deterministic: a crash
+Each tick polls every in-progress run's orchestrator message. Once the message is sent (the
+hive has it), the run's newest inbound message is marked read, once per run and before any
+reply of the same tick (`receipts`). A finished run is closed in one transaction that also
+settles its inbound rows and stores its outbound rows, whose transaction ids
+(`mxc-<run id>-<n>`, `mxc-<run id>-notice`) are deterministic: a crash
 between the send and the `sent` update re-sends the same transaction id on the next tick,
 and the homeserver deduplicates it, so the room gets the message once. Pending outbound rows,
 the runs' and the agent sends' (`mxa-` ids, stored by the sender), are then sent oldest first,
@@ -24,6 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from agents_common.orchestrator import (
+    Message,
     NotFound,
     OrchestratorClient,
     OrchestratorError,
@@ -42,6 +45,7 @@ from agents_matrix_connector.matrix import (
     MatrixForbidden,
     MatrixUnavailable,
 )
+from agents_matrix_connector.receipts import ReadReceipts
 from agents_matrix_connector.sender import RoomPolicy, event_content, refuse_sending
 from agents_matrix_connector.settings import BotSettings
 
@@ -82,6 +86,12 @@ def _failed(reason: str) -> _Outcome:
     return _Outcome("failed", reason, kind="notice", chunks=[NOTICE])
 
 
+def _received(message: Message | None) -> bool:
+    """The hive has the message: the orchestrator handed it to the agent's wrapper (`sent`), or
+    a turn exists for it."""
+    return message is not None and (message.status == "sent" or message.turn is not None)
+
+
 class Tracker:
     def __init__(
         self,
@@ -91,12 +101,14 @@ class Tracker:
         settings: BotSettings,
         *,
         now: Callable[[], datetime] = utcnow,
+        receipts: ReadReceipts | None = None,
     ):
         self._orchestrator = orchestrator
         self._matrix = matrix
         self._pool = pool
         self._settings = settings
         self._now = now
+        self._receipts = receipts or ReadReceipts(matrix)
         self._timeout = timedelta(seconds=settings.run_timeout_seconds)
         self._last_prune: datetime | None = None
 
@@ -109,31 +121,43 @@ class Tracker:
         await self._prune_daily()
 
     async def _track(self, run: runs.RunRow) -> None:
-        outcome = await self._outcome(run)
+        message, outcome = await self._poll(run)
+        if _received(message) and not self._receipts.marked(run.id):
+            # Before `_finish`, whose reply chunks are sent later in this tick: seen, then reply.
+            async with self._pool.connection() as conn:
+                rows = await inbound.run_rows(conn, run.id)
+            await self._receipts.mark_read(run.id, run.room_id, rows)
         if outcome is None:
             await self._typing(run.room_id, True)
             return
-        if not await self._finish(run, outcome):
+        finished = await self._finish(run, outcome)
+        self._receipts.forget(run.id)
+        if not finished:
             return
         if not outcome.chunks:
             await self._typing(run.room_id, False)
         if outcome.tell_session is not None:
             await self._tell(run, outcome.tell_session)
 
-    async def _outcome(self, run: runs.RunRow) -> _Outcome | None:
-        """The run's outcome from its message, or None while it is still running."""
+    async def _poll(self, run: runs.RunRow) -> tuple[Message | None, _Outcome | None]:
+        """The run's polled message (None when not found or the poll failed) and its outcome,
+        None while it is still running."""
         assert run.message_id is not None
         try:
             message = await self._orchestrator.get_message(int(run.message_id))
         except NotFound:
-            return _SESSION_GONE if run.kind == "follow" else _failed(MESSAGE_FAILED)
+            return None, _SESSION_GONE if run.kind == "follow" else _failed(MESSAGE_FAILED)
         except OrchestratorUnavailable as exc:
             log.warning("orchestrator unavailable polling run %s: %s", run.id, exc)
-            return self._timed_out(run)
+            return None, self._timed_out(run)
         except OrchestratorError as exc:
             # Status and code only: the message text may echo request content.
             log.warning("orchestrator error polling run %s: %s %s", run.id, exc.status, exc.code)
-            return self._timed_out(run)
+            return None, self._timed_out(run)
+        return message, await self._outcome(run, message)
+
+    async def _outcome(self, run: runs.RunRow, message: Message) -> _Outcome | None:
+        """The run's outcome from its message, or None while it is still running."""
         turn = message.turn
         if turn is not None and turn.status == "completed":
             chunks = split(turn.final_text or "", self._settings.reply_chunk_chars)
