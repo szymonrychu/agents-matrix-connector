@@ -346,7 +346,12 @@ class Worker:
         text = await self._render(batch, first=True)
         try:
             ref = await agent_runs.dispatch(
-                self._orchestrator, self._store, batch.ref, text, self._marker(batch)
+                self._orchestrator,
+                self._store,
+                batch.ref,
+                text,
+                self._marker(batch),
+                from_user=True,
             )
         except OrchestratorUnavailable as exc:
             self._unavailable(f"run {batch.ref.id}", exc)
@@ -376,7 +381,13 @@ class Worker:
         text = await self._render(batch, first=not seen)
         try:
             delivered = await agent_runs.deliver(
-                self._orchestrator, self._store, batch.ref, session_id, text, self._marker(batch)
+                self._orchestrator,
+                self._store,
+                batch.ref,
+                session_id,
+                text,
+                self._marker(batch),
+                from_user=True,
             )
         except OrchestratorUnavailable as exc:
             self._unavailable(f"run {batch.ref.id}", exc)

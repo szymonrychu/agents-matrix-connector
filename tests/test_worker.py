@@ -464,6 +464,30 @@ async def ready_follow(conn, fake, preset, worker) -> tuple[str, int]:
     return str(session_id), run_id
 
 
+async def test_dispatch_posts_from_user(conn, fake, preset, make_worker):
+    await preset()
+    await add_room(conn, DM)
+    await queue(conn, DM, "hello")
+
+    await make_worker().tick()
+
+    [(_, _, _, session_id, *_)] = await room_runs(conn, DM)
+    [message] = session_messages(fake, session_id)
+    assert message["from_user"] is True
+
+
+async def test_follow_delivery_posts_from_user(conn, fake, preset, make_worker):
+    worker = make_worker()
+    session_id, _ = await ready_follow(conn, fake, preset, worker)
+    await queue(conn, DM, "again")
+
+    await worker.tick()
+
+    follow = session_messages(fake, session_id)[-1]
+    assert "again" in follow["text"]
+    assert follow["from_user"] is True
+
+
 async def test_first_run_handoff_booting_sends_no_receipt(conn, hs, matrix, preset, make_worker):
     await preset()
     await add_room(conn, DM)
