@@ -6,7 +6,9 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+from agents_matrix_connector.discovery import normalize_aliases
 
 
 class ApiError(Exception):
@@ -79,6 +81,9 @@ class RoomView(BaseModel):
     anonymize_names: bool
     """The chat agent sees pseudonyms (`user-<sha>`, `admin-<sha>`) instead of the people's
     names and ids, and may not send a pseudonym to the room."""
+    agent_aliases: list[str]
+    """Names people use to call the agent in this room, matched as whole words; the bot's own
+    tag and replies to it always count."""
     session: SessionView | None
     binding: BindingView | None
     last_event_at: datetime | None
@@ -105,6 +110,13 @@ class RoomSettingsIn(BaseModel):
     """None (or omitted) keeps the stored value: the flag is an authorisation grant."""
     anonymize_names: bool | None = None
     """None (or omitted) keeps the stored value."""
+    agent_aliases: list[str] | None = None
+    """None (or omitted) keeps the stored aliases, a list replaces them, `[]` clears them."""
+
+    @field_validator("agent_aliases")
+    @classmethod
+    def _clean_aliases(cls, value: list[str] | None) -> list[str] | None:
+        return None if value is None else list(normalize_aliases(value))
 
 
 class RoomAllowIn(BaseModel):
@@ -114,6 +126,13 @@ class RoomAllowIn(BaseModel):
     preset_id: uuid.UUID | None = None
     trigger: Literal["all", "mention"] | None = None
     agents_may_initiate: bool | None = None
+    agent_aliases: list[str] | None = None
+    """As `RoomSettingsIn.agent_aliases`."""
+
+    @field_validator("agent_aliases")
+    @classmethod
+    def _clean_aliases(cls, value: list[str] | None) -> list[str] | None:
+        return None if value is None else list(normalize_aliases(value))
 
 
 class RoomAllowView(RoomDetail):

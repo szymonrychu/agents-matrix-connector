@@ -7,7 +7,7 @@ connection (so a caller can read inside its own transaction) or the pool.
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,6 +43,7 @@ class RoomSettings:
     trigger: str | None
     agents_may_initiate: bool = False
     anonymize_names: bool = False
+    agent_aliases: tuple[str, ...] = ()
 
 
 @asynccontextmanager
@@ -99,12 +100,14 @@ async def list_rule_rows(pool: AsyncConnectionPool) -> list[RuleRow]:
 async def get_room_settings(source: Source, room_id: str) -> RoomSettings | None:
     async with _conn(source) as conn:
         cur = await conn.execute(
-            "SELECT preset_id, trigger, agents_may_initiate, anonymize_names"
+            "SELECT preset_id, trigger, agents_may_initiate, anonymize_names, agent_aliases"
             " FROM room_settings WHERE room_id = %s",
             (room_id,),
         )
         row = await cur.fetchone()
-    return None if row is None else RoomSettings(*row)
+    if row is None:
+        return None
+    return RoomSettings(*row[:4], tuple(row[4]))
 
 
 async def set_room_settings(
@@ -115,26 +118,30 @@ async def set_room_settings(
     trigger: str | None,
     agents_may_initiate: bool | None = None,
     anonymize_names: bool | None = None,
+    agent_aliases: Sequence[str] | None = None,
 ) -> RoomSettings:
     """Store the room's preset and trigger; a flag given as None keeps its stored value.
 
     A new row without a flag gets false. `agents_may_initiate` is an authorisation grant and
     `anonymize_names` a privacy switch, so a save that does not name one never changes it.
+    `agent_aliases` given as None keeps the stored list, a list (even empty) replaces it.
     """
     async with pool.connection() as conn:
         cur = await conn.execute(
             """
             INSERT INTO room_settings (room_id, preset_id, trigger, agents_may_initiate,
-                                       anonymize_names)
+                                       anonymize_names, agent_aliases)
             VALUES (%(room)s, %(preset)s, %(trigger)s, COALESCE(%(flag)s::boolean, false),
-                    COALESCE(%(anon)s::boolean, false))
+                    COALESCE(%(anon)s::boolean, false),
+                    COALESCE(%(aliases)s::text[], '{}'))
             ON CONFLICT (room_id) DO UPDATE
             SET preset_id = EXCLUDED.preset_id, trigger = EXCLUDED.trigger,
                 agents_may_initiate = COALESCE(%(flag)s::boolean,
                                                room_settings.agents_may_initiate),
                 anonymize_names = COALESCE(%(anon)s::boolean, room_settings.anonymize_names),
+                agent_aliases = COALESCE(%(aliases)s::text[], room_settings.agent_aliases),
                 updated_at = now()
-            RETURNING agents_may_initiate, anonymize_names
+            RETURNING agents_may_initiate, anonymize_names, agent_aliases
             """,
             {
                 "room": room_id,
@@ -142,10 +149,11 @@ async def set_room_settings(
                 "trigger": trigger,
                 "flag": agents_may_initiate,
                 "anon": anonymize_names,
+                "aliases": None if agent_aliases is None else list(agent_aliases),
             },
         )
-        flag, anon = await cur.fetchone()
-    return RoomSettings(preset_id, trigger, flag, anon)
+        flag, anon, aliases = await cur.fetchone()
+    return RoomSettings(preset_id, trigger, flag, anon, tuple(aliases))
 
 
 async def allow_room(
@@ -156,19 +164,29 @@ async def allow_room(
     trigger: str | None,
     agents_may_initiate: bool | None,
     note: str,
+    agent_aliases: Sequence[str] | None = None,
 ) -> int:
     """In the caller's transaction: store the room settings (as `set_room_settings`) and the
     `allow/room` rule for the room id, reusing an existing one. Returns the rule id."""
     await conn.execute(
         """
-        INSERT INTO room_settings (room_id, preset_id, trigger, agents_may_initiate)
-        VALUES (%(room)s, %(preset)s, %(trigger)s, COALESCE(%(flag)s::boolean, false))
+        INSERT INTO room_settings (room_id, preset_id, trigger, agents_may_initiate,
+                                   agent_aliases)
+        VALUES (%(room)s, %(preset)s, %(trigger)s, COALESCE(%(flag)s::boolean, false),
+                COALESCE(%(aliases)s::text[], '{}'))
         ON CONFLICT (room_id) DO UPDATE
         SET preset_id = EXCLUDED.preset_id, trigger = EXCLUDED.trigger,
             agents_may_initiate = COALESCE(%(flag)s::boolean, room_settings.agents_may_initiate),
+            agent_aliases = COALESCE(%(aliases)s::text[], room_settings.agent_aliases),
             updated_at = now()
         """,
-        {"room": room_id, "preset": preset_id, "trigger": trigger, "flag": agents_may_initiate},
+        {
+            "room": room_id,
+            "preset": preset_id,
+            "trigger": trigger,
+            "flag": agents_may_initiate,
+            "aliases": None if agent_aliases is None else list(agent_aliases),
+        },
     )
     list_, kind, value = policy.validate_rule("allow", "room", room_id)
     cur = await conn.execute(

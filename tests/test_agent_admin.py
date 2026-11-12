@@ -79,6 +79,15 @@ async def test_rules_and_rooms_with_the_bearer(admin, conn):
     assert missing.status_code == 404
 
 
+async def test_admin_room_settings_aliases(admin, conn):
+    client, headers = admin
+    await seed(conn)
+    put = await client.put(
+        f"/rooms/{DM}/settings", json={"agent_aliases": ["bot"]}, headers=headers
+    )
+    assert put.status_code == 200 and put.json()["agent_aliases"] == ["bot"]
+
+
 async def test_unknown_preset_goes_through_the_orchestrator(admin, conn):
     client, headers = admin
     await seed(conn)
