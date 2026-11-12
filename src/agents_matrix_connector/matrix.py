@@ -1,4 +1,4 @@
-"""Thin async client for the fifteen Matrix client-server calls the connector makes."""
+"""Thin async client for the Matrix client-server and media calls the connector makes."""
 
 import asyncio
 import json
@@ -12,8 +12,11 @@ import httpx
 log = logging.getLogger(__name__)
 
 API_PREFIX = "/_matrix/client/v3"
+MEDIA_PREFIX = "/_matrix/client/v1/media"
+MEDIA_UPLOAD_PREFIX = "/_matrix/media/v3"
 TOKEN_ERRCODES = frozenset({"M_UNKNOWN_TOKEN", "M_MISSING_TOKEN"})
 MAX_RETRY_SECONDS = 10.0
+UPLOAD_TIMEOUT = 120.0
 REDACTED = "<redacted>"
 
 _sleep = asyncio.sleep
@@ -46,6 +49,13 @@ class MatrixNotFound(MatrixError):
 
 class MatrixUnavailable(MatrixError):
     """Transport error, 5xx, or a 429 that persisted through one retry."""
+
+
+class MediaTooLarge(MatrixError):
+    """A media download that exceeds the byte cap (errcode `too_large`)."""
+
+    def __init__(self, max_bytes: int):
+        super().__init__(None, "too_large", f"media is larger than {max_bytes} bytes")
 
 
 def _path(*segments: str) -> str:
@@ -204,6 +214,56 @@ class MatrixClient:
     async def set_account_data(self, user_id: str, event_type: str, content: dict) -> None:
         await self._request("PUT", _path("user", user_id, "account_data", event_type), json=content)
 
+    async def download_media(self, server: str, media_id: str, max_bytes: int) -> bytes:
+        """The bytes of one authenticated media download; MediaTooLarge past `max_bytes`."""
+        path = f"{MEDIA_PREFIX}/download/{quote(server, safe='')}/{quote(media_id, safe='')}"
+        for attempt in range(2):
+            try:
+                async with self._http.stream("GET", path) as response:
+                    if response.status_code == 429 and attempt == 0:
+                        await response.aread()
+                        delay = _retry_delay(response)
+                        log.warning(
+                            "matrix rate limited on media download, retrying in %.1fs", delay
+                        )
+                        await _sleep(delay)
+                        continue
+                    if not response.is_success:
+                        await response.aread()
+                        raise self._error(response)
+                    length = response.headers.get("content-length", "")
+                    if length.isdigit() and int(length) > max_bytes:
+                        raise MediaTooLarge(max_bytes)
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise MediaTooLarge(max_bytes)
+                        chunks.append(chunk)
+                    return b"".join(chunks)
+            except httpx.TransportError as exc:
+                message = self._redact(f"{type(exc).__name__}: {exc}")
+                raise MatrixUnavailable(None, None, message) from None
+        raise AssertionError("unreachable")
+
+    async def upload_media(self, data: bytes, content_type: str, filename: str) -> str:
+        """Upload `data` to the media repository; its `mxc://` content uri."""
+        body = await self._request(
+            "POST",
+            f"{MEDIA_UPLOAD_PREFIX}/upload?filename={quote(filename, safe='')}",
+            content=data,
+            headers={"Content-Type": content_type},
+            timeout=UPLOAD_TIMEOUT,
+        )
+        return body["content_uri"]
+
+    async def media_config(self) -> int | None:
+        """The homeserver's upload size limit in bytes, None when it does not state one."""
+        body = await self._request("GET", f"{MEDIA_PREFIX}/config")
+        size = body.get("m.upload.size") if isinstance(body, dict) else None
+        return size if isinstance(size, int) and not isinstance(size, bool) else None
+
     def _redact(self, text: str) -> str:
         return text.replace(self._token, REDACTED) if self._token else text
 
@@ -214,13 +274,21 @@ class MatrixClient:
         *,
         params: dict[str, str] | None = None,
         json: Any = None,
+        content: bytes | None = None,
+        headers: dict[str, str] | None = None,
         timeout: float | None = None,
     ) -> Any:
         request_timeout = httpx.USE_CLIENT_DEFAULT if timeout is None else timeout
         for attempt in range(2):
             try:
                 response = await self._http.request(
-                    method, path, params=params, json=json, timeout=request_timeout
+                    method,
+                    path,
+                    params=params,
+                    json=json,
+                    content=content,
+                    headers=headers,
+                    timeout=request_timeout,
                 )
             except httpx.TransportError as exc:
                 message = self._redact(f"{type(exc).__name__}: {exc}")

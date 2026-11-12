@@ -54,6 +54,28 @@ class ConnectorSettings(BaseServiceSettings):
     """Max skills per room."""
     room_memory_rule: str = ""
     """Replaces `prompt.MEMORY_RULE` in first prompts and the notes GET; empty keeps it."""
+    inbound_media_max_bytes: int = Field(26214400, ge=1)
+    """Max bytes downloaded for one inbound attachment."""
+    inbound_image_max_edge: int = Field(2576, ge=1)
+    """Long edge in pixels inbound images are downscaled to."""
+    inbound_image_max_pixels: int = Field(40_000_000, ge=1)
+    """Max width * height of an inbound image; larger is refused before decoding."""
+    inbound_attach_max_bytes: int = Field(6291456, ge=1)
+    """Max bytes of one prepared attachment handed to the agent."""
+    inbound_attach_max_total_bytes: int = Field(8388608, ge=1)
+    """Max bytes of all attachments of one message handed to the agent."""
+    inbound_attach_max_count: int = Field(8, ge=1)
+    """Max attachments of one message handed to the agent."""
+    media_mention_window_seconds: int = Field(120, ge=1)
+    """Same-sender media within this many seconds of a mention joins that message."""
+    agent_files_per_send: int = Field(4, ge=1)
+    """Max files in one agent send."""
+    agent_image_max_bytes: int = Field(8000000, ge=1)
+    """Max bytes of one outbound image (decimal, under the bridge's 8 MB)."""
+    agent_file_max_bytes: int = Field(25000000, ge=1)
+    """Max bytes of one other outbound file (decimal, under the bridge's 25 MB)."""
+    agent_room_file_bytes_per_hour: int = Field(209715200, ge=1)
+    """Max file bytes agent sends may put into one room in the last hour."""
     anonymize_admins: CsvList = []
     """Matrix user ids or numeric Facebook ids shown as `admin-<sha>` in anonymized rooms."""
 

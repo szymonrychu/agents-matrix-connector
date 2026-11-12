@@ -4,6 +4,23 @@ Lessons that outlive a session. Newest first.
 
 ## 2026-11-12 decisions
 
+- Attachments foundation (T-155): Pillow and pillow-heif are added because inbound photos must
+  be re-encoded (EXIF stripped and orientation applied, long edge 2576, JPEG q85 stepping
+  down) and iPhone HEIC must be readable; the agent's Read tool shows only jpeg/png/gif/webp.
+- gif and webp are kept native (gate answer Q2: first frame, re-encoded in the same format,
+  falling back to JPEG/PNG only when still over the cap); this overrides the conversion text in
+  plan.md 4.2.
+- Outbound caps are decimal bytes (8000000 per image, 25000000 per other file) so they stay
+  under the bridge's "8 MB / 25 MB" whichever unit it uses.
+- The pixel cap (`w * h`, default 40 million) is checked from the image header before any
+  `load()`, and `Image.MAX_IMAGE_PIXELS` is set to it, so a tiny file declaring a huge canvas
+  never allocates. Sniffed bytes decide type; sender mime, filename and extension never do.
+- `outbound_mime` keeps a small extension table (docx, xlsx, pptx, zip, csv, md) ahead of
+  `mimetypes`, whose result depends on the host's mime.types; an extension only ever yields a
+  non-media mime.
+- Animated WebP with metadata is sent unchanged by `strip_outbound_metadata` (re-encoding
+  would drop the frames); GIF is never re-encoded outbound.
+
 - Display-name body fallback removed (T-138, Q1 A): the bot ghost and the owner share the
   display name "Szymon Richert", so an owner tag woke the agent; mautrix-meta always sends
   `m.mentions` and pills, and Matrix spec v1.17 (MSC4210) dropped body matching. Mentions are
