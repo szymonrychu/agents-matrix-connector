@@ -102,7 +102,8 @@ matched, the default policy applies), with a `reason` and the matching `rule_id`
 Message statuses are `new`, `in-progress`, `handled`, `ignored` and `failed`, with a `reason`
 when not plain handled:
 
-- `not_mentioned`: ignored, a group message that did not mention the bot
+- `not_mentioned`: ignored, a group message that did not mention the bot (a tag of the bot, a
+  reply to its message or one of the room's `agent_aliases`, see "Mentions")
 - `queue_full`: ignored, the room already has `MATRIX_MAX_QUEUED_PER_ROOM` queued messages
 - `unsupported_content`: ignored, not a text message
 - `no_preset`: ignored, the room has no preset and there is no default preset
@@ -140,8 +141,8 @@ Bot user, homeserver, default policy, group trigger, rule kinds per list and syn
 
 Discovered rooms. Query: `kind` (`dm`, `group`, `matrix`, `infrastructure`), `access`
 (`allowed`, `denied`, `default`). 200 list of rooms with `access`, `preset_id`, `trigger`,
-`effective_trigger`, `agents_may_initiate` and `anonymize_names` (false when the room has no
-settings), `session`
+`effective_trigger`, `agents_may_initiate`, `anonymize_names` (false when the room has no
+settings) and `agent_aliases` (`[]` without settings), `session`
 (the latest run: `id`, `slug`, `status`, or null), `binding` (the room's active session binding:
 `session_id`, `slug`, `origin` `inbound` or `agent`, `since`; `session_id` null while a first run
 reserves the room; null when the room is unbound), `queued` (messages waiting),
@@ -164,12 +165,15 @@ One room (the fields of the list, `pending` included) with its `members` (`user_
 ### `PUT /matrix/api/v1/rooms/{room_id}/settings`
 
 Body `{"preset_id": uuid|null, "trigger": "all"|"mention"|null, "agents_may_initiate":
-true|false|null, "anonymize_names": true|false|null}`: the room's preset and trigger override
+true|false|null, "anonymize_names": true|false|null, "agent_aliases": [string]|null}`: the room's preset and trigger override
 (null or omitted clears), whether agents may start a chat in the room while it is unbound
 (`agents_may_initiate`, off by default) and whether the chat agent sees pseudonyms instead of
 the people's names (`anonymize_names`, off by default, see "Name anonymization"). An omitted or
 null flag keeps its stored value (false for a room without settings), so a save of the preset or
-trigger never changes either. 200 room; 404
+trigger never changes either. `agent_aliases` (at most 10 names of up to 64 characters, see
+"Mentions") are cleaned (trimmed, one leading `@` dropped, spaces collapsed, case-insensitive
+duplicates dropped); null or omitted keeps the stored list, `[]` clears it, an invalid one is 422
+`invalid_request`. 200 room; 404
 `not_found`; 422 `unknown_preset` or `invalid_request`; 503 `unavailable`; 502
 `orchestrator_error`.
 
@@ -179,7 +183,8 @@ trigger never changes either. 200 room; 404
 ### `POST /matrix/api/v1/rooms/{room_id}/allow`
 
 Allow and configure a room in one call. Body as `PUT .../settings` (`preset_id`, `trigger`
-stored as sent, `agents_may_initiate` null keeps the stored flag). One transaction stores the
+stored as sent, `agents_may_initiate` null keeps the stored flag, `agent_aliases` null keeps the stored list).
+One transaction stores the
 settings and an `allow/room` rule for the room id (an existing one is reused, so a second call
 adds nothing) and, when the room is a Messenger message request or still at membership
 `invite`, queues an `accept` room request (status `confirmed`) unless one is open. The bot joins
@@ -751,6 +756,18 @@ preamble is the built-in default or a custom template, so a template cannot drop
 with `role="admin"` are fully trusted, followed like the operator's, and override the
 untrusted-input rule. Identity comes only from attributes the connector sets; bodies and names
 are XML-escaped, so text claiming to be an admin never adds the role.
+
+### Mentions
+
+A group room in trigger `mention` wakes the agent on a tag of the bot (the structured
+`m.mentions` list or a matrix.to link to the bot in the message), on a reply to one of the bot's
+messages (the bridge puts the replied-to sender in `m.mentions`), or on one of the room's
+`agent_aliases` as a whole word, case-insensitive, with an optional leading `@` ("bot", "@Bot,"
+and "BOT?" match the alias `bot`; "robot" and "bot_x" do not). Display names are never matched:
+the bot and its owner can share one, so a tag of the owner must not wake the agent. Messenger
+nicknames are not bridged, so the names people use for the agent are configured here (`PUT
+.../settings`, `POST .../allow`, the UI or the admin tool). Aliases never grant access: the allow
+rules still decide who is heard.
 
 ### Read receipts
 

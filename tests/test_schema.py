@@ -34,6 +34,7 @@ MIGRATIONS = [
     "0006_anonymize_names.sql",
     "0007_room_notes.sql",
     "0008_room_skills.sql",
+    "0009_agent_aliases.sql",
 ]
 
 
@@ -427,6 +428,20 @@ def test_anonymize_names_column(db):
         assert conn.execute(
             "SELECT anonymize_names FROM room_settings WHERE room_id = '!anon'"
         ).fetchone() == (False,)
+
+
+def test_room_settings_agent_aliases_column(db):
+    with psycopg.connect(db) as conn:
+        row = conn.execute(
+            "SELECT data_type, udt_name, is_nullable, column_default"
+            " FROM information_schema.columns WHERE table_schema = 'public'"
+            " AND table_name = 'room_settings' AND column_name = 'agent_aliases'"
+        ).fetchone()
+        assert row == ("ARRAY", "_text", "NO", "'{}'::text[]")
+        conn.execute("INSERT INTO room_settings (room_id) VALUES ('!aliases')")
+        assert conn.execute(
+            "SELECT agent_aliases FROM room_settings WHERE room_id = '!aliases'"
+        ).fetchone() == ([],)
 
 
 def test_room_requests_indexes_and_checks(db):

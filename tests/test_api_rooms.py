@@ -2,6 +2,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import httpx
+import pytest
 from api_helpers import (
     ALICE,
     BOB,
@@ -239,6 +240,42 @@ async def test_room_settings_anonymize_names(api, conn):
 
     bad = await api.put(room_path(DM, "/settings"), json={"anonymize_names": "maybe"})
     assert bad.status_code == 422 and bad.json()["error"]["code"] == "invalid_request"
+
+
+async def test_put_settings_aliases(api, conn):
+    await seed(conn)
+    assert (await api.get(room_path(DM))).json()["agent_aliases"] == []
+    assert all(r["agent_aliases"] == [] for r in (await api.get("/rooms")).json())
+
+    put = await api.put(
+        room_path(DM, "/settings"), json={"agent_aliases": [" @Bot ", "bot", "Agent"]}
+    )
+    assert put.status_code == 200 and put.json()["agent_aliases"] == ["Bot", "Agent"]
+    assert (await api.get(room_path(DM))).json()["agent_aliases"] == ["Bot", "Agent"]
+    assert (await _listed(api, DM))["agent_aliases"] == ["Bot", "Agent"]
+
+    kept = await api.put(room_path(DM, "/settings"), json={"trigger": "all"})
+    assert kept.json()["agent_aliases"] == ["Bot", "Agent"]
+
+    cleared = await api.put(room_path(DM, "/settings"), json={"agent_aliases": []})
+    assert cleared.status_code == 200 and cleared.json()["agent_aliases"] == []
+
+
+@pytest.mark.parametrize("aliases", [["x" * 65], [""], ["!!!"], [f"alias{i}" for i in range(11)]])
+async def test_put_settings_aliases_invalid(api, conn, aliases):
+    await seed(conn)
+    await api.put(room_path(DM, "/settings"), json={"agent_aliases": ["keep"]})
+    bad = await api.put(room_path(DM, "/settings"), json={"agent_aliases": aliases})
+    assert bad.status_code == 422 and bad.json()["error"]["code"] == "invalid_request"
+    assert (await api.get(room_path(DM))).json()["agent_aliases"] == ["keep"]
+
+
+async def test_allow_room_aliases(api, conn):
+    await seed(conn)
+    first = await api.post(room_path(GRP, "/allow"), json={"agent_aliases": ["bot"]})
+    assert first.status_code == 200 and first.json()["agent_aliases"] == ["bot"]
+    second = await api.post(room_path(GRP, "/allow"), json={})
+    assert second.status_code == 200 and second.json()["agent_aliases"] == ["bot"]
 
 
 async def test_agents_may_initiate_default_false(api, conn):

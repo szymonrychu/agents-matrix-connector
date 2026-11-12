@@ -2,6 +2,19 @@
 
 Lessons that outlive a session. Newest first.
 
+## 2026-11-12 decisions
+
+- Display-name body fallback removed (T-138, Q1 A): the bot ghost and the owner share the
+  display name "Szymon Richert", so an owner tag woke the agent; mautrix-meta always sends
+  `m.mentions` and pills, and Matrix spec v1.17 (MSC4210) dropped body matching. Mentions are
+  now only the bot's id in `m.mentions.user_ids`, a matrix.to pill, or a room alias.
+- A reply to the bot counts as a mention because bridgev2 puts the replied-to sender in
+  `m.mentions.user_ids` (Q2); no reply parsing is added.
+- `room_settings.agent_aliases` per room because Messenger nicknames are not bridged
+  (`ChatMember.Nickname` unused). Whole word, casefold, Unicode `\w` boundary, optional leading
+  `@`, max 10 aliases x 64 chars; none keeps and `[]` clears, like `anonymize_names`. Aliases
+  never grant access, only wake an already allowed room.
+
 ## 2026-11-11 decisions
 
 - Per-room notes and skills (T-124): tables `room_notes` and `room_skills`, single writer api;

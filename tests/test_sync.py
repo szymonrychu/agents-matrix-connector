@@ -268,6 +268,9 @@ async def test_group_mention_trigger(fake, client, pool):
     loop = make_loop(client, pool)
     await loop.run_once()
     await rules.add_rule(pool, "allow", "room", GROUP, None)
+    await rules.set_room_settings(
+        pool, GROUP, preset_id=None, trigger=None, agent_aliases=["hermes bot"]
+    )
 
     fake.post(GROUP, ALICE, text("hello everyone"))
     fake.post(GROUP, ALICE, text("hey hermes bot, a question"))
@@ -283,6 +286,54 @@ async def test_group_mention_trigger(fake, client, pool):
     fake.post(GROUP, BOB, text("no mention now"))
     await loop.run_once()
     assert (await inbound_rows(pool))[3] == (BOB, "new", None, "no mention now", False)
+
+
+async def _mention_room(fake, client, pool, aliases=None):
+    fake.add_room(
+        GROUP,
+        [bridge_state("group_dm", "Team")],
+        {BRIDGE: "bridge", ALICE: "Alice", BOB: "Bob", SELF_FB: "Szymon Richert", BOT: "hermes"},
+    )
+    loop = make_loop(client, pool)
+    await loop.run_once()
+    await rules.add_rule(pool, "allow", "room", GROUP, None)
+    if aliases is not None:
+        await rules.set_room_settings(
+            pool, GROUP, preset_id=None, trigger=None, agent_aliases=aliases
+        )
+    return loop
+
+
+async def test_owner_tag_ignored_in_mention_room(fake, client, pool):
+    loop = await _mention_room(fake, client, pool)
+    fake.post(
+        GROUP,
+        ALICE,
+        text(
+            "@Szymon Richert",
+            **{"m.mentions": {}},
+            format="org.matrix.custom.html",
+            formatted_body='<a href="https://matrix.to/#/@owner-puppet:hs">Szymon Richert</a>',
+        ),
+    )
+    await loop.run_once()
+    assert await inbound_rows(pool) == [
+        (ALICE, "ignored", "not_mentioned", "@Szymon Richert", False)
+    ]
+
+
+async def test_alias_wakes_mention_room(fake, client, pool):
+    loop = await _mention_room(fake, client, pool, aliases=["bot"])
+    fake.post(GROUP, ALICE, text("@bot hi", **{"m.mentions": {}}))
+    await loop.run_once()
+    assert await inbound_rows(pool) == [(ALICE, "new", None, "@bot hi", True)]
+
+
+async def test_reply_to_bot_wakes_mention_room(fake, client, pool):
+    loop = await _mention_room(fake, client, pool)
+    fake.post(GROUP, ALICE, text("no names here", **{"m.mentions": {"user_ids": [SELF_FB]}}))
+    await loop.run_once()
+    assert await inbound_rows(pool) == [(ALICE, "new", None, "no names here", True)]
 
 
 async def test_encrypted_infrastructure_unsupported(fake, client, pool):

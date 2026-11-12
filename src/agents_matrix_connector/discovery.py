@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -154,9 +155,54 @@ def parse_message(
     )
 
 
-def mentions_self(
-    candidate: Candidate, self_ids: frozenset[str], self_names: Iterable[str]
-) -> bool:
+MAX_ALIASES = 10
+MAX_ALIAS_CHARS = 64
+
+
+def normalize_aliases(values: Sequence[str]) -> tuple[str, ...]:
+    """Clean a room's agent aliases: strip, drop one leading `@`, collapse whitespace, reject
+    empty, overlong, control or format characters and aliases without a letter or digit; drop
+    case-insensitive duplicates (first spelling wins). Raises ValueError naming the 1-based
+    index."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for index, raw in enumerate(values, start=1):
+        value = raw.strip()
+        if value.startswith("@"):
+            value = value[1:].strip()
+        value = " ".join(value.split())
+        if not value:
+            raise ValueError(f"alias {index} is empty")
+        if len(value) > MAX_ALIAS_CHARS:
+            raise ValueError(f"alias {index} is longer than {MAX_ALIAS_CHARS} characters")
+        if any(unicodedata.category(ch) in ("Cc", "Cf") for ch in value):
+            raise ValueError(f"alias {index} contains a control or format character")
+        if not any(ch.isalnum() for ch in value):
+            raise ValueError(f"alias {index} has no letter or digit")
+        key = value.casefold()
+        if key not in seen:
+            seen.add(key)
+            result.append(value)
+    if len(result) > MAX_ALIASES:
+        raise ValueError(f"more than {MAX_ALIASES} aliases")
+    return tuple(result)
+
+
+def alias_mentioned(body: str, aliases: Sequence[str]) -> bool:
+    """Whether `body` contains one of `aliases` as a whole word (casefolded, whitespace runs
+    match one another; a leading `@` in the body is a non-word character)."""
+    folded = body.casefold()
+    for alias in aliases:
+        words = alias.casefold().split()
+        if not words:
+            continue
+        pattern = r"(?<!\w)" + r"\s+".join(re.escape(word) for word in words) + r"(?!\w)"
+        if re.search(pattern, folded):
+            return True
+    return False
+
+
+def mentions_self(candidate: Candidate, self_ids: frozenset[str], aliases: Sequence[str]) -> bool:
     if any(i in self_ids for i in candidate.mention_ids):
         return True
     if candidate.formatted_body:
@@ -164,8 +210,7 @@ def mentions_self(
             for form in (self_id, quote(self_id, safe="")):
                 if f"https://matrix.to/#/{form}" in candidate.formatted_body:
                     return True
-    body = candidate.body.lower()
-    return any(name and name.lower() in body for name in self_names)
+    return alias_mentioned(candidate.body, aliases)
 
 
 def effective_trigger(

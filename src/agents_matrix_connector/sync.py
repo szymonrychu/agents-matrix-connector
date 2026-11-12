@@ -182,7 +182,7 @@ class _RoomContext:
     encrypted: bool
     member_count: int
     trigger: str | None
-    self_names: tuple[str, ...]
+    aliases: tuple[str, ...]
 
 
 class SyncLoop:
@@ -504,12 +504,6 @@ class SyncLoop:
             (room_id,),
         )
         kind, alias, encrypted, member_count = await cur.fetchone()
-        cur = await conn.execute(
-            "SELECT display_name FROM room_members WHERE room_id = %s AND user_id = ANY(%s)"
-            " AND display_name IS NOT NULL ORDER BY user_id",
-            (room_id, sorted(self._self_ids)),
-        )
-        self_names = tuple(row[0] for row in await cur.fetchall())
         room_settings = await rules.get_room_settings(conn, room_id)
         return _RoomContext(
             kind=kind,
@@ -517,7 +511,7 @@ class SyncLoop:
             encrypted=encrypted,
             member_count=member_count,
             trigger=room_settings.trigger if room_settings else None,
-            self_names=self_names,
+            aliases=room_settings.agent_aliases if room_settings else (),
         )
 
     async def _intake(
@@ -540,7 +534,7 @@ class SyncLoop:
         if isinstance(parsed, discovery.Unsupported):
             status, reason = "ignored", UNSUPPORTED_CONTENT
         else:
-            mentioned = discovery.mentions_self(parsed, self._self_ids, room.self_names)
+            mentioned = discovery.mentions_self(parsed, self._self_ids, room.aliases)
             status, reason, rule_id = await self._decide(
                 conn, room_id, parsed, room, rule_list, sender_name, sender_facebook_id, mentioned
             )

@@ -390,6 +390,20 @@
       "RoomAllowIn": {
         "description": "As `RoomSettingsIn`: preset and trigger are stored as sent (omitted clears), a null\n`agents_may_initiate` keeps the stored flag.",
         "properties": {
+          "agent_aliases": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Aliases"
+          },
           "agents_may_initiate": {
             "anyOf": [
               {
@@ -447,6 +461,13 @@
           },
           "access": {
             "$ref": "#/components/schemas/AccessView"
+          },
+          "agent_aliases": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Agent Aliases",
+            "type": "array"
           },
           "agents_may_initiate": {
             "title": "Agents May Initiate",
@@ -623,6 +644,7 @@
           "effective_trigger",
           "agents_may_initiate",
           "anonymize_names",
+          "agent_aliases",
           "session",
           "binding",
           "last_event_at",
@@ -639,6 +661,13 @@
         "properties": {
           "access": {
             "$ref": "#/components/schemas/AccessView"
+          },
+          "agent_aliases": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Agent Aliases",
+            "type": "array"
           },
           "agents_may_initiate": {
             "title": "Agents May Initiate",
@@ -811,6 +840,7 @@
           "effective_trigger",
           "agents_may_initiate",
           "anonymize_names",
+          "agent_aliases",
           "session",
           "binding",
           "last_event_at",
@@ -823,6 +853,20 @@
       },
       "RoomSettingsIn": {
         "properties": {
+          "agent_aliases": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Aliases"
+          },
           "agents_may_initiate": {
             "anyOf": [
               {
@@ -880,6 +924,13 @@
         "properties": {
           "access": {
             "$ref": "#/components/schemas/AccessView"
+          },
+          "agent_aliases": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Agent Aliases",
+            "type": "array"
           },
           "agents_may_initiate": {
             "title": "Agents May Initiate",
@@ -1045,6 +1096,7 @@
           "effective_trigger",
           "agents_may_initiate",
           "anonymize_names",
+          "agent_aliases",
           "session",
           "binding",
           "last_event_at",

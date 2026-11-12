@@ -135,3 +135,53 @@ async def test_anonymize_names_flag_kept_unless_named(pool):
         pool, "!new:x", preset_id=None, trigger=None, anonymize_names=True
     )
     assert new.anonymize_names is True and new.agents_may_initiate is False
+
+
+async def test_room_settings_aliases_round_trip(pool):
+    fresh = await rules.set_room_settings(pool, "!r:x", preset_id=None, trigger=None)
+    assert fresh.agent_aliases == ()
+    assert (await rules.get_room_settings(pool, "!r:x")).agent_aliases == ()
+    stored = await rules.set_room_settings(
+        pool, "!r:x", preset_id=None, trigger=None, agent_aliases=["bot", "Agent"]
+    )
+    assert stored.agent_aliases == ("bot", "Agent")
+    kept = await rules.set_room_settings(
+        pool, "!r:x", preset_id=None, trigger="all", agent_aliases=None
+    )
+    assert kept.agent_aliases == ("bot", "Agent")
+    assert (await rules.get_room_settings(pool, "!r:x")).agent_aliases == ("bot", "Agent")
+    cleared = await rules.set_room_settings(
+        pool, "!r:x", preset_id=None, trigger="all", agent_aliases=[]
+    )
+    assert cleared.agent_aliases == ()
+    assert (await rules.get_room_settings(pool, "!r:x")).agent_aliases == ()
+
+
+async def test_allow_room_aliases_keep_and_replace(pool):
+    async with pool.connection() as conn, conn.transaction():
+        await rules.allow_room(
+            conn,
+            "!r:x",
+            preset_id=None,
+            trigger=None,
+            agents_may_initiate=None,
+            note="n",
+            agent_aliases=["bot"],
+        )
+    assert (await rules.get_room_settings(pool, "!r:x")).agent_aliases == ("bot",)
+    async with pool.connection() as conn, conn.transaction():
+        await rules.allow_room(
+            conn, "!r:x", preset_id=None, trigger=None, agents_may_initiate=None, note="n"
+        )
+    assert (await rules.get_room_settings(pool, "!r:x")).agent_aliases == ("bot",)
+    async with pool.connection() as conn, conn.transaction():
+        await rules.allow_room(
+            conn,
+            "!r:x",
+            preset_id=None,
+            trigger=None,
+            agents_may_initiate=None,
+            note="n",
+            agent_aliases=["Agent"],
+        )
+    assert (await rules.get_room_settings(pool, "!r:x")).agent_aliases == ("Agent",)

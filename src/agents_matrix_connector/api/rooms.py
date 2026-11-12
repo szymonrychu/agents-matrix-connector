@@ -160,6 +160,7 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
             "effective_trigger": _effective_trigger(room, setting, settings.group_trigger),
             "agents_may_initiate": setting.agents_may_initiate if setting else False,
             "anonymize_names": setting.anonymize_names if setting else False,
+            "agent_aliases": list(setting.agent_aliases) if setting else [],
             "session": (
                 SessionView(
                     id=room.session.session_id, slug=room.session.slug, status=room.session.status
@@ -272,6 +273,7 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
             trigger=body.trigger,
             agents_may_initiate=body.agents_may_initiate,
             anonymize_names=body.anonymize_names,
+            agent_aliases=body.agent_aliases,
         )
         return await detail(await require_room(room_id), await rules.list_rules(pool))
 
@@ -301,6 +303,7 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
                 trigger=body.trigger,
                 agents_may_initiate=body.agents_may_initiate,
                 note=note,
+                agent_aliases=body.agent_aliases,
             )
             accept_id = await room_requests.open_accept_id(conn, room_id)
             if accept_id is None and (room.message_request or room.membership == "invite"):

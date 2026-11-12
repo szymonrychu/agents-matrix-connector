@@ -6,10 +6,12 @@ from agents_matrix_connector.discovery import (
     Candidate,
     Skip,
     Unsupported,
+    alias_mentioned,
     classify,
     effective_trigger,
     facebook_id,
     mentions_self,
+    normalize_aliases,
     parse_message,
     truncate,
 )
@@ -178,22 +180,111 @@ def cand(body="hi", formatted=None, mentions=()):
     return Candidate("$e", "!r", "@a:hs.test", body, formatted, tuple(mentions), 1)
 
 
-def test_mentions_self():
-    names = ["Claude"]
-    assert mentions_self(cand(mentions=["@me:hs.test"]), SELF, names)
+SELF2 = frozenset({"@me:hs.test", "@me-ghost:hs.test"})
+
+
+def test_mentions_self_structured():
+    assert mentions_self(cand(mentions=["@me:hs.test"]), SELF2, ())
     assert mentions_self(
-        cand(formatted='<a href="https://matrix.to/#/@me:hs.test">x</a>'), SELF, names
+        cand(formatted='<a href="https://matrix.to/#/@me:hs.test">x</a>'), SELF2, ()
     )
     assert mentions_self(
-        cand(formatted='<a href="https://matrix.to/#/%40me%3Ahs.test">x</a>'), SELF, names
+        cand(formatted='<a href="https://matrix.to/#/%40me%3Ahs.test">x</a>'), SELF2, ()
     )
-    assert mentions_self(cand(body="hey CLAUDE, hi"), SELF, names)
-    assert not mentions_self(cand(body="hello"), SELF, names)
-    assert not mentions_self(cand(body="hello"), SELF, [""])
-    assert not mentions_self(cand(mentions=["@other:hs.test"]), SELF, names)
+    assert not mentions_self(cand(mentions=["@other:hs.test"]), SELF2, ())
     assert not mentions_self(
-        cand(formatted='<a href="https://matrix.to/#/@x:hs.test">x</a>'), SELF, names
+        cand(formatted='<a href="https://matrix.to/#/@x:hs.test">x</a>'), SELF2, ()
     )
+
+
+def test_owner_tag_with_bot_display_name_not_mentioned():
+    candidate = cand(
+        body="@Szymon Richert",
+        formatted=('<a href="https://matrix.to/#/@owner-puppet:hs.test">Szymon Richert</a>'),
+    )
+    assert not mentions_self(candidate, SELF2, ())
+
+
+def test_reply_to_bot_is_mentioned():
+    assert mentions_self(cand(body="Nie zesraj sie", mentions=["@me:hs.test"]), SELF2, ())
+
+
+def test_self_name_in_body_not_mentioned():
+    assert not mentions_self(cand(body="Hermes said hi"), SELF2, ())
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("bot ping", True),
+        ("@bot ping", True),
+        ("BOT, ping", True),
+        ("hey @Bot!", True),
+        ("(bot)", True),
+        ("ping bot", True),
+        ("bot\nhi", True),
+        ("robot", False),
+        ("bots", False),
+        ("abot", False),
+        ("bot_x", False),
+        ("x_bot", False),
+        ("b o t", False),
+    ],
+)
+def test_alias_matches_whole_word(body, expected):
+    assert alias_mentioned(body, ("bot",)) is expected
+
+
+def test_alias_multi_word():
+    assert alias_mentioned("hi agent   smith!", ("Agent Smith",))
+    assert not alias_mentioned("agent smithers", ("Agent Smith",))
+
+
+def test_alias_unicode_boundary():
+    assert alias_mentioned("GOSIA?", ("Gosia",))
+    assert not alias_mentioned("Gosiak", ("Gosia",))
+    assert not alias_mentioned("zGosia", ("Gosia",))
+    assert not alias_mentioned("Zo\u015bka", ("Zosia",))
+    assert alias_mentioned("\u0142ukasz, hi", ("\u0141ukasz",))
+
+
+def test_alias_metacharacters_literal():
+    assert alias_mentioned("c++ help", ("c++",))
+    assert not alias_mentioned("c help", ("c++",))
+    assert not alias_mentioned("axb", ("a.b",))
+    assert alias_mentioned("a.b", ("a.b",))
+
+
+def test_empty_alias_list_never_matches():
+    assert not alias_mentioned("bot", ())
+    assert not mentions_self(cand(body="bot"), SELF2, ())
+
+
+def test_alias_in_mentions_self():
+    assert mentions_self(cand(body="@bot hi"), SELF2, ("bot",))
+
+
+def test_normalize_aliases():
+    assert normalize_aliases([" @Bot ", "bot", "Agent   Smith"]) == ("Bot", "Agent Smith")
+    assert normalize_aliases([]) == ()
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [""],
+        ["@"],
+        ["   "],
+        ["x" * 65],
+        ["a\x00b"],
+        ["a\u200bb"],
+        ["!!!"],
+        [f"alias{i}" for i in range(11)],
+    ],
+)
+def test_normalize_aliases_rejects(values):
+    with pytest.raises(ValueError):
+        normalize_aliases(values)
 
 
 def test_effective_trigger():
