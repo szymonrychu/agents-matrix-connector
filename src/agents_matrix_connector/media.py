@@ -166,8 +166,8 @@ def _decode(data: bytes, mime: str, max_edge: int, max_pixels: int) -> Image.Ima
         image.load()
         image = ImageOps.exif_transpose(image)
         has_alpha = _has_alpha(image)
-        image.info = {}
         image = image.convert("RGBA" if has_alpha else "RGB")
+        image.info = {}
         if max(image.size) > max_edge:
             image = _scaled(image, max_edge / max(image.size))
     except MediaRefused:
