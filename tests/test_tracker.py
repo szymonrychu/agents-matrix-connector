@@ -1,4 +1,8 @@
+import base64
+import hashlib
+import io
 import logging
+import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -7,9 +11,13 @@ import pytest
 from agents_common.db.pool import open_pool
 from agents_common.fake_orchestrator import FakeOrchestrator
 from agents_common.orchestrator import OrchestratorClient
+from api_helpers import make_settings as api_settings
 
+from agents_matrix_connector import media
+from agents_matrix_connector.api.agent import CHAT_PREFIX, create_agent_app
+from agents_matrix_connector.bot import upload_limit
 from agents_matrix_connector.chunks import split
-from agents_matrix_connector.db import inbound, runs, sends
+from agents_matrix_connector.db import inbound, runs, send_files, sends
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
 from agents_matrix_connector.matrix import MatrixAuthError, MatrixClient
 from agents_matrix_connector.receipts import ReadReceipts
@@ -67,6 +75,10 @@ class SpyMatrix:
     async def send_receipt(self, room_id: str, event_id: str) -> None:
         self.calls.append("receipt")
         await self._client.send_receipt(room_id, event_id)
+
+    async def upload_media(self, data: bytes, content_type: str, filename: str) -> str:
+        self.calls.append("upload")
+        return await self._client.upload_media(data, content_type, filename)
 
 
 def make_settings(**overrides) -> BotSettings:
@@ -961,3 +973,312 @@ async def test_rejection_notice_failure_is_logged(tracker, pool, orch, orch_clie
     assert bodies(hs) == []
     assert session_texts(orch, session) == ["prompt"]
     assert f"run {run_id}: could not tell session {session}" in caplog.text
+
+
+# --- files (T-155 outbound) --------------------------------------------------------------------
+
+CANARY = "CANARY-T155-7f3a"
+
+
+def png_bytes(w: int = 12, h: int = 8) -> bytes:
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), (1, 2, 3)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+async def files_room(pool, room=ROOM, session=None) -> uuid.UUID:
+    """Allow the room for agents with files and bind it to a session."""
+    session = session or uuid.uuid4()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO rooms (room_id, kind, membership, member_count)"
+            " VALUES (%s, 'dm', 'join', 1)",
+            (room,),
+        )
+        await conn.execute(
+            "INSERT INTO users (user_id, facebook_id) VALUES (%s, '1') ON CONFLICT DO NOTHING",
+            (ALICE,),
+        )
+        await conn.execute(
+            "INSERT INTO room_members (room_id, user_id, membership) VALUES (%s, %s, 'join')",
+            (room, ALICE),
+        )
+        await conn.execute(
+            "INSERT INTO access_rules (list, kind, value) VALUES ('allow', 'room', %s)", (room,)
+        )
+        await conn.execute(
+            "INSERT INTO room_settings (room_id, agents_may_send_files) VALUES (%s, true)",
+            (room,),
+        )
+        await conn.execute(
+            "INSERT INTO room_bindings (room_id, session_id, origin, send_id)"
+            " VALUES (%s, %s, 'agent', 999)",
+            (room, session),
+        )
+    return session
+
+
+async def queue_files(pool, session, files, *, text=None, room=ROOM, ref_event_id=None) -> int:
+    """A send with `files` (name, bytes) as the api stores it."""
+    new = []
+    for n, (name, data) in enumerate(files):
+        mime = media.outbound_mime(data, name)
+        msgtype = media.outbound_msgtype(mime)
+        data, w, h = media.strip_outbound_metadata(data, mime)
+        new.append(
+            send_files.NewFile(
+                position=n,
+                path=f"out/{name}",
+                name=name,
+                mime=mime,
+                msgtype=msgtype,
+                size=len(data),
+                sha256=hashlib.sha256(data).hexdigest(),
+                w=w,
+                h=h,
+                data=data,
+            )
+        )
+    async with pool.connection() as conn:
+        send_id = await sends.insert(
+            conn,
+            session_id=session,
+            slug="hive-1",
+            kind="message",
+            room_id=room,
+            text=text,
+            key=None,
+            reply_to="m1" if ref_event_id else None,
+            ref_event_id=ref_event_id,
+        )
+        await send_files.insert_many(conn, send_id, new)
+    return send_id
+
+
+async def send_status(pool, send_id) -> tuple:
+    return (await fetch(pool, "SELECT status, reason FROM sends WHERE id = %s", send_id))[0]
+
+
+async def stored_data(pool, send_id, position=0):
+    rows = await fetch(
+        pool,
+        "SELECT data, content_uri FROM send_files WHERE send_id = %s AND position = %s",
+        send_id,
+        position,
+    )
+    return rows[0]
+
+
+def file_tracker(orch_client, matrix, pool, clock, hs) -> Tracker:
+    return Tracker(
+        orch_client, matrix, pool, make_settings(), now=clock, upload_limit=hs.upload_size
+    )
+
+
+async def test_tracker_uploads_and_sends_image(orch_client, matrix, pool, clock, hs):
+    tracker = file_tracker(orch_client, matrix, pool, clock, hs)
+    sender = Sender(pool, make_settings(), now=clock)
+    session = await files_room(pool)
+    image = png_bytes()
+    send_id = await queue_files(
+        pool, session, [("chart.png", image)], text="look", ref_event_id="$target"
+    )
+
+    await sender.tick()
+    await tracker.tick()
+    await sender.tick()
+
+    assert hs.uploads == [("chart.png", "image/png", image)]
+    relation = {"m.in_reply_to": {"event_id": "$target"}}
+    assert hs.sent(ROOM) == [
+        {"msgtype": "m.text", "body": "look", "m.relates_to": relation},
+        {
+            "msgtype": "m.image",
+            "body": "chart.png",
+            "filename": "chart.png",
+            "url": "mxc://hs/up1",
+            "info": {"mimetype": "image/png", "size": len(image), "w": 12, "h": 8},
+        },
+    ]
+    assert [txn for _, _, txn, _ in matrix.events] == [f"mxa-{send_id}-1", f"mxa-{send_id}-f0"]
+    assert await send_status(pool, send_id) == ("sent", None)
+    assert await stored_data(pool, send_id) == (None, "mxc://hs/up1")
+
+
+async def test_tracker_sends_m_file_for_pdf(orch_client, matrix, pool, clock, hs):
+    tracker = file_tracker(orch_client, matrix, pool, clock, hs)
+    sender = Sender(pool, make_settings(), now=clock)
+    session = await files_room(pool)
+    pdf = b"%PDF-1.4\nreport\n"
+    send_id = await queue_files(pool, session, [("report.pdf", pdf)], ref_event_id="$t")
+
+    await sender.tick()
+    await tracker.tick()
+    await sender.tick()
+
+    assert hs.uploads == [("report.pdf", "application/pdf", pdf)]
+    assert hs.sent(ROOM) == [
+        {
+            "msgtype": "m.file",
+            "body": "report.pdf",
+            "filename": "report.pdf",
+            "url": "mxc://hs/up1",
+            "info": {"mimetype": "application/pdf", "size": len(pdf)},
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$t"}},
+        }
+    ]
+    assert await send_status(pool, send_id) == ("sent", None)
+
+
+async def test_tracker_upload_once_after_crash(orch_client, matrix, pool, clock, hs):
+    tracker = file_tracker(orch_client, matrix, pool, clock, hs)
+    sender = Sender(pool, make_settings(), now=clock)
+    session = await files_room(pool)
+    send_id = await queue_files(pool, session, [("a.txt", b"some words\n")])
+
+    await sender.tick()
+    hs.fail_next("send_text", 503)
+    await tracker.tick()
+    assert len(hs.uploads) == 1
+    assert await stored_data(pool, send_id) == (b"some words\n", "mxc://hs/up1")
+    assert hs.sent(ROOM) == []
+    assert await send_status(pool, send_id) == ("sending", None)
+
+    restarted = file_tracker(orch_client, matrix, pool, clock, hs)
+    await restarted.tick()
+    await sender.tick()
+    assert len(hs.uploads) == 1
+    txns = [txn for _, _, txn, _ in matrix.events]
+    assert txns[-1] == f"mxa-{send_id}-f0" and set(txns) == {f"mxa-{send_id}-f0"}
+    assert [c["url"] for c in hs.sent(ROOM)] == ["mxc://hs/up1"]
+    assert await send_status(pool, send_id) == ("sent", None)
+    assert await stored_data(pool, send_id) == (None, "mxc://hs/up1")
+
+
+async def test_tracker_too_large_for_homeserver(orch_client, matrix, pool, clock, hs):
+    hs.upload_size = 10
+    tracker = file_tracker(orch_client, matrix, pool, clock, hs)
+    sender = Sender(pool, make_settings(), now=clock)
+    session = await files_room(pool)
+    send_id = await queue_files(pool, session, [("big.txt", b"x" * 11)], text="before")
+
+    await sender.tick()
+    await tracker.tick()
+    await sender.tick()
+
+    assert hs.uploads == []
+    assert [c["body"] for c in hs.sent(ROOM)] == ["before"]
+    assert await send_status(pool, send_id) == ("failed", "too_large_for_homeserver")
+    rows = await fetch(
+        pool, "SELECT status, reason FROM outbound WHERE send_id = %s ORDER BY id", send_id
+    )
+    assert rows == [("sent", None), ("failed", "too_large_for_homeserver")]
+    assert await stored_data(pool, send_id) == (None, None)
+
+
+async def test_tracker_file_unavailable_when_bytes_gone(orch_client, matrix, pool, clock, hs):
+    tracker = file_tracker(orch_client, matrix, pool, clock, hs)
+    sender = Sender(pool, make_settings(), now=clock)
+    session = await files_room(pool)
+    send_id = await queue_files(pool, session, [("a.txt", b"words\n")])
+    await sender.tick()
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE send_files SET data = NULL WHERE send_id = %s", (send_id,))
+    await tracker.tick()
+    await sender.tick()
+    assert hs.uploads == [] and hs.sent(ROOM) == []
+    assert await send_status(pool, send_id) == ("failed", "file_unavailable")
+
+
+async def test_sweep_clears_settled_bytes(pool, clock):
+    sender = Sender(pool, make_settings(), now=clock)
+    session = uuid.uuid4()
+    ids = {}
+    for status in ("queued", "sent", "failed", "refused"):
+        ids[status] = await queue_files(pool, session, [("a.txt", b"bytes\n")], room="!b:hs")
+        async with pool.connection() as conn:
+            await conn.execute(
+                "UPDATE sends SET status = %s WHERE id = %s",
+                ("sending" if status == "queued" else status, ids[status]),
+            )
+    await sender.tick()
+    for status, send_id in ids.items():
+        data, _ = await stored_data(pool, send_id)
+        assert (data is None) is (status != "queued"), status
+
+
+async def test_bot_reads_upload_limit_at_start(hs):
+    async with MatrixClient(
+        "http://hs", TOKEN, transport=httpx.ASGITransport(app=hs.app)
+    ) as client:
+        assert await upload_limit(client) == hs.upload_size
+        hs.upload_size = None
+        assert await upload_limit(client) is None
+        hs.fail_next("media_config", 404)
+        assert await upload_limit(client) is None
+
+
+async def test_canary_file_not_retained(orch, orch_client, matrix, pool, url, clock, hs, caplog):
+    caplog.set_level(logging.DEBUG)
+    token = secrets.token_hex(16)
+    app = create_agent_app(
+        pool,
+        orch_client,
+        api_settings(agent_token_sha256=hashlib.sha256(token.encode()).hexdigest()),
+    )
+    session = await files_room(pool)
+    orch.sessions[str(session)] = {"id": str(session)}
+    content = f"top secret {CANARY} line\n".encode()
+    orch.put_file(str(session), "out/canary-notes.txt", content)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Orch-Session": str(session),
+        "X-Orch-Agent": str(uuid.uuid4()),
+    }
+    responses = []
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://agents" + CHAT_PREFIX
+    ) as agent:
+        r = await agent.post("/messages", json={"files": ["out/canary-notes.txt"]}, headers=headers)
+        assert r.status_code == 202, r.text
+        responses.append(r.text)
+        send_ref = r.json()["id"]
+
+        tracker = file_tracker(orch_client, matrix, pool, clock, hs)
+        sender = Sender(pool, make_settings(), now=clock)
+        await sender.tick()
+        await tracker.tick()
+        await sender.tick()
+
+        r = await agent.get(f"/messages/{send_ref}", headers=headers)
+        assert r.status_code == 200 and r.json()["status"] == "sent", r.text
+        assert r.json()["files"][0]["status"] == "sent"
+        responses.append(r.text)
+
+    assert hs.uploads[0][2] == content  # it did reach the homeserver
+    data, uri = await stored_data(pool, int(send_ref[1:]))
+    assert data is None and uri is not None
+
+    marker = CANARY.encode()
+    needles = {
+        CANARY,
+        base64.b64encode(marker).decode(),
+        base64.b64encode(content).decode(),
+        marker.hex(),
+        content.hex(),
+    }
+    tables = await fetch(
+        pool, "SELECT tablename FROM pg_tables WHERE schemaname = current_schema()"
+    )
+    assert ("send_files",) in tables
+    dumped = []
+    for (table,) in tables:
+        dumped += [row[0] for row in await fetch(pool, f'SELECT t::text FROM "{table}" t')]
+    logged = caplog.text + " ".join(str(r.args) for r in caplog.records)
+    for needle in needles:
+        assert needle not in logged, needle
+        assert all(needle not in body for body in responses), needle
+        assert all(needle not in row for row in dumped), needle
+    assert "canary-notes" not in logged

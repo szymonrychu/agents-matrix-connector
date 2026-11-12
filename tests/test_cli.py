@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import logging
 import secrets
 import uuid
 
@@ -9,6 +10,7 @@ from psycopg import sql
 
 from agents_matrix_connector import __version__, cli
 from agents_matrix_connector.cli import EXIT_BAD_SETTINGS, SUBCOMMANDS, MigrateSettings, main
+from agents_matrix_connector.media import FileUrlFilter
 
 
 def test_version(capsys):
@@ -173,7 +175,9 @@ def test_api_binds_agent_listener_only_with_hash(api_env):
 
     api_env.setattr(cli, "_run", run)
 
+    logging.getLogger("httpx").filters.clear()
     assert main(["api"]) == 0
+    assert any(isinstance(f, FileUrlFilter) for f in logging.getLogger("httpx").filters)
     assert served == {9100: "/matrix/api/v1/openapi.json"}
 
     served.clear()

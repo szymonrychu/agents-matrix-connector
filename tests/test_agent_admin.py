@@ -1,11 +1,14 @@
 """The admin surface on the token-gated agent listener: rules and rooms for the superleader."""
 
+import json
+
 import httpx
 import pytest
 from api_helpers import DM, make_settings, seed
 from test_agent_gate import bearer, make_token
 
 from agents_matrix_connector.api.agent import ADMIN_PREFIX, CHAT_PREFIX, create_agent_app
+from agents_matrix_connector.db import rules
 
 ROOM_X = "!x:szymonrichert.pl"
 
@@ -138,3 +141,34 @@ async def test_admin_allow_needs_bearer(admin, conn):
     )
     assert r.status_code == 200
     assert r.json()["access"]["state"] == "allowed" and r.json()["rule_id"] > 0
+
+
+async def test_admin_settings_refuse_agents_may_send_files(admin, conn):
+    client, headers = admin
+    await seed(conn)
+    for value in (True, False, None):
+        r = await client.put(
+            f"/rooms/{DM}/settings", json={"agents_may_send_files": value}, headers=headers
+        )
+        assert r.status_code == 422, value
+    detail = await client.get(f"/rooms/{DM}", headers=headers)
+    assert detail.json()["agents_may_send_files"] is False
+
+
+async def test_admin_settings_keep_agents_may_send_files(admin, conn, pool):
+    client, headers = admin
+    await seed(conn)
+    await rules.set_room_settings(
+        pool, DM, preset_id=None, trigger=None, agents_may_send_files=True
+    )
+    saved = await client.put(f"/rooms/{DM}/settings", json={"trigger": "all"}, headers=headers)
+    assert saved.status_code == 200
+    assert saved.json()["agents_may_send_files"] is True
+    assert (await client.get(f"/rooms/{DM}", headers=headers)).json()["agents_may_send_files"]
+
+
+def test_admin_openapi_body_has_no_files_flag():
+    from agents_matrix_connector.api import openapi
+
+    schema = json.loads(openapi.export_agent())["components"]["schemas"]
+    assert "agents_may_send_files" not in schema["AdminRoomSettingsIn"]["properties"]

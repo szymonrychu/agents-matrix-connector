@@ -44,6 +44,7 @@ class RoomSettings:
     agents_may_initiate: bool = False
     anonymize_names: bool = False
     agent_aliases: tuple[str, ...] = ()
+    agents_may_send_files: bool = False
 
 
 @asynccontextmanager
@@ -100,14 +101,14 @@ async def list_rule_rows(pool: AsyncConnectionPool) -> list[RuleRow]:
 async def get_room_settings(source: Source, room_id: str) -> RoomSettings | None:
     async with _conn(source) as conn:
         cur = await conn.execute(
-            "SELECT preset_id, trigger, agents_may_initiate, anonymize_names, agent_aliases"
-            " FROM room_settings WHERE room_id = %s",
+            "SELECT preset_id, trigger, agents_may_initiate, anonymize_names, agent_aliases,"
+            " agents_may_send_files FROM room_settings WHERE room_id = %s",
             (room_id,),
         )
         row = await cur.fetchone()
     if row is None:
         return None
-    return RoomSettings(*row[:4], tuple(row[4]))
+    return RoomSettings(*row[:4], tuple(row[4]), row[5])
 
 
 async def set_room_settings(
@@ -119,29 +120,34 @@ async def set_room_settings(
     agents_may_initiate: bool | None = None,
     anonymize_names: bool | None = None,
     agent_aliases: Sequence[str] | None = None,
+    agents_may_send_files: bool | None = None,
 ) -> RoomSettings:
     """Store the room's preset and trigger; a flag given as None keeps its stored value.
 
-    A new row without a flag gets false. `agents_may_initiate` is an authorisation grant and
-    `anonymize_names` a privacy switch, so a save that does not name one never changes it.
+    A new row without a flag gets false. `agents_may_initiate` and `agents_may_send_files` are
+    authorisation grants and `anonymize_names` a privacy switch, so a save that does not name
+    one never changes it.
     `agent_aliases` given as None keeps the stored list, a list (even empty) replaces it.
     """
     async with pool.connection() as conn:
         cur = await conn.execute(
             """
             INSERT INTO room_settings (room_id, preset_id, trigger, agents_may_initiate,
-                                       anonymize_names, agent_aliases)
+                                       anonymize_names, agent_aliases, agents_may_send_files)
             VALUES (%(room)s, %(preset)s, %(trigger)s, COALESCE(%(flag)s::boolean, false),
                     COALESCE(%(anon)s::boolean, false),
-                    COALESCE(%(aliases)s::text[], '{}'))
+                    COALESCE(%(aliases)s::text[], '{}'),
+                    COALESCE(%(files)s::boolean, false))
             ON CONFLICT (room_id) DO UPDATE
             SET preset_id = EXCLUDED.preset_id, trigger = EXCLUDED.trigger,
                 agents_may_initiate = COALESCE(%(flag)s::boolean,
                                                room_settings.agents_may_initiate),
                 anonymize_names = COALESCE(%(anon)s::boolean, room_settings.anonymize_names),
                 agent_aliases = COALESCE(%(aliases)s::text[], room_settings.agent_aliases),
+                agents_may_send_files = COALESCE(%(files)s::boolean,
+                                                 room_settings.agents_may_send_files),
                 updated_at = now()
-            RETURNING agents_may_initiate, anonymize_names, agent_aliases
+            RETURNING agents_may_initiate, anonymize_names, agent_aliases, agents_may_send_files
             """,
             {
                 "room": room_id,
@@ -150,10 +156,11 @@ async def set_room_settings(
                 "flag": agents_may_initiate,
                 "anon": anonymize_names,
                 "aliases": None if agent_aliases is None else list(agent_aliases),
+                "files": agents_may_send_files,
             },
         )
-        flag, anon, aliases = await cur.fetchone()
-    return RoomSettings(preset_id, trigger, flag, anon, tuple(aliases))
+        flag, anon, aliases, files = await cur.fetchone()
+    return RoomSettings(preset_id, trigger, flag, anon, tuple(aliases), files)
 
 
 async def allow_room(

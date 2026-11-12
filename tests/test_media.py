@@ -1,6 +1,7 @@
 """Pure media helpers: sniffing, inbound preparation, outbound mapping, names, path rules."""
 
 import io
+import logging
 import os
 import struct
 import zlib
@@ -383,3 +384,20 @@ def test_decode_does_not_mutate_pil_globals():
     data = _save(_gradient(20, 20), "PNG")
     media.prepare_inbound(data, max_edge=2000, max_pixels=123_456, max_bytes=1_000_000)
     assert before == Image.MAX_IMAGE_PIXELS
+
+
+def test_file_url_filter_drops_file_urls_and_keeps_others(caplog):
+    media.quiet_file_urls()
+    media.quiet_file_urls()
+    logger = logging.getLogger("httpx")
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        for url in (
+            "http://wrapper/files/download?path=/work/secret-plan.pdf",
+            "http://hs/_matrix/media/v3/upload?filename=secret-plan.pdf",
+        ):
+            logger.info('HTTP Request: GET %s "HTTP/1.1 200 OK"', url)
+        logger.info('HTTP Request: GET %s "HTTP/1.1 200 OK"', "http://hs/_matrix/client/v3/sync")
+    assert "secret-plan" not in caplog.text
+    assert "/files/download" not in caplog.text
+    assert "v3/sync" in caplog.text
+    assert len(logger.filters) == 1

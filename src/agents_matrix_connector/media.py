@@ -9,6 +9,7 @@ copies EXIF, XMP, ICC or text chunks.
 import fnmatch
 import io
 import json
+import logging
 import mimetypes
 import re
 from dataclasses import dataclass
@@ -72,6 +73,27 @@ _MIN_EDGE = 256
 _SAFE_NAME_MAX = 128
 _DENY_NAMES = (".env", "*.pem", "*.key", "id_rsa*", "id_ed25519*", "credentials*")
 _PATH_MAX = 512
+
+
+class FileUrlFilter(logging.Filter):
+    """Drops log records naming a file transfer URL: httpx logs every request URL at INFO, and a
+    workdir download URL carries the file path, an upload URL the file name; no log line may
+    hold either."""
+
+    MARKERS = ("/files/download", "/media/v3/upload")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not any(marker in message for marker in self.MARKERS)
+
+
+_FILE_URL_FILTER = FileUrlFilter()
+
+
+def quiet_file_urls() -> None:
+    """Install `FileUrlFilter` on the loggers that log request URLs; idempotent."""
+    for name in ("httpx", "agents_matrix_connector.matrix"):
+        logging.getLogger(name).addFilter(_FILE_URL_FILTER)
 
 
 class MediaRefused(Exception):

@@ -16,6 +16,7 @@ from psycopg_pool import AsyncConnectionPool
 from agents_matrix_connector import discovery, policy
 from agents_matrix_connector.api.schemas import (
     AccessView,
+    AdminRoomSettingsIn,
     ApiError,
     BindingView,
     DeniedSender,
@@ -109,7 +110,10 @@ def _parse_cursor(raw: str) -> tuple[str, int]:
     return direction, int(number)
 
 
-def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSettings) -> APIRouter:
+def build_rooms_router(
+    pool: AsyncConnectionPool, orchestrator, settings: ApiSettings, *, admin: bool = False
+) -> APIRouter:
+    """`admin` swaps the settings body for `AdminRoomSettingsIn` (no `agents_may_send_files`)."""
     router = APIRouter()
     puppet = re.compile(settings.puppet_pattern)
     bridge_server = settings.user_id.split(":", 1)[1]
@@ -161,6 +165,7 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
             "agents_may_initiate": setting.agents_may_initiate if setting else False,
             "anonymize_names": setting.anonymize_names if setting else False,
             "agent_aliases": list(setting.agent_aliases) if setting else [],
+            "agents_may_send_files": setting.agents_may_send_files if setting else False,
             "session": (
                 SessionView(
                     id=room.session.session_id, slug=room.session.slug, status=room.session.status
@@ -262,8 +267,9 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
         room = await require_room(room_id)
         return await detail(room, await rules.list_rules(pool))
 
-    @router.put("/rooms/{room_id}/settings", response_model=RoomDetail)
-    async def put_settings(room_id: str, body: RoomSettingsIn) -> RoomDetail:
+    async def store_settings(
+        room_id: str, body: RoomSettingsIn | AdminRoomSettingsIn
+    ) -> RoomDetail:
         await require_room(room_id)
         await check_preset(body.preset_id)
         await rules.set_room_settings(
@@ -274,8 +280,21 @@ def build_rooms_router(pool: AsyncConnectionPool, orchestrator, settings: ApiSet
             agents_may_initiate=body.agents_may_initiate,
             anonymize_names=body.anonymize_names,
             agent_aliases=body.agent_aliases,
+            agents_may_send_files=getattr(body, "agents_may_send_files", None),
         )
         return await detail(await require_room(room_id), await rules.list_rules(pool))
+
+    if admin:
+
+        @router.put("/rooms/{room_id}/settings", response_model=RoomDetail)
+        async def put_admin_settings(room_id: str, body: AdminRoomSettingsIn) -> RoomDetail:
+            return await store_settings(room_id, body)
+
+    else:
+
+        @router.put("/rooms/{room_id}/settings", response_model=RoomDetail)
+        async def put_settings(room_id: str, body: RoomSettingsIn) -> RoomDetail:
+            return await store_settings(room_id, body)
 
     @router.post("/rooms/{room_id}/allow", response_model=RoomAllowView)
     async def allow_room(
