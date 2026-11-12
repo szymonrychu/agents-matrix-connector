@@ -783,8 +783,8 @@ rules still decide who is heard.
 ### Read receipts
 
 The bot marks the newest message of a batch read (a public Matrix `m.read` receipt, which
-mautrix-meta bridges to Messenger as "seen") once the agent has it: at handoff when the session
-is already up, else when the orchestrator reports the message sent (polled every
+mautrix-meta bridges to Messenger as "seen") once the agent has it: at handoff when an agent of
+the session already holds a wrapper session (a ready pod alone is not enough), else when the orchestrator reports the message sent (polled every
 `MATRIX_POLL_SECONDS`). It never marks read while the session is still starting, never waits
 for the reply, and never marks a message that failed before the agent got it. One receipt per
 batch. The typing indicator is unchanged: it starts at handoff. It never sends a receipt in
