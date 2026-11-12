@@ -24,6 +24,7 @@ TABLES = {
     "room_requests",
     "room_notes",
     "room_skills",
+    "send_files",
 }
 MIGRATIONS = [
     "0001_init.sql",
@@ -35,6 +36,7 @@ MIGRATIONS = [
     "0007_room_notes.sql",
     "0008_room_skills.sql",
     "0009_agent_aliases.sql",
+    "0010_attachments.sql",
 ]
 
 
@@ -82,6 +84,7 @@ def test_writer_comments(db):
         "room_requests": "queue: inserted by api; api confirms or rejects",
         "room_notes": "writer: api",
         "room_skills": "writer: api",
+        "send_files": "queue: inserted by api with its send, upload and clear by bot",
     }
     with psycopg.connect(db) as conn:
         for table, comment in expected.items():
@@ -460,3 +463,94 @@ def test_room_requests_indexes_and_checks(db):
         db,
         "INSERT INTO room_requests (action, status, target_kind) VALUES ('open', 'resolving', 'x')",
     )
+
+
+def test_migration_0010_columns(db):
+    with psycopg.connect(db) as conn:
+        inbound = _columns(conn, "inbound")
+        assert {k: inbound[k] for k in inbound if k.startswith("media_")} == {
+            "media_kind": ("text", "YES"),
+            "media_url": ("text", "YES"),
+            "media_mime": ("text", "YES"),
+            "media_size": ("bigint", "YES"),
+            "media_name": ("text", "YES"),
+            "media_w": ("integer", "YES"),
+            "media_h": ("integer", "YES"),
+            "media_status": ("text", "YES"),
+            "media_reason": ("text", "YES"),
+        }
+        assert _columns(conn, "room_settings")["agents_may_send_files"] == ("boolean", "NO")
+        assert _column_default(conn, "room_settings", "agents_may_send_files") == "false"
+        assert _columns(conn, "send_files") == {
+            "send_id": ("bigint", "NO"),
+            "position": ("smallint", "NO"),
+            "path": ("text", "NO"),
+            "name": ("text", "NO"),
+            "mime": ("text", "NO"),
+            "msgtype": ("text", "NO"),
+            "size": ("bigint", "NO"),
+            "sha256": ("text", "NO"),
+            "w": ("integer", "YES"),
+            "h": ("integer", "YES"),
+            "data": ("bytea", "YES"),
+            "content_uri": ("text", "YES"),
+        }
+        pk = conn.execute(
+            "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid"
+            " AND a.attnum = ANY(i.indkey) WHERE i.indrelid = 'send_files'::regclass"
+            " AND i.indisprimary ORDER BY array_position(i.indkey::int[], a.attnum::int)"
+        ).fetchall()
+        assert [r[0] for r in pk] == ["send_id", "position"]
+        assert _columns(conn, "outbound")["file_position"] == ("smallint", "YES")
+        conn.execute("INSERT INTO room_settings (room_id) VALUES ('!files')")
+        assert conn.execute(
+            "SELECT agents_may_send_files FROM room_settings WHERE room_id = '!files'"
+        ).fetchone() == (False,)
+
+
+def _send_id(conn):
+    return conn.execute(
+        "INSERT INTO sends (session_id, kind, room_id, status)"
+        " VALUES (gen_random_uuid(), 'message', '!r', 'queued') RETURNING id"
+    ).fetchone()[0]
+
+
+def _file_row(conn, send_id, position=0, msgtype="m.image"):
+    conn.execute(
+        "INSERT INTO send_files (send_id, position, path, name, mime, msgtype, size, sha256)"
+        " VALUES (%s, %s, 'out/a.png', 'a.png', 'image/png', %s, 3, 'ab')",
+        (send_id, position, msgtype),
+    )
+
+
+def test_send_files_checks_and_cascade_on_send_delete(db):
+    with psycopg.connect(db, autocommit=True) as conn:
+        send_id = _send_id(conn)
+        _file_row(conn, send_id)
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            _file_row(conn, send_id)
+        for msgtype in ("m.text", "image"):
+            with pytest.raises(psycopg.errors.CheckViolation):
+                _file_row(conn, send_id, position=1, msgtype=msgtype)
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            _file_row(conn, send_id + 1000)
+        for kind, status in (("sticker2", None), ("image", "bogus")):
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(
+                    "INSERT INTO inbound (event_id, room_id, sender, status, media_kind,"
+                    " media_status) VALUES (%s, '!r', '@a:b', 'new', %s, %s)",
+                    (f"$e{kind}{status}", kind, status or "attached"),
+                )
+        for kind in ("image", "video", "audio", "file", "sticker"):
+            conn.execute(
+                "INSERT INTO inbound (event_id, room_id, sender, status, media_kind,"
+                " media_status) VALUES (%s, '!r', '@a:b', 'new', %s, 'not_attached')",
+                (f"$ok{kind}", kind),
+            )
+        conn.execute("DELETE FROM sends WHERE id = %s", (send_id,))
+        assert conn.execute("SELECT count(*) FROM send_files").fetchone() == (0,)
+
+
+def test_sends_text_stays_nullable(db):
+    with psycopg.connect(db) as conn:
+        assert _columns(conn, "sends")["text"] == ("text", "YES")

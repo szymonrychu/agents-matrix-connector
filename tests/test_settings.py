@@ -237,3 +237,36 @@ def test_room_memory_settings_defaults_and_bounds(monkeypatch):
     monkeypatch.setenv("MATRIX_ROOM_MEMORY_RULE", "R")
     s = load_settings(ApiSettings)
     assert (s.room_skills_max, s.room_memory_rule) == (100, "R")
+
+
+MEDIA_DEFAULTS = {
+    "inbound_media_max_bytes": 26214400,
+    "inbound_image_max_edge": 2576,
+    "inbound_image_max_pixels": 40_000_000,
+    "inbound_attach_max_bytes": 6291456,
+    "inbound_attach_max_total_bytes": 8388608,
+    "inbound_attach_max_count": 8,
+    "media_mention_window_seconds": 120,
+    "agent_files_per_send": 4,
+    "agent_image_max_bytes": 8000000,
+    "agent_file_max_bytes": 25000000,
+    "agent_room_file_bytes_per_hour": 209715200,
+}
+
+
+def test_media_settings_defaults():
+    s = load_settings(ApiSettings)
+    for name, value in MEDIA_DEFAULTS.items():
+        assert getattr(s, name) == value, name
+
+
+def test_media_settings_env(monkeypatch):
+    for name in MEDIA_DEFAULTS:
+        monkeypatch.setenv(f"MATRIX_{name.upper()}", "7")
+    s = load_settings(ApiSettings)
+    for name in MEDIA_DEFAULTS:
+        assert getattr(s, name) == 7, name
+    for name in MEDIA_DEFAULTS:
+        monkeypatch.setenv(f"MATRIX_{name.upper()}", "0")
+        assert f"MATRIX_{name.upper()}" in problems(ApiSettings), name
+        monkeypatch.setenv(f"MATRIX_{name.upper()}", "7")

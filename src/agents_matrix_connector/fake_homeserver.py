@@ -4,9 +4,11 @@
 `MatrixClient` makes, with Matrix-shaped JSON and errors, for one bot user and its token.
 Drive it through `httpx.ASGITransport(app=fake.app)` or serve it with uvicorn; the helpers
 (`add_room`, `add_alias`, `invite`, `post`, `set_state`, `set_member`, `encrypt`,
-`limit_timeline`, `fail_next`, `revoke_token`) change its state and `sent` / `sent_events` /
-`typing_state` / `receipts` / `created_rooms` / `invites` / `account_data` / `membership_of`
-read back what the bot did.
+`limit_timeline`, `fail_next`, `revoke_token`, `put_media`, `fail_media`) change its state and
+`sent` / `sent_events` / `typing_state` / `receipts` / `created_rooms` / `invites` /
+`account_data` / `membership_of` read back what the bot did; `media_downloads` (media ids
+requested), `uploads` (filename, content type, data) and `upload_size` cover the media routes
+(`/_matrix/client/v1/media/download` and `config`, `/_matrix/media/v3/upload`).
 
 Sync tokens are `s<n>` and pagination tokens `t<n>`, both meaning "after the n-th event";
 `/messages` accepts either. A sync timeline holding more events than its limit (the
@@ -46,6 +48,9 @@ ROUTES = (
     "invite",
     "get_account_data",
     "set_account_data",
+    "media_download",
+    "media_upload",
+    "media_config",
 )
 DEFAULT_ERRCODES = {
     400: "M_UNKNOWN",
@@ -68,6 +73,8 @@ PREJOIN_STATE_TYPES = frozenset(
 ENCRYPTION_ALGORITHM = "m.megolm.v1.aes-sha2"
 BASE_TS = 1_700_000_000_000
 PREFIX = ("", "_matrix", "client", "v3")
+MEDIA_PREFIX = ("", "_matrix", "client", "v1", "media")
+MEDIA_UPLOAD_PREFIX = ("", "_matrix", "media", "v3")
 
 Handler = Callable[[Request, list[str]], Awaitable[Response]]
 
@@ -121,6 +128,11 @@ class FakeHomeserver:
         self._typing: dict[str, bool] = {}
         self._receipts: list[tuple[str, str, str]] = []
         self._timeline_limit: int | None = None
+        self._media: dict[tuple[str, str], bytes] = {}
+        self._media_failures: dict[str, int] = {}
+        self.media_downloads: list[str] = []
+        self.uploads: list[tuple[str, str, bytes]] = []
+        self.upload_size: int | None = 52428800
         self._failures: dict[str, list[_Failure]] = {route: [] for route in ROUTES}
         self._table: list[tuple[str, tuple[str | None, ...], str, Handler]] = [
             ("GET", ("account", "whoami"), "whoami", self._whoami),
@@ -153,6 +165,13 @@ class FakeHomeserver:
                 "set_account_data",
                 self._set_account_data,
             ),
+        ]
+        self._media_table: list[tuple[str, tuple[str | None, ...], str, Handler]] = [
+            ("GET", ("download", None, None), "media_download", self._media_download),
+            ("GET", ("config",), "media_config", self._media_config),
+        ]
+        self._upload_table: list[tuple[str, tuple[str | None, ...], str, Handler]] = [
+            ("POST", ("upload",), "media_upload", self._media_upload),
         ]
         self.app = _AsgiApp(self._asgi)
 
@@ -250,6 +269,15 @@ class FakeHomeserver:
     def receipts(self, room_id: str) -> list[str]:
         """Event ids the bot sent receipts for in the room, in order."""
         return [event for room, _, event in self._receipts if room == room_id]
+
+    def put_media(self, server: str, media_id: str, data: bytes) -> str:
+        """Store `data` as downloadable media; its `mxc://` uri."""
+        self._media[(server, media_id)] = data
+        return f"mxc://{server}/{media_id}"
+
+    def fail_media(self, media_id: str, status: int) -> None:
+        """Answer every download of `media_id` with this error status."""
+        self._media_failures[media_id] = status
 
     def fail_next(
         self,
@@ -349,11 +377,23 @@ class FakeHomeserver:
     async def _dispatch(self, request: Request, scope: Scope) -> Response:
         raw = scope.get("raw_path") or scope["path"].encode()
         segments = [unquote(s) for s in raw.decode("latin-1").split("?", 1)[0].split("/")]
-        if tuple(segments[: len(PREFIX)]) != PREFIX:
-            return matrix_error(404, "M_UNRECOGNIZED", "Unrecognized request")
-        rest = segments[len(PREFIX) :]
+        for prefix, table in (
+            (PREFIX, self._table),
+            (MEDIA_PREFIX, self._media_table),
+            (MEDIA_UPLOAD_PREFIX, self._upload_table),
+        ):
+            if tuple(segments[: len(prefix)]) == prefix:
+                return await self._route(request, segments[len(prefix) :], table)
+        return matrix_error(404, "M_UNRECOGNIZED", "Unrecognized request")
+
+    async def _route(
+        self,
+        request: Request,
+        rest: list[str],
+        table: list[tuple[str, tuple[str | None, ...], str, Handler]],
+    ) -> Response:
         method_allowed = False
-        for method, pattern, route, handler in self._table:
+        for method, pattern, route, handler in table:
             if len(pattern) != len(rest) or any(
                 p is not None and p != s for p, s in zip(pattern, rest, strict=True)
             ):
@@ -670,6 +710,27 @@ class FakeHomeserver:
         if room_id is None:
             return matrix_error(404, "M_NOT_FOUND", f"Room alias {alias} not found")
         return JSONResponse({"room_id": room_id, "servers": [self.server_name]})
+
+    async def _media_download(self, request: Request, params: list[str]) -> Response:
+        server, media_id = params
+        self.media_downloads.append(media_id)
+        if media_id in self._media_failures:
+            return _failure_response(_Failure(self._media_failures[media_id], None, None))
+        data = self._media.get((server, media_id))
+        if data is None:
+            return matrix_error(404, "M_NOT_FOUND", "Not found")
+        return Response(data, media_type="application/octet-stream")
+
+    async def _media_config(self, request: Request, params: list[str]) -> Response:
+        if self.upload_size is None:
+            return JSONResponse({})
+        return JSONResponse({"m.upload.size": self.upload_size})
+
+    async def _media_upload(self, request: Request, params: list[str]) -> Response:
+        filename = request.query_params.get("filename", "")
+        content_type = request.headers.get("content-type", "")
+        self.uploads.append((filename, content_type, await request.body()))
+        return JSONResponse({"content_uri": f"mxc://{self.server_name}/up{len(self.uploads)}"})
 
     async def _typing_route(self, request: Request, params: list[str]) -> Response:
         room_id, user_id = params

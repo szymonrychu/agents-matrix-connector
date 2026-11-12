@@ -52,6 +52,17 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_AGENT_TOKEN_SHA256` | empty | api | sha256 hex (64 lowercase characters) of the orchestrator's agent bearer token; empty leaves the agent listener unbound |
 | `MATRIX_AGENT_RATE_PER_MINUTE` | 20 | api | max agent sends (messages and reactions together) per session in the last 60 s (>= 1) |
 | `MATRIX_AGENT_ROOM_CHUNKS_PER_HOUR` | 60 | api | max Matrix events (message chunks of `MATRIX_REPLY_CHUNK_CHARS`, one per reaction) that agent sends may put into one room in the last hour, all sessions together (>= 1) |
+| `MATRIX_INBOUND_MEDIA_MAX_BYTES` | 26214400 | bot | max bytes downloaded for one inbound attachment (>= 1) |
+| `MATRIX_INBOUND_IMAGE_MAX_EDGE` | 2576 | bot | long edge in pixels inbound images are downscaled to (>= 1) |
+| `MATRIX_INBOUND_IMAGE_MAX_PIXELS` | 40000000 | bot | max width times height of an inbound image; larger is refused before decoding (>= 1) |
+| `MATRIX_INBOUND_ATTACH_MAX_BYTES` | 6291456 | bot | max bytes of one prepared attachment handed to the agent (>= 1) |
+| `MATRIX_INBOUND_ATTACH_MAX_TOTAL_BYTES` | 8388608 | bot | max bytes of all attachments of one message handed to the agent (>= 1) |
+| `MATRIX_INBOUND_ATTACH_MAX_COUNT` | 8 | bot | max attachments of one message handed to the agent (>= 1) |
+| `MATRIX_MEDIA_MENTION_WINDOW_SECONDS` | 120 | bot | same-sender media sent this many seconds before or after a mention joins that message (>= 1) |
+| `MATRIX_AGENT_FILES_PER_SEND` | 4 | api | max files in one agent send (>= 1) |
+| `MATRIX_AGENT_IMAGE_MAX_BYTES` | 8000000 | api | max bytes of one outbound image, decimal to stay under the bridge's 8 MB (>= 1) |
+| `MATRIX_AGENT_FILE_MAX_BYTES` | 25000000 | api | max bytes of one other outbound file, decimal to stay under the bridge's 25 MB (>= 1) |
+| `MATRIX_AGENT_ROOM_FILE_BYTES_PER_HOUR` | 209715200 | api | max file bytes agent sends may put into one room in the last hour, all sessions together (>= 1) |
 | `MATRIX_ANONYMIZE_ADMINS` | empty | api, bot | Matrix user ids or numeric Facebook ids, comma separated, shown as `admin-<sha>` instead of `user-<sha>` in rooms with `anonymize_names` |
 | `MATRIX_ROOM_REQUESTS_PER_HOUR` | 10 | api | max open and invite room requests created in the last hour, all sessions together (>= 1); more answer 429 `rate_limited` |
 | `MATRIX_ROOM_NOTES_MAX_CHARS` | 8000 | api | max characters of one room's notes (100 to 32000); a longer PUT is 413 `notes_too_large` |

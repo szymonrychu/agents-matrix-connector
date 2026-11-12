@@ -16,6 +16,7 @@ from agents_matrix_connector.matrix import (
     MatrixForbidden,
     MatrixNotFound,
     MatrixUnavailable,
+    MediaTooLarge,
 )
 
 BOT = "@bot:hs"
@@ -669,3 +670,95 @@ async def test_account_data_missing_is_none(fake, client):
     fake.fail_next("get_account_data", 502)
     with pytest.raises(MatrixUnavailable):
         await client.get_account_data(BOT, "m.direct")
+
+
+MEDIA = "/_matrix/client/v1/media"
+
+
+async def test_download_media_authenticated(fake, client, recorder):
+    fake.put_media("hs", "abc", b"bytes")
+    assert await client.download_media("hs", "abc", 100) == b"bytes"
+    request = recorder.requests[-1]
+    assert request.url.raw_path.decode() == f"{MEDIA}/download/hs/abc"
+    assert request.headers["authorization"] == f"Bearer {TOKEN}"
+    assert fake.media_downloads == ["abc"]
+
+
+async def test_download_media_cap_content_length(fake, client):
+    fake.put_media("hs", "big", b"x" * 11)
+    with pytest.raises(MediaTooLarge) as err:
+        await client.download_media("hs", "big", 10)
+    assert err.value.errcode == "too_large"
+    assert await client.download_media("hs", "big", 11) == b"x" * 11
+
+
+async def test_download_media_cap_streamed():
+    async def body():
+        for _ in range(5):
+            yield b"x" * 4
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body())
+
+    async with MatrixClient(BASE, TOKEN, transport=httpx.MockTransport(handler)) as c:
+        with pytest.raises(MediaTooLarge):
+            await c.download_media("hs", "abc", 10)
+        assert len(await c.download_media("hs", "abc", 20)) == 20
+
+
+async def test_download_media_not_found(fake, client):
+    with pytest.raises(MatrixError) as err:
+        await client.download_media("hs", "nope", 10)
+    assert err.value.status == 404 and err.value.errcode == "M_NOT_FOUND"
+    fake.put_media("hs", "bad", b"x")
+    fake.fail_media("bad", 500)
+    with pytest.raises(MatrixUnavailable):
+        await client.download_media("hs", "bad", 10)
+    fake.revoke_token()
+    with pytest.raises(MatrixAuthError):
+        await client.download_media("hs", "abc", 10)
+
+
+async def test_upload_media_returns_content_uri(fake, client, recorder):
+    uri = await client.upload_media(b"data", "image/png", "My Chart (1).png")
+    assert uri == "mxc://hs/up1"
+    assert fake.uploads == [("My Chart (1).png", "image/png", b"data")]
+    request = recorder.requests[-1]
+    assert request.method == "POST"
+    raw = request.url.raw_path.decode()
+    assert raw == "/_matrix/media/v3/upload?filename=My%20Chart%20%281%29.png"
+    assert request.headers["content-type"] == "image/png"
+    assert await client.upload_media(b"d2", "text/plain", "a.txt") == "mxc://hs/up2"
+
+
+async def test_media_config_upload_size(fake, client):
+    assert await client.media_config() == 52428800
+    fake.upload_size = 1000
+    assert await client.media_config() == 1000
+    fake.upload_size = None
+    assert await client.media_config() is None
+
+
+async def test_media_token_redacted_in_errors(caplog):
+    def echo_token(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"errcode": "M_UNKNOWN", "error": f"bad {TOKEN}"})
+
+    def leak_in_transport(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"refused with {TOKEN}", request=request)
+
+    caplog.set_level(logging.DEBUG)
+    errors: list[MatrixError] = []
+    for handler in (echo_token, leak_in_transport):
+        async with MatrixClient(BASE, TOKEN, transport=httpx.MockTransport(handler)) as c:
+            for call in (
+                c.download_media("hs", "abc", 10),
+                c.upload_media(b"x", "text/plain", "a.txt"),
+                c.media_config(),
+            ):
+                with pytest.raises(MatrixUnavailable) as err:
+                    await call
+                errors.append(err.value)
+    for err in errors:
+        assert TOKEN not in str(err) and TOKEN not in repr(err.args)
+        assert TOKEN not in "".join(traceback.format_exception(err))
+    assert TOKEN not in caplog.text
