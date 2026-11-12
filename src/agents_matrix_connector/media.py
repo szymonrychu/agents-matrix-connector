@@ -159,15 +159,14 @@ def prepare_inbound(data: bytes, *, max_edge: int, max_pixels: int, max_bytes: i
 
 
 def _decode(data: bytes, mime: str, max_edge: int, max_pixels: int) -> Image.Image:
-    Image.MAX_IMAGE_PIXELS = max_pixels
     try:
         image = Image.open(io.BytesIO(data), formats=_PIL_FORMATS[mime])
         if image.width * image.height > max_pixels:
             raise MediaRefused("too_large")
         image.load()
         image = ImageOps.exif_transpose(image)
-        image.info = {}
         has_alpha = _has_alpha(image)
+        image.info = {}
         image = image.convert("RGBA" if has_alpha else "RGB")
         if max(image.size) > max_edge:
             image = _scaled(image, max_edge / max(image.size))
@@ -261,7 +260,8 @@ def outbound_mime(data: bytes, name: str) -> str:
 def strip_outbound_metadata(data: bytes, mime: str) -> tuple[bytes, int | None, int | None]:
     """(bytes, width, height) for an outbound image; metadata (JPEG Exif/XMP, PNG text and
     eXIf chunks, WebP EXIF/XMP chunks) is removed by re-encoding only when present, else the
-    input bytes come back unchanged. Non-images return (data, None, None)."""
+    input bytes come back unchanged. Non-images return (data, None, None). Fails closed:
+    an image that cannot be inspected or re-encoded raises MediaRefused, never the original."""
     if mime not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
         return data, None, None
     try:
@@ -284,7 +284,7 @@ def strip_outbound_metadata(data: bytes, mime: str) -> tuple[bytes, int | None, 
             out = _dump(image, "WEBP", quality=90)
         return out, *image.size
     except Exception:
-        return data, None, None
+        raise MediaRefused("undecodable") from None
 
 
 def _has_metadata(data: bytes, mime: str) -> bool:

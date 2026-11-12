@@ -361,3 +361,25 @@ def test_check_agent_path_ok(path):
 def test_check_agent_path_refused(path):
     with pytest.raises(ValueError):
         media.check_agent_path(path)
+
+
+def test_prepare_palette_png_with_transparency_stays_png():
+    image = Image.new("P", (40, 30), 0)
+    image.putpalette([255, 0, 0, 0, 255, 0] + [0] * 762)
+    data = _save(image, "PNG", transparency=0)
+    out = media.prepare_inbound(data, max_edge=2000, max_pixels=10_000_000, max_bytes=1_000_000)
+    assert out.mime == "image/png"
+    assert Image.open(io.BytesIO(out.data)).convert("RGBA").getchannel("A").getextrema()[0] == 0
+
+
+def test_strip_outbound_metadata_fails_closed():
+    broken = _save(_gradient(40, 30), "JPEG", exif=_exif(gps=True))[:-300]
+    with pytest.raises(MediaRefused):
+        media.strip_outbound_metadata(broken, "image/jpeg")
+
+
+def test_decode_does_not_mutate_pil_globals():
+    before = Image.MAX_IMAGE_PIXELS
+    data = _save(_gradient(20, 20), "PNG")
+    media.prepare_inbound(data, max_edge=2000, max_pixels=123_456, max_bytes=1_000_000)
+    assert before == Image.MAX_IMAGE_PIXELS
