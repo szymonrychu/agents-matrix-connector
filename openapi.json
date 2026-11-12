@@ -218,6 +218,72 @@
             "title": "Id",
             "type": "string"
           },
+          "media_kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "image",
+                  "video",
+                  "audio",
+                  "file",
+                  "sticker"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Media Kind"
+          },
+          "media_mime": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Media Mime"
+          },
+          "media_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Media Reason"
+          },
+          "media_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Media Size"
+          },
+          "media_status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "attached",
+                  "not_attached"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Media Status"
+          },
           "reason": {
             "anyOf": [
               {

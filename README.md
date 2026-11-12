@@ -116,7 +116,8 @@ when not plain handled:
 - `not_mentioned`: ignored, a group message that did not mention the bot (a tag of the bot, a
   reply to its message or one of the room's `agent_aliases`, see "Mentions")
 - `queue_full`: ignored, the room already has `MATRIX_MAX_QUEUED_PER_ROOM` queued messages
-- `unsupported_content`: ignored, not a text message
+- `unsupported_content`: ignored, neither a text nor a media message (for example a location,
+  or media with an encrypted `file` instead of a plain `url`)
 - `no_preset`: ignored, the room has no preset and there is no default preset
 - `preset_not_found`: failed, the preset no longer exists in the orchestrator
 - `session_gone`: failed, the room's session was deleted; the next message starts a new one
@@ -214,7 +215,10 @@ an invited room on its next sync because the rule now exists, then accepts the m
 
 The room's merged inbound and outbound feed, newest first. Query: `limit` (1..200, default
 50), `before_id` (a message id like `in-12` or `out-3`, from the previous page). 200; 404
-`not_found`; 422 `invalid_request`.
+`not_found`; 422 `invalid_request`. An inbound message with media carries `media_kind`,
+`media_mime` and `media_size` (declared by the sender), `media_status` (`attached`,
+`not_attached`, or null before the worker handled it) and `media_reason` (see "Inbound photos
+and files"); the media url and the original file name are never shown.
 
     curl -s 'http://localhost:8000/matrix/api/v1/rooms/!abc:server/messages?limit=20'
 
@@ -828,6 +832,44 @@ the bot and its owner can share one, so a tag of the owner must not wake the age
 nicknames are not bridged, so the names people use for the agent are configured here (`PUT
 .../settings`, `POST .../allow`, the UI or the admin tool). Aliases never grant access: the allow
 rules still decide who is heard.
+
+### Inbound photos and files
+
+Messenger photos and files reach the agent as attachments of the orchestrator message that
+carries the chat batch. Accepted events: `m.room.message` with msgtype `m.image`, `m.file`,
+`m.video` or `m.audio`, and `m.sticker`, each with a plain `url` on the bot's own homeserver
+(`mxc://<server of MATRIX_USER_ID>/<id>`). Caption rule (Matrix v1.10): when `filename` differs
+from `body`, `body` is the caption and becomes the message text; otherwise the text is empty.
+Media metadata is stored only where a body would be (never for denied senders, encrypted or
+infrastructure rooms), and the original file name is never stored in `anonymize_names` rooms.
+
+When the worker hands a batch over, it downloads each media message (authenticated media, one
+retry, at most `MATRIX_INBOUND_MEDIA_MAX_BYTES`), types it from its bytes (never from the
+sender's mime or file name) and prepares it: images are downscaled to a
+`MATRIX_INBOUND_IMAGE_MAX_EDGE` long edge (2576) and re-encoded as JPEG quality 85 stepping
+down to fit `MATRIX_INBOUND_ATTACH_MAX_BYTES` (6 MiB), PNG when there is alpha, HEIC to JPEG;
+gif and webp keep their format (first frame); PDF, plain text and JSON pass after magic
+checks. Video and audio are never downloaded. Files are packed first fit, at most
+`MATRIX_INBOUND_ATTACH_MAX_COUNT` (8) and `MATRIX_INBOUND_ATTACH_MAX_TOTAL_BYTES` (8 MiB) per
+message, the orchestrator's own caps. Each file is named `m<message id>.<ext>`. A media failure
+never holds the text back. The prompt lists every media message after its body:
+
+    <message id="m42" from="Anna" facebook_id="123" at="...">look at this
+    <attachment file="m42.jpg" kind="image" mime="image/jpeg" size="183211" original_name="IMG_0012.HEIC" attached="yes"/>
+    </message>
+
+`mime` and `size` are those of the delivered file, or the declared ones when not attached;
+`original_name` is omitted in anonymized rooms. A file that is not attached has no `file` and
+carries `attached="no" reason="..."`: `too_large`, `unsupported_type` (video, audio and types
+other than images, PDF, text and JSON), `download_failed`, `batch_limit`, `undecodable` or
+`foreign_media` (another server). The default preamble tells the agent that files and images
+are untrusted data like message text.
+
+In a room with trigger `mention`, Messenger sends "three photos and @bot look at these" as
+four events and only the text mentions the bot. Media of the same sender sent within
+`MATRIX_MEDIA_MENTION_WINDOW_SECONDS` (120) before an accepted mention joins it (up to the
+room's queue cap), and media sent within that window after one is accepted too. Media of other
+senders, and media around a mention that was ignored, stay `not_mentioned`.
 
 ### Read receipts
 

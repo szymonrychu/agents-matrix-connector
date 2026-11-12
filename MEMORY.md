@@ -4,6 +4,29 @@ Lessons that outlive a session. Newest first.
 
 ## 2026-11-12 decisions
 
+- Inbound media (T-155 step 2): the mention window is applied only by bot sync, on rows it
+  inserted. An accepted mention promotes the same sender's media rows that are
+  `ignored/not_mentioned` within `MATRIX_MEDIA_MENTION_WINDOW_SECONDS` around it, newest first,
+  at most the room's remaining queue cap (`max_queued_per_room - count_new`), status-guarded
+  (`status='ignored' AND reason='not_mentioned'` in the UPDATE itself); media after a mention is
+  accepted when an accepted mention (`mentioned AND status <> 'ignored'`) of that sender is
+  within the window before it. Why: Messenger sends each photo as its own event and only the
+  text mentions the bot; a guarded update keeps one writer per transition, and the cap keeps a
+  photo burst from bypassing `queue_full`.
+- Video and audio are never downloaded (`unsupported_type` without a request): no orchestrator
+  allowlist entry would accept them, so a download would only cost bandwidth.
+- gif and webp are delivered in their own format, first frame (gate Q2 answer, overriding the
+  plan's PNG/JPEG); this needs the orchestrator release that allows image/gif, image/webp and
+  application/pdf deployed first, else the whole batch fails 422.
+- Attachment names are always generated, `m<row id>.<ext>` from the sniffed type; the original
+  file name is only an escaped prompt attribute and is never stored in `anonymize_names` rooms
+  (sync drops it before insert), nor shown in `MessageView`.
+- The worker records `media_status`/`media_reason` through `inbound.set_media_outcome`, guarded
+  on `status='in-progress' AND run_id=<run>`, so a run that lost its rows cannot overwrite a
+  later run's outcome. Media is attached again on a `_resume` retry (bytes are never stored).
+- `m.sticker` joined the sync filter, the backfill filter and the message type check (F3):
+  without it stickers never reach `parse_message`.
+
 - Outbound agent files (T-155 step 3): the api downloads each file through the orchestrator
   at request time (gate Q4), outside any pool connection: the room checks, flag, names, path
   rules and a rate/room-bytes pre-check run on one connection, which is released before the

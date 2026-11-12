@@ -4,6 +4,7 @@ import pytest
 
 from agents_matrix_connector.discovery import (
     Candidate,
+    Media,
     Skip,
     Unsupported,
     alias_mentioned,
@@ -299,3 +300,75 @@ def test_effective_trigger():
 def test_truncate():
     assert truncate("abc", 3) == "abc"
     assert truncate("abcd", 3) == "abc [truncated]"
+
+
+MXC = "mxc://hs.test/abc"
+
+
+@pytest.mark.parametrize(
+    ("msgtype", "kind"),
+    [("m.image", "image"), ("m.file", "file"), ("m.video", "video"), ("m.audio", "audio")],
+)
+def test_parse_media_msgtypes(msgtype, kind):
+    content = {
+        "msgtype": msgtype,
+        "body": "IMG_1.jpg",
+        "url": MXC,
+        "info": {"mimetype": "image/jpeg", "size": 1234, "w": 30, "h": 20},
+    }
+    got = parse_message("!r", msg(content=content), SELF, BOTS)
+    assert isinstance(got, Candidate)
+    assert got.body == ""
+    assert got.media == Media(kind, MXC, "image/jpeg", 1234, "IMG_1.jpg", 30, 20)
+
+
+def test_parse_media_info_wrong_types_dropped():
+    content = {
+        "msgtype": "m.image",
+        "body": "a.png",
+        "url": MXC,
+        "info": {"mimetype": 5, "size": "big", "w": True, "h": 2.5},
+    }
+    got = parse_message("!r", msg(content=content), SELF, BOTS)
+    assert got.media == Media("image", MXC, None, None, "a.png", None, None)
+
+
+def test_parse_sticker():
+    content = {"body": "thumbs up", "url": MXC, "info": {"mimetype": "image/webp"}}
+    got = parse_message("!r", msg(content=content, type_="m.sticker"), SELF, BOTS)
+    assert isinstance(got, Candidate)
+    assert got.media == Media("sticker", MXC, "image/webp", None, "thumbs up", None, None)
+    assert got.body == ""
+
+
+def test_parse_encrypted_file_unsupported():
+    content = {"msgtype": "m.image", "body": "a.jpg", "file": {"url": MXC, "key": {}}}
+    got = parse_message("!r", msg(content=content), SELF, BOTS)
+    assert got == Unsupported("$e", "@alice:hs.test")
+    sticker = msg(content={"body": "s", "file": {"url": MXC}}, type_="m.sticker")
+    assert isinstance(parse_message("!r", sticker, SELF, BOTS), Unsupported)
+
+
+def test_parse_location_unsupported():
+    content = {"msgtype": "m.location", "body": "here", "geo_uri": "geo:1,2"}
+    assert isinstance(parse_message("!r", msg(content=content), SELF, BOTS), Unsupported)
+    other = {"msgtype": "m.notice", "body": "x", "url": MXC}
+    assert isinstance(parse_message("!r", msg(content=other), SELF, BOTS), Unsupported)
+
+
+def test_caption_rule():
+    def parse(**content):
+        got = parse_message(
+            "!r", msg(content={"msgtype": "m.image", "url": MXC, **content}), SELF, BOTS
+        )
+        assert isinstance(got, Candidate)
+        return got.body, got.media.name
+
+    assert parse(body="look at this", filename="IMG_1.jpg") == ("look at this", "IMG_1.jpg")
+    assert parse(body="IMG_1.jpg", filename="IMG_1.jpg") == ("", "IMG_1.jpg")
+    assert parse(body="IMG_1.jpg") == ("", "IMG_1.jpg")
+    assert parse(body="IMG_1.jpg", filename=7) == ("", "IMG_1.jpg")
+
+
+def test_text_candidate_has_no_media():
+    assert parse_message("!r", msg(), SELF, BOTS).media is None

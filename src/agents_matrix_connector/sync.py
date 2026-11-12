@@ -45,6 +45,7 @@ log = logging.getLogger(__name__)
 
 EVENT_TYPES = [
     "m.room.message",
+    "m.sticker",
     "m.room.member",
     "m.room.name",
     "m.room.canonical_alias",
@@ -52,7 +53,7 @@ EVENT_TYPES = [
     "m.bridge",
     "uk.half-shot.bridge",
 ]
-ROOM_INFO_TYPES = frozenset(EVENT_TYPES) - {"m.room.message", "m.room.member"}
+ROOM_INFO_TYPES = frozenset(EVENT_TYPES) - {*discovery.MESSAGE_TYPES, "m.room.member"}
 TIMELINE_LIMIT = 50
 _EXCLUDED = {"not_types": ["*"]}
 SYNC_FILTER = {
@@ -72,7 +73,7 @@ QUEUE_FULL = "queue_full"
 _BODYLESS = frozenset({policy.ROOM_ENCRYPTED, policy.ROOM_INFRASTRUCTURE, UNSUPPORTED_CONTENT})
 
 BACKFILL_PAGE = 100
-BACKFILL_FILTER = {"types": ["m.room.message", "m.room.member"]}
+BACKFILL_FILTER = {"types": [*discovery.MESSAGE_TYPES, "m.room.member"]}
 
 BACKOFF_INITIAL_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 60.0
@@ -160,7 +161,7 @@ def _timestamp(event: Mapping) -> datetime | None:
 
 
 def _messages_oldest_first(newest_first: list[dict]) -> list[dict]:
-    return [e for e in reversed(newest_first) if e.get("type") == "m.room.message"]
+    return [e for e in reversed(newest_first) if e.get("type") in discovery.MESSAGE_TYPES]
 
 
 @dataclass(frozen=True)
@@ -183,6 +184,7 @@ class _RoomContext:
     member_count: int
     trigger: str | None
     aliases: tuple[str, ...]
+    anonymize: bool
 
 
 class SyncLoop:
@@ -512,6 +514,7 @@ class SyncLoop:
             member_count=member_count,
             trigger=room_settings.trigger if room_settings else None,
             aliases=room_settings.agent_aliases if room_settings else (),
+            anonymize=room_settings.anonymize_names if room_settings else False,
         )
 
     async def _intake(
@@ -529,18 +532,32 @@ class SyncLoop:
         row = await cur.fetchone()
         sender_name, sender_facebook_id = row if row else (None, self._facebook_id(parsed.sender))
         body: str | None = None
+        media: discovery.Media | None = None
         mentioned = False
         rule_id: int | None = None
+        at = _timestamp(event)
+        when = at or self._now()
         if isinstance(parsed, discovery.Unsupported):
             status, reason = "ignored", UNSUPPORTED_CONTENT
         else:
             mentioned = discovery.mentions_self(parsed, self._self_ids, room.aliases)
             status, reason, rule_id = await self._decide(
-                conn, room_id, parsed, room, rule_list, sender_name, sender_facebook_id, mentioned
+                conn,
+                room_id,
+                parsed,
+                room,
+                rule_list,
+                sender_name,
+                sender_facebook_id,
+                mentioned,
+                when,
             )
             if _stores_body(reason):
                 body = discovery.truncate(parsed.body, self._settings.max_inbound_chars)
-        await inbound.insert(
+                media = parsed.media
+                if media is not None and room.anonymize:
+                    media = replace(media, name=None)
+        inserted = await inbound.insert(
             conn,
             event_id=parsed.event_id,
             room_id=room_id,
@@ -548,11 +565,32 @@ class SyncLoop:
             sender_name=sender_name,
             body=body,
             mentioned=mentioned,
-            origin_ts=_timestamp(event),
+            origin_ts=at,
             status=status,
             reason=reason,
             rule_id=rule_id,
+            media=media,
         )
+        if inserted and status == "new" and mentioned and self._trigger(room) == "mention":
+            await self._promote_media(conn, room_id, parsed.sender, when)
+
+    def _trigger(self, room: _RoomContext) -> str:
+        return discovery.effective_trigger(
+            room.kind or "", room.member_count, room.trigger, self._settings.group_trigger
+        )
+
+    async def _promote_media(
+        self, conn: psycopg.AsyncConnection, room_id: str, sender: str, at: datetime
+    ) -> None:
+        """An accepted mention in a mention room: the sender's media ignored `not_mentioned`
+        just before it joins it (Messenger sends each photo as its own event), up to the room's
+        queue cap."""
+        room_left = self._settings.max_queued_per_room - await inbound.count_new(conn, room_id)
+        promoted = await inbound.promote_media(
+            conn, room_id, sender, at, self._settings.media_mention_window_seconds, room_left
+        )
+        if promoted:
+            log.info("room %s: %s media messages joined a mention", room_id, promoted)
 
     async def _decide(
         self,
@@ -564,6 +602,7 @@ class SyncLoop:
         sender_name: str | None,
         sender_facebook_id: str | None,
         mentioned: bool,
+        at: datetime,
     ) -> tuple[str, str | None, int | None]:
         subject = policy.Subject(
             room_id=room_id,
@@ -577,11 +616,13 @@ class SyncLoop:
         decision = policy.evaluate(subject, rule_list, self._settings.default_policy)
         if not decision.allowed:
             return "ignored", decision.reason, decision.rule_id
-        trigger = discovery.effective_trigger(
-            room.kind or "", room.member_count, room.trigger, self._settings.group_trigger
-        )
-        if trigger == "mention" and not mentioned:
-            return "ignored", NOT_MENTIONED, decision.rule_id
+        if self._trigger(room) == "mention" and not mentioned:
+            # Media just after an accepted mention of the same sender joins it.
+            joins = candidate.media is not None and await inbound.recent_accepted_mention(
+                conn, room_id, candidate.sender, at, self._settings.media_mention_window_seconds
+            )
+            if not joins:
+                return "ignored", NOT_MENTIONED, decision.rule_id
         if await inbound.count_new(conn, room_id) >= self._settings.max_queued_per_room:
             return "ignored", QUEUE_FULL, decision.rule_id
         return "new", None, decision.rule_id

@@ -448,6 +448,11 @@ def _in_view(row: inbound.InboundRow) -> MessageView:
         status=row.status,
         reason=row.reason,
         run_id=row.run_id,
+        media_kind=row.media_kind,
+        media_mime=row.media_mime,
+        media_size=row.media_size,
+        media_status=row.media_status,
+        media_reason=row.media_reason,
     )
 
 

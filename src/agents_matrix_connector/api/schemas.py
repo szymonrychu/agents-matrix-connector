@@ -167,6 +167,17 @@ class MessageView(BaseModel):
     status: str
     reason: str | None
     run_id: int | None
+    media_kind: Literal["image", "video", "audio", "file", "sticker"] | None = None
+    """An inbound message's attachment kind; never the media url or the original file name."""
+    media_mime: str | None = None
+    """The declared mime type (sender text)."""
+    media_size: int | None = None
+    """The declared size in bytes (sender text)."""
+    media_status: Literal["attached", "not_attached"] | None = None
+    """Whether the media reached the agent; None until the worker handled it."""
+    media_reason: str | None = None
+    """Why it was not attached: too_large, unsupported_type, download_failed, batch_limit,
+    undecodable or foreign_media."""
 
 
 class UserView(BaseModel):
