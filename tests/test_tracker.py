@@ -917,6 +917,19 @@ async def test_final_answer_with_pseudonym_rejected_and_agent_told(
     assert "orchestrator_chat_send" in told[0]
 
 
+async def test_failure_note_is_not_from_user(tracker, pool, orch, orch_client, hs, matrix):
+    await anonymize_room(pool)
+    run_id, message_id, session = await seed(pool, orch, orch_client)
+    orch.complete_turn(message_id, "user-0123456789ab")
+    await tracker.tick()
+    await tracker.tick()
+
+    assert await run_state(pool, run_id) == ("failed", "pseudonym_disclosed")
+    told = [m for m in orch.messages.values() if m["session_id"] == session][1:]
+    assert len(told) == 1
+    assert told[0]["from_user"] is None
+
+
 async def test_final_answer_without_pseudonym_sent_in_anonymized_room(
     tracker, pool, orch, orch_client, hs
 ):

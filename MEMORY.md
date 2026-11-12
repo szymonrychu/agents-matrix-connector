@@ -311,3 +311,4 @@ Lessons that outlive a session. Newest first.
   `MATRIX_ANONYMIZE_ADMINS` and the first prompt always carries `ADMIN_TRUST_RULE` after the
   preamble (not part of the editable template, so custom preambles cannot drop it). Identity is
   only connector-set attributes; bodies are escaped, so claims in content never grant trust.
+- 2026-11-12: forwarded chat batches are posted `from_user=True` (T-137): `Worker._dispatch` and `Worker._deliver` pass it to agents-common, so the orchestrator stamps `last_user_message_at` and the web pins the superleader the user last talked to across Matrix and web. Every sender the room rules allow counts as the user (the rules already decide who may reach an agent). Tracker notes (`tracker._tell`, failure and rejection text) are system text and stay unflagged. Needs agents-orchestrator 7.16.0 deployed first (PostMessage forbids unknown fields) and agents-common v0.15.0.
