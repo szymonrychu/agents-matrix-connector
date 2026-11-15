@@ -409,3 +409,11 @@ Lessons that outlive a session. Newest first.
   bounded. Edits are applied right after the original's insert (bundled edits) or as m.replace
   events through inbound.apply_edit (same sender only); redactions blank the row, and a message
   the server already redacted is stored blank as ignored/redacted.
+- 2026-11-15 (T-420 Task 3): the history feed is one UNION ALL statement (db/history.py) with
+  keyset paging on (at, kind, id); s and o rows sort by created_at so a cursor stays put while a
+  send is delivered. One SQL fragment (_REPLY_TO) resolves an event id to m/s/o/unknown for both
+  inbound replies and worker replies. `history.parse_ref` is the m/s/o id parser for the feed
+  (sends.parse_ref still parses the m/s references of the send routes). `status` is null on m
+  items: the inbound queue status is internal; s and o items carry their delivery status. In an
+  anonymized room a `from` filter that is not a pseudonym returns an empty page rather than an
+  error, so a real name is never resolved or confirmed.
