@@ -76,6 +76,8 @@ class ConnectorSettings(BaseServiceSettings):
     """Max bytes of one other outbound file (decimal, under the bridge's 25 MB)."""
     agent_room_file_bytes_per_hour: int = Field(209715200, ge=1)
     """Max file bytes agent sends may put into one room in the last hour."""
+    agent_attachment_requests_per_10min: int = Field(10, ge=1)
+    """Max attachment requests agents may make for one room in 600 seconds."""
     anonymize_admins: CsvList = []
     """Matrix user ids or numeric Facebook ids shown as `admin-<sha>` in anonymized rooms."""
 

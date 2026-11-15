@@ -54,8 +54,11 @@ from agents_matrix_connector.api.rules import build_rules_router
 from agents_matrix_connector.api.schemas import ApiError
 from agents_matrix_connector.chunks import split
 from agents_matrix_connector.db import (
+    attachment_requests,
     bindings,
     directory,
+    history,
+    inbound,
     notes,
     rules,
     send_files,
@@ -274,6 +277,29 @@ class SendStatus(BaseModel):
     """The message's files in order; empty for a reaction or a message without files."""
 
 
+class AttachmentIn(_Body):
+    id: str = Field(
+        max_length=24,
+        description="the id (m<n>) of a message of this session's room that has an attachment",
+    )
+
+
+class AttachmentAccepted(BaseModel):
+    id: str
+    """The request id (a<n>) to read with `GET /chat/v1/attachments/{request_id}`."""
+    status: Literal["queued"]
+
+
+class AttachmentStatus(BaseModel):
+    id: str
+    message: str
+    """The message id (m<n>) the attachment belongs to."""
+    status: Literal["queued", "fetching", "sent", "failed", "refused"]
+    reason: str | None
+    created_at: datetime
+    done_at: datetime | None
+
+
 class NotesIn(_Body):
     body: str
     """The whole notes body; empty forgets the notes."""
@@ -396,6 +422,11 @@ def valid_slug(slug: str) -> bool:
         and not slug.startswith("orchestrator-")
     )
 
+
+ATTACHMENT_WINDOW_SECONDS = 600
+"""The window of `MATRIX_AGENT_ATTACHMENT_REQUESTS_PER_10MIN`."""
+_NOT_A_MESSAGE = "not a chat message id (m<n>) of this session's room"
+_NO_SUCH_ATTACHMENT = "no such attachment request of this session"
 
 _ROOM_UNBOUND = "this session is not bound to a chat room"
 
@@ -927,7 +958,7 @@ def build_chat_router(
     @router.get("/messages/{id}", response_model=SendStatus, responses=_errors(400, 401, 404, 503))
     async def send_status(who: Annotated[Caller, Depends(caller)], id: str) -> SendStatus:
         """One of this session's sends; any other id is 404."""
-        parsed = sends.parse_ref(id)
+        parsed = history.parse_ref(id)
         row = None
         files: list[SentFile] = []
         if parsed is not None and parsed[0] == "s":
@@ -955,6 +986,93 @@ def build_chat_router(
             created_at=row.created_at,
             sent_at=row.sent_at,
             files=files,
+        )
+
+    @router.post(
+        "/attachments",
+        status_code=202,
+        response_model=AttachmentAccepted,
+        responses=_errors(400, 401, 409, 422, 429, 503),
+    )
+    async def request_attachment(
+        who: Annotated[Caller, Depends(caller)], body: AttachmentIn
+    ) -> AttachmentAccepted:
+        """Ask for the file of a past message of this session's room: the bot downloads it and
+        sends it to the session as a new turn. Poll `GET /attachments/{request_id}`. Only
+        images, pdf, json and text files within the size cap are delivered."""
+        parsed = history.parse_ref(body.id)
+        if parsed is None or parsed[0] != "m":
+            raise _bad_reference("id", _NOT_A_MESSAGE)
+        async with pool.connection() as conn:
+            room_id = await _own_room(conn, who)
+            row = await inbound.get(conn, parsed[1])
+            if row is None or row.room_id != room_id:
+                raise _bad_reference("id", _NOT_A_MESSAGE)
+            if row.redacted or row.media_kind is None or row.media_url is None:
+                raise ApiError(
+                    409,
+                    "no_attachment",
+                    "id: the message has no attachment that can be fetched",
+                )
+            if row.media_kind in ("video", "audio"):
+                raise ApiError(
+                    422, "unsupported_type", "id: video and audio are not delivered to agents"
+                )
+            if media.parse_mxc(row.media_url, bridge_server) is None:
+                raise ApiError(422, "foreign_media", "id: the attachment is on another server")
+            async with conn.transaction():
+                await _lock(conn, "attachments", room_id)
+                limit = settings.agent_attachment_requests_per_10min
+                if (
+                    await attachment_requests.count_recent(conn, room_id, ATTACHMENT_WINDOW_SECONDS)
+                    >= limit
+                ):
+                    raise ApiError(
+                        429,
+                        "rate_limited",
+                        f"at most {limit} attachment requests per room in "
+                        f"{ATTACHMENT_WINDOW_SECONDS} s",
+                    )
+                request_id = await attachment_requests.insert(
+                    conn,
+                    session_id=who.session_id,
+                    slug=who.slug,
+                    room_id=room_id,
+                    inbound_id=row.id,
+                )
+        if request_id is None:
+            raise ApiError(409, "already_fetching", "id: this attachment is already being fetched")
+        log.info(
+            "attachment requested session=%s id=a%s message=m%s",
+            who.session_id,
+            request_id,
+            row.id,
+        )
+        return AttachmentAccepted(id=f"a{request_id}", status="queued")
+
+    @router.get(
+        "/attachments/{request_id}",
+        response_model=AttachmentStatus,
+        responses=_errors(400, 401, 404, 503),
+    )
+    async def attachment_status(
+        who: Annotated[Caller, Depends(caller)], request_id: str
+    ) -> AttachmentStatus:
+        """One of this session's attachment requests; any other id is 404."""
+        number = attachment_requests.parse_request_ref(request_id)
+        row = None
+        if number is not None:
+            async with pool.connection() as conn:
+                row = await attachment_requests.get(conn, number)
+        if row is None or row.session_id != who.session_id:
+            raise ApiError(404, "not_found", _NO_SUCH_ATTACHMENT)
+        return AttachmentStatus(
+            id=f"a{row.id}",
+            message=f"m{row.inbound_id}",
+            status=row.status,
+            reason=row.reason,
+            created_at=row.created_at,
+            done_at=row.done_at,
         )
 
     notes_errors = _errors(400, 401, 409, 413, 422, 503)

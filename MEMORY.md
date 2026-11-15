@@ -424,3 +424,13 @@ Lessons that outlive a session. Newest first.
   filters by path and method and would otherwise also expose the UI shape on the admin path.
   A malformed id is `bad_reference` like an unknown or foreign one (A14); `before` with `after`
   is `invalid_request`.
+
+## 2026-11-15 Attachment requests (T-420, Task 5)
+- `db.history.parse_ref` is the one m/s/o id parser; `sends.parse_ref` is gone and `sends.resolve`
+  rejects `o` ids like any unusable reference (uniform 422 bad_reference).
+- `POST /chat/v1/attachments` takes the per-room advisory lock `attachments:<room>` for the
+  rate-limit count and the insert, so two requests cannot both pass the 10-per-600-s count. The
+  in-flight dedupe is the partial unique index on `inbound_id`, not a read-then-write.
+- The status path parameter is `request_id`; any id that is not the caller's `a<n>` is the same
+  404 text (never echoed). `INTERRUPTED` lives in `db/attachment_requests.py`.
+- Settled requests are pruned daily with the other tables (retention_days).

@@ -63,6 +63,7 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_AGENT_IMAGE_MAX_BYTES` | 8000000 | api | max bytes of one outbound image, decimal to stay under the bridge's 8 MB (>= 1) |
 | `MATRIX_AGENT_FILE_MAX_BYTES` | 25000000 | api | max bytes of one other outbound file, decimal to stay under the bridge's 25 MB (>= 1) |
 | `MATRIX_AGENT_ROOM_FILE_BYTES_PER_HOUR` | 209715200 | api | max file bytes agent sends may put into one room in the last hour, all sessions together (>= 1) |
+| `MATRIX_AGENT_ATTACHMENT_REQUESTS_PER_10MIN` | 10 | api | max attachment requests agents may make for one room in 600 s, all sessions together (>= 1) |
 | `MATRIX_ANONYMIZE_ADMINS` | empty | api, bot | Matrix user ids or numeric Facebook ids, comma separated, shown as `admin-<sha>` instead of `user-<sha>` in rooms with `anonymize_names` |
 | `MATRIX_ROOM_REQUESTS_PER_HOUR` | 10 | api | max open and invite room requests created in the last hour, all sessions together (>= 1); more answer 429 `rate_limited` |
 | `MATRIX_ROOM_NOTES_MAX_CHARS` | 8000 | api | max characters of one room's notes (100 to 32000); a longer PUT is 413 `notes_too_large` |
@@ -525,6 +526,34 @@ bot is here.
 
     curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
       'http://localhost:8001/chat/v1/history?limit=20'
+
+### `POST /chat/v1/attachments`
+
+Ask for the file of a past message of the room this session is bound to (the room is never a
+parameter). Body `{"id": "m<n>"}` (at most 24 characters). The bot downloads the file and sends
+it to the session as a new turn; only the types agents already receive (png, jpeg, gif, webp,
+pdf, json, text) within `MATRIX_INBOUND_ATTACH_MAX_BYTES` are delivered. 202
+`{"id": "a<n>", "status": "queued"}`; read the outcome with `GET /chat/v1/attachments/{request_id}`.
+Errors: 409 `room_unbound`; 422 `bad_reference` (not an `m<n>`, unknown, or of another room:
+one identical answer); 409 `no_attachment` (text message, redacted, or no fetchable file); 422
+`unsupported_type` (video and audio are not delivered to agents); 422 `foreign_media` (the file
+is on another homeserver); 429 `rate_limited` (at most `MATRIX_AGENT_ATTACHMENT_REQUESTS_PER_10MIN`
+requests per room in 600 s); 409 `already_fetching` (one in-flight request per message); 400
+`invalid_slug`; 401 `unauthorized`; 503 `unavailable`. The media url is never returned.
+
+    curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      -H 'Content-Type: application/json' -d '{"id": "m123"}' \
+      http://localhost:8001/chat/v1/attachments
+
+### `GET /chat/v1/attachments/{request_id}`
+
+One of this session's attachment requests. 200 `{"id", "message" (m<n>), "status" (`queued`,
+`fetching`, `sent`, `failed` or `refused`), "reason", "created_at", "done_at"}`. Any id that is
+not an `a<n>` of the calling session is 404 `not_found` (the id is never echoed); 401
+`unauthorized`; 503 `unavailable`. Settled requests are pruned after `MATRIX_RETENTION_DAYS`.
+
+    curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      http://localhost:8001/chat/v1/attachments/a1
 
 ### `GET /chat/v1/notes`
 

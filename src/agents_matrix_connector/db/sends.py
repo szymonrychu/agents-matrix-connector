@@ -8,7 +8,6 @@ and never commit, so the caller owns the transaction. The room-session binding l
 
 from __future__ import annotations
 
-import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -19,12 +18,12 @@ import psycopg
 from agents_common.db.queue import transition
 from psycopg.rows import dict_row
 
+from agents_matrix_connector.db import history
+
 _COLUMNS = (
     "id, session_id, slug, kind, room_id, text, key, reply_to, ref_event_id, event_id, status,"
     " reason, created_at, claimed_at, sent_at"
 )
-_REF = re.compile(r"([ms])([1-9][0-9]*)", re.ASCII)
-_BIGINT_MAX = 2**63 - 1
 
 
 @dataclass(frozen=True)
@@ -69,17 +68,6 @@ class Ref:
     session_id: uuid.UUID | None = None
     kind: str | None = None
     status: str | None = None
-
-
-def parse_ref(ref: str) -> tuple[Literal["m", "s"], int] | None:
-    """`m<n>` or `s<n>` to its letter and id; None for anything else."""
-    match = _REF.fullmatch(ref)
-    if match is None:
-        return None
-    number = int(match.group(2))
-    if number > _BIGINT_MAX:
-        return None
-    return ("m" if match.group(1) == "m" else "s"), number
 
 
 async def insert(
@@ -233,8 +221,8 @@ async def message_sends_since(
 async def resolve(conn: psycopg.AsyncConnection, ref: str) -> Ref | None:
     """`m<n>` to the inbound row's room and event id; `s<n>` to the send's room, session, kind,
     status and delivered event id. None for an unknown or malformed reference."""
-    parsed = parse_ref(ref)
-    if parsed is None:
+    parsed = history.parse_ref(ref)
+    if parsed is None or parsed[0] == "o":
         return None
     letter, row_id = parsed
     if letter == "m":

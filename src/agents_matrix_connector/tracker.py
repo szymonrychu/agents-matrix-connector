@@ -38,7 +38,15 @@ from psycopg_pool import AsyncConnectionPool
 from agents_matrix_connector import anonymize
 from agents_matrix_connector.chunks import split
 from agents_matrix_connector.clock import utcnow
-from agents_matrix_connector.db import bindings, inbound, rules, runs, send_files, sends
+from agents_matrix_connector.db import (
+    attachment_requests,
+    bindings,
+    inbound,
+    rules,
+    runs,
+    send_files,
+    sends,
+)
 from agents_matrix_connector.matrix import (
     MatrixAuthError,
     MatrixClient,
@@ -403,13 +411,15 @@ class Tracker:
             runs_deleted = await runs.prune(conn, cutoff)
             sends_deleted = await sends.prune(conn, cutoff)
             bindings_deleted = await bindings.prune_released(conn, cutoff)
+            attachments_deleted = await attachment_requests.prune(conn, cutoff)
         self._last_prune = now
         log.info(
-            "pruned %s inbound, %s run and outbound, %s send and %s released binding rows"
-            " older than %s",
+            "pruned %s inbound, %s run and outbound, %s send, %s released binding and %s attachment"
+            " request rows older than %s",
             inbound_deleted,
             runs_deleted,
             sends_deleted,
             bindings_deleted,
+            attachments_deleted,
             cutoff.isoformat(),
         )

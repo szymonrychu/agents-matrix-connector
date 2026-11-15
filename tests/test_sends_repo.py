@@ -116,31 +116,6 @@ async def test_rate_count_window(conn):
     assert await sends.count_recent(conn, session, 3600) == 5
 
 
-@pytest.mark.parametrize(
-    ("ref", "parsed"),
-    [
-        ("m1", ("m", 1)),
-        ("s42", ("s", 42)),
-        ("m9223372036854775807", ("m", 9223372036854775807)),
-        ("m9223372036854775808", None),
-        ("m0", None),
-        ("s01", None),
-        ("x1", None),
-        ("m", None),
-        ("M1", None),
-        ("m1 ", None),
-        (" s1", None),
-        ("m-1", None),
-        ("s1.0", None),
-        ("$event:x", None),
-        ("", None),
-        ("m١", None),
-    ],
-)
-def test_parse_ref(ref, parsed):
-    assert sends.parse_ref(ref) == parsed
-
-
 async def test_resolve_references(conn):
     await inbound.insert(
         conn,

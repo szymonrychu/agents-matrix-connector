@@ -251,6 +251,7 @@ MEDIA_DEFAULTS = {
     "agent_image_max_bytes": 8000000,
     "agent_file_max_bytes": 25000000,
     "agent_room_file_bytes_per_hour": 209715200,
+    "agent_attachment_requests_per_10min": 10,
 }
 
 

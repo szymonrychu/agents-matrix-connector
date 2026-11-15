@@ -24,7 +24,7 @@ from agents_matrix_connector import media
 from agents_matrix_connector.anonymize import pseudonym
 from agents_matrix_connector.api import agent as agent_api
 from agents_matrix_connector.api.agent import CHAT_PREFIX, create_agent_app, valid_key
-from agents_matrix_connector.db.sends import parse_ref
+from agents_matrix_connector.db.history import parse_ref
 from agents_matrix_connector.prompt import MEMORY_RULE
 
 TOKEN = secrets.token_hex(32)

@@ -156,6 +156,8 @@ def test_readme_lists_every_agent_route() -> None:
         f"POST {CHAT_PREFIX}/messages",
         f"POST {CHAT_PREFIX}/reactions",
         f"GET {CHAT_PREFIX}/history",
+        f"POST {CHAT_PREFIX}/attachments",
+        f"GET {CHAT_PREFIX}/attachments/{{request_id}}",
         f"GET {CHAT_PREFIX}/messages/{{id}}",
         f"GET {CHAT_PREFIX}/notes",
         f"PUT {CHAT_PREFIX}/notes",
