@@ -26,7 +26,6 @@ from agents_matrix_connector.clock import utcnow
 from agents_matrix_connector.db import directory, history_crawls, inbound, rules
 from agents_matrix_connector.db.history_crawls import HistoryCrawl
 from agents_matrix_connector.matrix import (
-    MAX_RETRY_SECONDS,
     MatrixAuthError,
     MatrixClient,
     MatrixError,
@@ -46,6 +45,8 @@ CAP = "cap"
 NOT_VISIBLE = "not_visible"
 MATRIX_ERROR = "matrix_error"
 DEFAULT_RETRY_SECONDS = 60
+# Crawler-only cap on a server Retry-After (not_before is scheduled, never slept).
+MAX_CRAWL_RETRY_SECONDS = 600
 
 
 class HistoryCrawler:
@@ -95,7 +96,7 @@ class HistoryCrawler:
         except MatrixUnavailable as exc:
             wait = DEFAULT_RETRY_SECONDS
             if exc.retry_after is not None:
-                wait = min(exc.retry_after, MAX_RETRY_SECONDS)
+                wait = min(exc.retry_after, MAX_CRAWL_RETRY_SECONDS)
             async with self._pool.connection() as conn, conn.transaction():
                 await history_crawls.defer(conn, crawl.id, status, now + timedelta(seconds=wait))
             log.warning(

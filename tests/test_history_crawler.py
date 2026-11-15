@@ -14,6 +14,7 @@ from agents_matrix_connector.history_crawl import (
     COMPLETE,
     DEFAULT_RETRY_SECONDS,
     MATRIX_ERROR,
+    MAX_CRAWL_RETRY_SECONDS,
     NOT_VISIBLE,
     HistoryCrawler,
 )
@@ -316,16 +317,32 @@ async def test_crawl_honours_retry_after(fake, client, pool, clock, calls, monke
 
     await crawler.tick()
     status, reason, events, _, not_before = await crawl_state(pool)
-    # The server's Retry-After is capped at the client's retry cap before the crawler waits.
+    # The crawler schedules not_before from the server's Retry-After instead of sleeping.
     assert (status, reason, events) == ("crawling", None, 0)
-    assert not_before == T0 + timedelta(seconds=matrix.MAX_RETRY_SECONDS)
+    assert not_before == T0 + timedelta(seconds=120)
 
-    clock.at = T0 + timedelta(seconds=matrix.MAX_RETRY_SECONDS - 1)
+    clock.at = T0 + timedelta(seconds=119)
     await crawler.tick()
     assert len(calls) == 1
-    clock.at = T0 + timedelta(seconds=matrix.MAX_RETRY_SECONDS)
+    clock.at = T0 + timedelta(seconds=120)
     await crawler.tick()
     assert (await crawl_state(pool))[:4] == ("done", COMPLETE, 1, 1)
+
+
+async def test_crawl_retry_after_capped_by_crawler_cap(fake, client, pool, clock, monkeypatch):
+    async def no_sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(matrix, "_sleep", no_sleep)
+    add_prejoin_dm(fake, ["one"])
+    _, crawler = await synced(fake, client, pool, clock)
+    await bind(pool)
+    fake.fail_next("room_messages", 429, retry_after_header="3600")
+    fake.fail_next("room_messages", 429, retry_after_header="3600")
+
+    await crawler.tick()
+    assert MAX_CRAWL_RETRY_SECONDS == 600
+    assert (await crawl_state(pool))[4] == T0 + timedelta(seconds=600)
 
 
 async def test_crawl_unavailable_without_retry_after_waits_default(fake, client, pool, clock):
