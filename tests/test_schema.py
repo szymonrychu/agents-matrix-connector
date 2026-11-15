@@ -25,6 +25,8 @@ TABLES = {
     "room_notes",
     "room_skills",
     "send_files",
+    "attachment_requests",
+    "history_crawls",
 }
 MIGRATIONS = [
     "0001_init.sql",
@@ -37,6 +39,7 @@ MIGRATIONS = [
     "0008_room_skills.sql",
     "0009_agent_aliases.sql",
     "0010_attachments.sql",
+    "0011_chat_history.sql",
 ]
 
 
@@ -75,7 +78,8 @@ def test_writer_comments(db):
         "access_rules": "writer: api",
         "room_settings": "writer: api",
         "settings": "writer: api",
-        "inbound": "queue: inserted by bot sync, transitions by bot worker",
+        "inbound": "queue: inserted by bot sync and bot history crawler, edits and redactions"
+        " by bot sync, status by bot worker",
         "runs": "writer: bot worker",
         "outbound": "writer: bot worker",
         "sends": "queue: inserted by api, transitions by bot worker",
@@ -85,6 +89,8 @@ def test_writer_comments(db):
         "room_notes": "writer: api",
         "room_skills": "writer: api",
         "send_files": "queue: inserted by api with its send, upload and clear by bot",
+        "attachment_requests": "queue: inserted by api, transitions by bot attachment fetcher",
+        "history_crawls": "queue: inserted and transitioned by bot history crawler",
     }
     with psycopg.connect(db) as conn:
         for table, comment in expected.items():
@@ -506,6 +512,101 @@ def test_migration_0010_columns(db):
         assert conn.execute(
             "SELECT agents_may_send_files FROM room_settings WHERE room_id = '!files'"
         ).fetchone() == (False,)
+
+
+def test_migration_0011_columns(db):
+    with psycopg.connect(db, autocommit=True) as conn:
+        inbound = _columns(conn, "inbound")
+        assert inbound["reply_to_event_id"] == ("text", "YES")
+        assert inbound["source"] == ("text", "NO")
+        assert inbound["edited_at"] == ("timestamp with time zone", "YES")
+        assert inbound["redacted"] == ("boolean", "NO")
+        assert _column_default(conn, "inbound", "source") == "'sync'::text"
+        assert _column_default(conn, "inbound", "redacted") == "false"
+        assert _columns(conn, "attachment_requests") == {
+            "id": ("bigint", "NO"),
+            "session_id": ("uuid", "NO"),
+            "slug": ("text", "YES"),
+            "room_id": ("text", "NO"),
+            "inbound_id": ("bigint", "NO"),
+            "status": ("text", "NO"),
+            "reason": ("text", "YES"),
+            "message_id": ("text", "YES"),
+            "created_at": ("timestamp with time zone", "NO"),
+            "claimed_at": ("timestamp with time zone", "YES"),
+            "done_at": ("timestamp with time zone", "YES"),
+        }
+        assert _columns(conn, "history_crawls") == {
+            "id": ("bigint", "NO"),
+            "room_id": ("text", "NO"),
+            "status": ("text", "NO"),
+            "reason": ("text", "YES"),
+            "token": ("text", "YES"),
+            "events": ("integer", "NO"),
+            "inserted": ("integer", "NO"),
+            "not_before": ("timestamp with time zone", "YES"),
+            "created_at": ("timestamp with time zone", "NO"),
+            "updated_at": ("timestamp with time zone", "NO"),
+            "done_at": ("timestamp with time zone", "YES"),
+        }
+        names = {
+            r[0] for r in conn.execute("SELECT indexname FROM pg_indexes WHERE schemaname='public'")
+        }
+        assert {
+            "inbound_room_at_idx",
+            "sends_room_created_idx",
+            "outbound_room_created_idx",
+            "attachment_requests_queued_idx",
+            "attachment_requests_room_created_idx",
+            "attachment_requests_inflight_idx",
+        } <= names
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO inbound (event_id, room_id, sender, status, source)"
+                " VALUES ('$s', '!r', '@u:x', 'ignored', 'other')"
+            )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO attachment_requests (session_id, room_id, inbound_id, status)"
+                " VALUES (gen_random_uuid(), '!r', 1, 'bogus')"
+            )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute("INSERT INTO history_crawls (room_id, status) VALUES ('!r', 'bogus')")
+        insert = (
+            "INSERT INTO attachment_requests (session_id, room_id, inbound_id, status)"
+            " VALUES (gen_random_uuid(), '!r', 7, %s)"
+        )
+        conn.execute(insert, ("sent",))
+        conn.execute(insert, ("queued",))
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(insert, ("queued",))
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(insert, ("fetching",))
+
+
+def test_migration_0011_resets_sync_filter(pg_url):
+    name, url = _empty_db(pg_url)
+    try:
+        with psycopg.connect(url, autocommit=True) as conn:
+            for migration in MIGRATIONS[:-1]:
+                conn.execute(_migration(migration))
+            conn.execute("UPDATE sync_state SET filter_id = 'f1'")
+            conn.execute(
+                "INSERT INTO inbound (event_id, room_id, sender, status)"
+                " VALUES ('$old', '!r', '@u:x', 'handled')"
+            )
+            conn.execute(_migration(MIGRATIONS[-1]))
+            filter_id = conn.execute("SELECT filter_id FROM sync_state").fetchone()[0]
+            row = conn.execute(
+                "SELECT source, redacted, reply_to_event_id, edited_at FROM inbound"
+            ).fetchone()
+    finally:
+        with psycopg.connect(pg_url, autocommit=True) as conn:
+            conn.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name))
+            )
+    assert filter_id is None
+    assert row == ("sync", False, None, None)
 
 
 def _send_id(conn):

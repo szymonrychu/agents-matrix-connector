@@ -20,8 +20,11 @@ from agents_matrix_connector.discovery import Media
 _COLUMNS = (
     "id, event_id, room_id, sender, sender_name, body, mentioned, origin_ts, received_at,"
     " status, reason, run_id, rule_id, media_kind, media_url, media_mime, media_size,"
-    " media_name, media_w, media_h, media_status, media_reason"
+    " media_name, media_w, media_h, media_status, media_reason, reply_to_event_id, source,"
+    " edited_at, redacted"
 )
+REDACTED = "redacted"
+HISTORY = "history"
 MEDIA_STATUSES = ("attached", "not_attached")
 
 
@@ -49,6 +52,10 @@ class InboundRow:
     media_h: int | None = None
     media_status: str | None = None
     media_reason: str | None = None
+    reply_to_event_id: str | None = None
+    source: str = "sync"
+    edited_at: datetime | None = None
+    redacted: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,17 +110,24 @@ async def insert(
     reason: str | None,
     rule_id: int | None = None,
     media: Media | None = None,
+    reply_to_event_id: str | None = None,
+    source: str = "sync",
+    redacted: bool = False,
 ) -> bool:
     """Insert one row; `media` is the declared attachment metadata (the caller passes None
-    where no body is stored, and a `Media` without name in anonymized rooms)."""
+    where no body is stored, and a `Media` without name in anonymized rooms). Rows of
+    `source="history"` come from the history crawl and are always `ignored`."""
     if status not in ("new", "ignored"):
         raise ValueError(f"insert status must be new or ignored, got {status!r}")
+    if source == "history" and status != "ignored":
+        raise ValueError("history rows must be ignored")
     cur = await conn.execute(
         """
         INSERT INTO inbound (event_id, room_id, sender, sender_name, body, mentioned, origin_ts,
                              status, reason, rule_id, media_kind, media_url, media_mime,
-                             media_size, media_name, media_w, media_h)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                             media_size, media_name, media_w, media_h, reply_to_event_id, source,
+                             redacted)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (event_id) DO NOTHING
         """,
         (
@@ -134,9 +148,67 @@ async def insert(
             media.name if media else None,
             media.w if media else None,
             media.h if media else None,
+            reply_to_event_id,
+            source,
+            redacted,
         ),
     )
     return cur.rowcount == 1
+
+
+async def get(conn: psycopg.AsyncConnection, row_id: int) -> InboundRow | None:
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(f"SELECT {_COLUMNS} FROM inbound WHERE id = %s", (row_id,))
+        row = await cur.fetchone()
+    return InboundRow(**row) if row else None
+
+
+async def apply_edit(
+    conn: psycopg.AsyncConnection,
+    room_id: str,
+    event_id: str,
+    sender: str,
+    body: str,
+    at: datetime,
+) -> bool:
+    """Fold an edit into the original row: only the original sender's, only a stored body
+    (withheld and redacted rows stay as they are), and only an edit newer than the last."""
+    cur = await conn.execute(
+        "UPDATE inbound SET body = %s, edited_at = %s"
+        " WHERE room_id = %s AND event_id = %s AND sender = %s AND NOT redacted"
+        " AND body IS NOT NULL AND (edited_at IS NULL OR edited_at < %s)",
+        (body, at, room_id, event_id, sender, at),
+    )
+    return cur.rowcount == 1
+
+
+async def apply_redaction(conn: psycopg.AsyncConnection, room_id: str, event_id: str) -> bool:
+    """Blank the row's text and media and mark it redacted; a still-queued row is ignored so
+    it never reaches an agent. True when the row was newly redacted."""
+    cur = await conn.execute(
+        "UPDATE inbound SET redacted = true, body = NULL, media_kind = NULL, media_url = NULL,"
+        " media_name = NULL, media_mime = NULL, media_size = NULL, media_w = NULL,"
+        " media_h = NULL WHERE room_id = %s AND event_id = %s AND NOT redacted",
+        (room_id, event_id),
+    )
+    changed = cur.rowcount == 1
+    await conn.execute(
+        "UPDATE inbound SET status = 'ignored', reason = %s"
+        " WHERE room_id = %s AND event_id = %s AND status = 'new'",
+        (REDACTED, room_id, event_id),
+    )
+    return changed
+
+
+async def oldest_sync_event_id(conn: psycopg.AsyncConnection, room_id: str) -> str | None:
+    """The event id of the room's oldest sync row (the history crawl's starting point)."""
+    cur = await conn.execute(
+        f"SELECT event_id FROM inbound WHERE room_id = %s AND source = 'sync'"
+        f" ORDER BY {_AT}, id LIMIT 1",
+        (room_id,),
+    )
+    row = await cur.fetchone()
+    return row[0] if row else None
 
 
 _AT = "COALESCE(origin_ts, received_at)"

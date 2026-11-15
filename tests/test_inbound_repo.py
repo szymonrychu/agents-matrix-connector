@@ -330,3 +330,115 @@ async def test_recent_accepted_mention(conn):
     assert await inbound.recent_accepted_mention(conn, "!a:x", "@u:x", later, 120) is True
     await conn.execute("UPDATE inbound SET status = 'ignored', reason = 'not_allowed'")
     assert await inbound.recent_accepted_mention(conn, "!a:x", "@u:x", later, 120) is False
+
+
+async def put_full(conn, event_id, room="!a:x", sender="@u:x", body="old", at=T0, **kwargs):
+    kwargs.setdefault("status", "new")
+    kwargs.setdefault("reason", None)
+    return await inbound.insert(
+        conn,
+        event_id=event_id,
+        room_id=room,
+        sender=sender,
+        sender_name="U",
+        body=body,
+        mentioned=False,
+        origin_ts=at,
+        **kwargs,
+    )
+
+
+async def row_of(conn, event_id):
+    cur = await conn.execute("SELECT id FROM inbound WHERE event_id = %s", (event_id,))
+    return await inbound.get(conn, (await cur.fetchone())[0])
+
+
+async def test_insert_stores_reply_source_and_redacted(conn):
+    assert await put_full(
+        conn,
+        "$h",
+        reply_to_event_id="$a",
+        source="history",
+        status="ignored",
+        reason=inbound.HISTORY,
+        redacted=False,
+    )
+    row = await row_of(conn, "$h")
+    assert row.reply_to_event_id == "$a"
+    assert row.source == "history"
+    assert row.redacted is False
+    assert row.edited_at is None
+    assert inbound.HISTORY == "history"
+    assert inbound.REDACTED == "redacted"
+    assert await inbound.get(conn, row.id + 1000) is None
+
+
+async def test_insert_history_requires_ignored(conn):
+    with pytest.raises(ValueError):
+        await put_full(conn, "$h", source="history", status="new")
+
+
+async def test_apply_edit_same_sender_newer_wins(conn):
+    await put_full(conn, "$e")
+    t1 = T0 + timedelta(minutes=5)
+    assert await inbound.apply_edit(conn, "!a:x", "$e", "@u:x", "new", t1)
+    row = await row_of(conn, "$e")
+    assert (row.body, row.edited_at) == ("new", t1)
+    assert not await inbound.apply_edit(
+        conn, "!a:x", "$e", "@u:x", "older", T0 + timedelta(milliseconds=1)
+    )
+    assert (await row_of(conn, "$e")).body == "new"
+
+
+async def test_apply_edit_other_sender_or_withheld_or_redacted_ignored(conn):
+    t1 = T0 + timedelta(minutes=5)
+    await put_full(conn, "$e")
+    await put_full(conn, "$w", body=None)
+    await put_full(conn, "$r")
+    await inbound.apply_redaction(conn, "!a:x", "$r")
+    assert not await inbound.apply_edit(conn, "!a:x", "$e", "@other:x", "x", t1)
+    assert not await inbound.apply_edit(conn, "!a:x", "$w", "@u:x", "x", t1)
+    assert not await inbound.apply_edit(conn, "!a:x", "$r", "@u:x", "x", t1)
+    assert not await inbound.apply_edit(conn, "!a:x", "$nope", "@u:x", "x", t1)
+    assert (await row_of(conn, "$e")).body == "old"
+
+
+async def test_apply_redaction_blanks_body_and_media(conn):
+    media = Media(kind="image", url="mxc://x/y", mime="image/png", size=5, name="a.png", w=2, h=3)
+    await put_full(conn, "$m", media=media)
+    assert await inbound.apply_redaction(conn, "!a:x", "$m")
+    row = await row_of(conn, "$m")
+    assert row.redacted is True
+    for field in (
+        "body",
+        "media_kind",
+        "media_url",
+        "media_name",
+        "media_mime",
+        "media_size",
+        "media_w",
+        "media_h",
+    ):
+        assert getattr(row, field) is None, field
+    assert not await inbound.apply_redaction(conn, "!a:x", "$m")
+    assert not await inbound.apply_redaction(conn, "!a:x", "$unknown")
+
+
+async def test_redaction_of_queued_row_ignores_it(conn):
+    await put_full(conn, "$n")
+    await put_full(conn, "$d", status="ignored", reason="x")
+    await conn.execute("UPDATE inbound SET status = 'handled' WHERE event_id = '$d'")
+    await inbound.apply_redaction(conn, "!a:x", "$n")
+    await inbound.apply_redaction(conn, "!a:x", "$d")
+    row = await row_of(conn, "$n")
+    assert (row.status, row.reason) == ("ignored", inbound.REDACTED)
+    assert (await row_of(conn, "$d")).status == "handled"
+
+
+async def test_oldest_sync_event_id_skips_history_rows(conn):
+    assert await inbound.oldest_sync_event_id(conn, "!a:x") is None
+    await put_full(conn, "$hist", at=T0 - timedelta(days=1), source="history", status="ignored")
+    await put_full(conn, "$s2", at=T0 + timedelta(minutes=1))
+    await put_full(conn, "$s1", at=T0)
+    await put_full(conn, "$other", room="!b:x", at=T0 - timedelta(days=2))
+    assert await inbound.oldest_sync_event_id(conn, "!a:x") == "$s1"
