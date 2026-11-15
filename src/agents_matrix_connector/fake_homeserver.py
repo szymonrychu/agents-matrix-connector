@@ -35,6 +35,7 @@ from starlette.types import Receive, Scope, Send
 ROUTES = (
     "whoami",
     "create_filter",
+    "get_filter",
     "sync",
     "join",
     "room_state",
@@ -128,6 +129,7 @@ class FakeHomeserver:
         self._typing: dict[str, bool] = {}
         self._receipts: list[tuple[str, str, str]] = []
         self._timeline_limit: int | None = None
+        self._empty_page = False
         self._media: dict[tuple[str, str], bytes] = {}
         self._media_failures: dict[str, int] = {}
         self.media_downloads: list[str] = []
@@ -137,6 +139,7 @@ class FakeHomeserver:
         self._table: list[tuple[str, tuple[str | None, ...], str, Handler]] = [
             ("GET", ("account", "whoami"), "whoami", self._whoami),
             ("POST", ("user", None, "filter"), "create_filter", self._create_filter),
+            ("GET", ("user", None, "filter", None), "get_filter", self._get_filter),
             ("GET", ("sync",), "sync", self._sync),
             ("POST", ("join", None), "join", self._join),
             ("GET", ("rooms", None, "state"), "room_state", self._room_state),
@@ -250,6 +253,11 @@ class FakeHomeserver:
         if limit is not None and limit < 1:
             raise ValueError("limit must be at least 1")
         self._timeline_limit = limit
+
+    def empty_page_next(self) -> None:
+        """The next `/messages` call answers an empty chunk that still has an `end` token
+        (Synapse does this when a page holds only filtered-out events)."""
+        self._empty_page = True
 
     def sent(self, room_id: str) -> list[dict]:
         """Contents the bot sent into the room, in order, one per distinct transaction."""
@@ -451,6 +459,12 @@ class FakeHomeserver:
         self._filters[filter_id] = copy.deepcopy(body)
         return JSONResponse({"filter_id": filter_id})
 
+    async def _get_filter(self, request: Request, params: list[str]) -> Response:
+        user_id, filter_id = params
+        if user_id != self.user_id or filter_id not in self._filters:
+            return matrix_error(404, "M_NOT_FOUND", "No row found")
+        return JSONResponse(copy.deepcopy(self._filters[filter_id]))
+
     async def _sync(self, request: Request, params: list[str]) -> Response:
         query = request.query_params
         since: int | None = None
@@ -640,6 +654,9 @@ class FakeHomeserver:
         else:
             candidates = [(p, e) for p, e in room.timeline if p > position]
         candidates = [(p, e) for p, e in candidates if _wanted(e, types)]
+        if self._empty_page:
+            self._empty_page = False
+            return JSONResponse({"start": f"t{position}", "chunk": [], "end": f"t{position}"})
         chunk = candidates[:limit]
         body: dict[str, Any] = {
             "start": start if start is not None else f"t{position}",

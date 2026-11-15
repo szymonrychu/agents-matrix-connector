@@ -47,13 +47,19 @@ EVENT_TYPES = [
     "m.room.message",
     "m.sticker",
     "m.room.member",
+    "m.room.redaction",
     "m.room.name",
     "m.room.canonical_alias",
     "m.room.encryption",
     "m.bridge",
     "uk.half-shot.bridge",
 ]
-ROOM_INFO_TYPES = frozenset(EVENT_TYPES) - {*discovery.MESSAGE_TYPES, "m.room.member"}
+ROOM_INFO_TYPES = frozenset(EVENT_TYPES) - {
+    *discovery.MESSAGE_TYPES,
+    "m.room.member",
+    "m.room.redaction",
+}
+REDACTED = inbound.REDACTED
 TIMELINE_LIMIT = 50
 _EXCLUDED = {"not_types": ["*"]}
 SYNC_FILTER = {
@@ -73,7 +79,7 @@ QUEUE_FULL = "queue_full"
 _BODYLESS = frozenset({policy.ROOM_ENCRYPTED, policy.ROOM_INFRASTRUCTURE, UNSUPPORTED_CONTENT})
 
 BACKFILL_PAGE = 100
-BACKFILL_FILTER = {"types": [*discovery.MESSAGE_TYPES, "m.room.member"]}
+BACKFILL_FILTER = {"types": [*discovery.MESSAGE_TYPES, "m.room.member", "m.room.redaction"]}
 
 BACKOFF_INITIAL_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 60.0
@@ -161,7 +167,8 @@ def _timestamp(event: Mapping) -> datetime | None:
 
 
 def _messages_oldest_first(newest_first: list[dict]) -> list[dict]:
-    return [e for e in reversed(newest_first) if e.get("type") in discovery.MESSAGE_TYPES]
+    wanted = (*discovery.MESSAGE_TYPES, "m.room.redaction")
+    return [e for e in reversed(newest_first) if e.get("type") in wanted]
 
 
 @dataclass(frozen=True)
@@ -212,6 +219,7 @@ class SyncLoop:
         self._alias_pending: set[str] = set()
         self._unverified_logged: set[tuple[str, str]] = set()
         self._filter_id: str | None = None
+        self._contexts: dict[str, _RoomContext] = {}
         self.last_sync_at: datetime | None = None
 
     async def run(self, stop: asyncio.Event) -> None:
@@ -236,7 +244,13 @@ class SyncLoop:
                 self._auto_join_source = None
         async with self._pool.connection() as conn:
             since, stored_filter = await directory.get_sync_state(conn)
-        self._filter_id = self._filter_id or stored_filter
+        # A rolling deploy can leave a filter an older pod made (without redactions).
+        if (
+            self._filter_id is None
+            and stored_filter is not None
+            and await self._filter_is_current(stored_filter)
+        ):
+            self._filter_id = stored_filter
         if self._filter_id is None:
             self._filter_id = await self._create_filter()
         try:
@@ -250,6 +264,7 @@ class SyncLoop:
         fetched = await self._fetch_state(joined)
         recovered = await self._backfill(joined) if since is not None else {}
         at = self._now()
+        self._contexts = {}
         async with self._pool.connection() as conn, conn.transaction():
             rule_list = await rules.list_rules(conn)
             for room_id, room in (rooms.get("invite") or {}).items():
@@ -280,6 +295,16 @@ class SyncLoop:
         await self._join_invites()
 
     # Matrix calls outside the transaction.
+
+    async def _filter_is_current(self, filter_id: str) -> bool:
+        try:
+            stored = await self._matrix.get_filter(self._settings.user_id, filter_id)
+        except MatrixNotFound:
+            return False
+        if stored == SYNC_FILTER:
+            return True
+        log.warning("stored sync filter %s is outdated, creating a new one", filter_id)
+        return False
 
     async def _create_filter(self) -> str:
         return await self._matrix.create_filter(self._settings.user_id, SYNC_FILTER)
@@ -384,14 +409,14 @@ class SyncLoop:
             )
             chunk = page.get("chunk")
             events = [e for e in chunk if isinstance(e, dict)] if isinstance(chunk, list) else []
-            count += len(events)
+            count += max(len(events), 1)  # an empty page still counts, so the loop is bounded
             recorded = await self._recorded([e.get("event_id") for e in events])
             for event in events:
                 if event.get("event_id") in recorded or _is_own_join(event, self._settings.user_id):
                     return _messages_oldest_first(read)
                 read.append(event)
             end = page.get("end")
-            if not events or not isinstance(end, str):
+            if not isinstance(end, str):
                 return _messages_oldest_first(read)
             token = end
         log.warning(
@@ -492,13 +517,55 @@ class SyncLoop:
             return
         if newly_joined:
             timeline = _after_join(room, timeline, self._settings.user_id)
-        context: _RoomContext | None = None
         for event in recovered + timeline:
-            parsed = discovery.parse_message(room_id, event, self._self_ids, self._bridge_bots)
-            if isinstance(parsed, discovery.Skip):
-                continue
-            context = context or await self._room_context(conn, room_id)
-            await self._intake(conn, room_id, event, parsed, context, rule_list)
+            await self._apply_event(conn, room_id, event, rule_list)
+
+    async def _apply_event(
+        self,
+        conn: psycopg.AsyncConnection,
+        room_id: str,
+        event: dict,
+        rule_list: list[policy.Rule],
+    ) -> bool:
+        """Apply one timeline event: a redaction or an edit folds into its original row, a
+        message is taken in. True when an inbound row was inserted."""
+        redaction = discovery.parse_redaction(event)
+        if redaction is not None:
+            if await inbound.apply_redaction(conn, room_id, redaction.target):
+                log.info("room %s: event %s redacted", room_id, redaction.target)
+            return False
+        edit = discovery.parse_edit(room_id, event, self._self_ids, self._bridge_bots)
+        if edit is not None:
+            await inbound.apply_edit(
+                conn,
+                room_id,
+                edit.target,
+                edit.sender,
+                discovery.truncate(edit.body, self._settings.max_inbound_chars),
+                _timestamp(event) or self._now(),
+            )
+            return False
+        parsed = discovery.parse_message(room_id, event, self._self_ids, self._bridge_bots)
+        if isinstance(parsed, discovery.Skip):
+            return False
+        if isinstance(parsed, discovery.Redacted):
+            return await inbound.insert(
+                conn,
+                event_id=parsed.event_id,
+                room_id=room_id,
+                sender=parsed.sender,
+                sender_name=None,
+                body=None,
+                mentioned=False,
+                origin_ts=_timestamp(event),
+                status="ignored",
+                reason=REDACTED,
+                redacted=True,
+            )
+        context = self._contexts.get(room_id)
+        if context is None:
+            context = self._contexts[room_id] = await self._room_context(conn, room_id)
+        return await self._intake(conn, room_id, event, parsed, context, rule_list)
 
     async def _room_context(self, conn: psycopg.AsyncConnection, room_id: str) -> _RoomContext:
         cur = await conn.execute(
@@ -525,7 +592,7 @@ class SyncLoop:
         parsed: discovery.Candidate | discovery.Unsupported,
         room: _RoomContext,
         rule_list: list[policy.Rule],
-    ) -> None:
+    ) -> bool:
         cur = await conn.execute(
             "SELECT display_name, facebook_id FROM users WHERE user_id = %s", (parsed.sender,)
         )
@@ -537,6 +604,7 @@ class SyncLoop:
         rule_id: int | None = None
         at = _timestamp(event)
         when = at or self._now()
+        candidate = parsed if isinstance(parsed, discovery.Candidate) else None
         if isinstance(parsed, discovery.Unsupported):
             status, reason = "ignored", UNSUPPORTED_CONTENT
         else:
@@ -570,9 +638,20 @@ class SyncLoop:
             reason=reason,
             rule_id=rule_id,
             media=media,
+            reply_to_event_id=parsed.reply_to if candidate else None,
         )
+        if inserted and body is not None and candidate and candidate.edited_body is not None:
+            await inbound.apply_edit(
+                conn,
+                room_id,
+                parsed.event_id,
+                parsed.sender,
+                discovery.truncate(candidate.edited_body, self._settings.max_inbound_chars),
+                _timestamp({"origin_server_ts": candidate.edited_ts}) or when,
+            )
         if inserted and status == "new" and mentioned and self._trigger(room) == "mention":
             await self._promote_media(conn, room_id, parsed.sender, when)
+        return inserted
 
     def _trigger(self, room: _RoomContext) -> str:
         return discovery.effective_trigger(

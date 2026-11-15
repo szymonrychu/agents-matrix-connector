@@ -401,3 +401,11 @@ Lessons that outlive a session. Newest first.
   redaction blanks text and media and ignores a still-queued row (reason redacted). History
   rows are always status ignored (reason history), so they never dispatch. The REDACTED and
   HISTORY reason constants live in db/inbound.py, the table owner.
+- 2026-11-15 (T-420 Task 2): the sync loop verifies a stored filter id against SYNC_FILTER
+  (GET filter) before reuse and creates a new one when it differs or is gone, because an old pod
+  during a rolling deploy can re-save a filter without m.room.redaction (A21). Backfill no longer
+  stops at an empty chunk that still has an `end` token (Synapse returns those when a page holds
+  only filtered events); an empty page counts as one event toward the cap so the loop stays
+  bounded. Edits are applied right after the original's insert (bundled edits) or as m.replace
+  events through inbound.apply_edit (same sender only); redactions blank the row, and a message
+  the server already redacted is stored blank as ignored/redacted.

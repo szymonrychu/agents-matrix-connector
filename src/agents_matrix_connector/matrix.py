@@ -105,6 +105,10 @@ class MatrixClient:
         body = await self._request("POST", _path("user", user_id, "filter"), json=definition)
         return body["filter_id"]
 
+    async def get_filter(self, user_id: str, filter_id: str) -> dict:
+        body = await self._request("GET", _path("user", user_id, "filter", filter_id))
+        return body
+
     async def sync(
         self,
         since: str | None,
