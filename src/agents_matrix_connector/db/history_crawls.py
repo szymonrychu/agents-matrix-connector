@@ -21,6 +21,8 @@ _COLUMNS = (
     "id, room_id, status, reason, token, events, inserted, not_before, created_at, updated_at,"
     " done_at"
 )
+# Fixed reason of a crawl that ended on an unexpected (non-Matrix) error.
+INTERNAL_ERROR = "internal_error"
 _FINISHED = frozenset({"done", "failed"})
 _ACTIVE = frozenset({"queued", "crawling"})
 

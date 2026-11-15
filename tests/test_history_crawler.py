@@ -8,6 +8,7 @@ from agents_common.db.pool import open_pool
 
 from agents_matrix_connector import matrix
 from agents_matrix_connector.db import inbound, rules
+from agents_matrix_connector.db.history_crawls import INTERNAL_ERROR
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
 from agents_matrix_connector.history_crawl import (
     CAP,
@@ -422,6 +423,33 @@ async def test_crawl_other_matrix_error_fails(fake, client, pool, clock):
     fake.fail_next("room_messages", 400)
     await crawler.tick()
     assert (await crawl_state(pool))[:2] == ("failed", MATRIX_ERROR)
+
+
+async def test_crawl_unexpected_error_fails_and_next_room_proceeds(
+    fake, client, pool, clock, monkeypatch
+):
+    other = "!other:hs"
+    add_prejoin_dm(fake, ["one"])
+    fake.add_room(other, [_bridge_state()], {BRIDGE: "Facebook bridge", ALICE: "Alice"})
+    fake.post(other, ALICE, text("two"))
+    fake.set_member(other, BOT, "join", "hermes")
+    _, crawler = await synced(fake, client, pool, clock)
+    await bind(pool)
+    await bind(pool, other)
+    real = client.room_messages
+
+    async def boom(room_id, from_token, **kwargs):
+        if room_id == DM:
+            raise RuntimeError("not a matrix error")
+        return await real(room_id, from_token, **kwargs)
+
+    monkeypatch.setattr(client, "room_messages", boom)
+    for _ in range(6):
+        await crawler.tick()
+    rows = dict(await fetch(pool, "SELECT room_id, status FROM history_crawls"))
+    assert rows == {DM: "failed", other: "done"}
+    reasons = dict(await fetch(pool, "SELECT room_id, reason FROM history_crawls"))
+    assert reasons[DM] == INTERNAL_ERROR
 
 
 async def test_crawl_auth_error_propagates(fake, client, pool, clock):

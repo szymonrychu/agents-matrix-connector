@@ -461,7 +461,10 @@ Lessons that outlive a session. Newest first.
   queue cap or media promotion. History mode uses its own room-context cache so the concurrent
   sync loop's per-response cache is never shared.
 - An empty page with `end` counts as one event toward the cap, so a crawl always ends.
-- A 429's `retry_after` is capped at `matrix.MAX_RETRY_SECONDS` (10 s) before the crawl is
-  deferred (Task 7 review ruling); without one the crawl waits `DEFAULT_RETRY_SECONDS` (60 s).
+- A 429's `retry_after` is capped at the crawler-only `MAX_CRAWL_RETRY_SECONDS` (600 s) before the
+  crawl is deferred (not_before is scheduled, never slept); without one the crawl waits `DEFAULT_RETRY_SECONDS` (60 s).
+- A non-Matrix exception on a crawl ends it as `failed` with reason `internal_error` (2026-11-15):
+  otherwise the same oldest crawl would come back every tick and block every other room. Only the
+  exception type name and crawl id are logged; a failure while settling never masks it.
 - `retry_after_seconds` accepts only ASCII digits in `Retry-After` (superscript two passes `isdigit()`
   but `float` raises).

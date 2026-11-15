@@ -106,6 +106,15 @@ class HistoryCrawler:
             await self._finish(crawl, "done", NOT_VISIBLE)
         except MatrixError:
             await self._finish(crawl, "failed", MATRIX_ERROR)
+        except Exception as exc:
+            # Any other repeating error would wedge the queue: end this crawl, never block others.
+            log.error("history crawl %d failed unexpectedly: %s", crawl.id, type(exc).__name__)
+            try:
+                await self._finish(crawl, "failed", history_crawls.INTERNAL_ERROR)
+            except Exception as settle:
+                log.error(
+                    "history crawl %d could not be settled: %s", crawl.id, type(settle).__name__
+                )
 
     async def _start_token(self, room_id: str) -> str | None:
         """Just before the oldest stored sync row, else the committed sync position; None
