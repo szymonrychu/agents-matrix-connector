@@ -445,3 +445,23 @@ Lessons that outlive a session. Newest first.
 - The sender role (`role="admin"`) is computed like the worker does, from `anonymize.is_admin`;
   anonymized rooms show the pseudonym and never the original file name.
 - Only fixed reasons and ids are logged (`attachment a<id>: <status> (<reason>)`).
+
+## History crawl (2026-11-15, T-420, Task 8)
+
+- `history_crawl.HistoryCrawler` is the sixth bot tick (after the attachment fetcher): one
+  `/messages` page of at most 100 events per tick, up to `MATRIX_HISTORY_CRAWL_MAX_EVENTS`
+  (default 2000, 0 disables) per room, one crawl per room ever (`history_crawls.room_id` unique,
+  queued from active `room_bindings`). The crawler is the table's only writer.
+- The start token is never the live edge: just before the room's oldest stored sync row
+  (`/context` start), else the committed sync `next_batch` (everything older was already offered
+  to sync). With no sync position yet the crawl stays queued. A live event therefore can never
+  become a history row instead of being dispatched.
+- History rows go through `SyncLoop.intake_history` / `_apply_event(history=True)`: always
+  `ignored`, reason `history` or the policy refusal, `source='history'`, no mention, trigger,
+  queue cap or media promotion. History mode uses its own room-context cache so the concurrent
+  sync loop's per-response cache is never shared.
+- An empty page with `end` counts as one event toward the cap, so a crawl always ends.
+- A 429's `retry_after` is capped at `matrix.MAX_RETRY_SECONDS` (10 s) before the crawl is
+  deferred (Task 7 review ruling); without one the crawl waits `DEFAULT_RETRY_SECONDS` (60 s).
+- `retry_after_seconds` accepts only ASCII digits in `Retry-After` (superscript two passes `isdigit()`
+  but `float` raises).

@@ -134,7 +134,7 @@ async def test_sigterm_while_waiting_for_the_lock(pool, port, start):
         assert await asyncio.wait_for(task, 5) == 0
 
 
-async def test_work_loop_runs_room_requests_then_fetcher():
+async def test_work_loop_runs_room_requests_then_fetcher_then_crawler():
     from agents_matrix_connector.bot import _work_loop
 
     order: list[str] = []
@@ -156,13 +156,14 @@ async def test_work_loop_runs_room_requests_then_fetcher():
             Step("sender"),
             Step("tracker"),
             Step("rooms"),
-            Step("fetcher", True),
+            Step("fetcher"),
+            Step("crawler", True),
             settings,
             stop,
         ),
         5,
     )
-    assert order == ["worker", "sender", "tracker", "rooms", "fetcher"]
+    assert order == ["worker", "sender", "tracker", "rooms", "fetcher", "crawler"]
 
 
 def bridge_transport(answer):

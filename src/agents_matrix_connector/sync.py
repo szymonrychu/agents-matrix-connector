@@ -60,6 +60,7 @@ ROOM_INFO_TYPES = frozenset(EVENT_TYPES) - {
     "m.room.redaction",
 }
 REDACTED = inbound.REDACTED
+HISTORY = inbound.HISTORY
 TIMELINE_LIMIT = 50
 _EXCLUDED = {"not_types": ["*"]}
 SYNC_FILTER = {
@@ -526,9 +527,14 @@ class SyncLoop:
         room_id: str,
         event: dict,
         rule_list: list[policy.Rule],
+        *,
+        history: bool = False,
+        contexts: dict[str, _RoomContext] | None = None,
     ) -> bool:
         """Apply one timeline event: a redaction or an edit folds into its original row, a
-        message is taken in. True when an inbound row was inserted."""
+        message is taken in. True when an inbound row was inserted. `history` stores messages
+        as history rows (the pre-join crawl); `contexts` is the room-context cache to use
+        (default: the one of the current sync response)."""
         redaction = discovery.parse_redaction(event)
         if redaction is not None:
             if await inbound.apply_redaction(conn, room_id, redaction.target):
@@ -561,11 +567,31 @@ class SyncLoop:
                 status="ignored",
                 reason=REDACTED,
                 redacted=True,
+                source="history" if history else "sync",
             )
-        context = self._contexts.get(room_id)
+        cache = self._contexts if contexts is None else contexts
+        context = cache.get(room_id)
         if context is None:
-            context = self._contexts[room_id] = await self._room_context(conn, room_id)
-        return await self._intake(conn, room_id, event, parsed, context, rule_list)
+            context = cache[room_id] = await self._room_context(conn, room_id)
+        return await self._intake(conn, room_id, event, parsed, context, rule_list, history)
+
+    async def intake_history(
+        self,
+        conn: psycopg.AsyncConnection,
+        room_id: str,
+        events_oldest_first: list[dict],
+        rule_list: list[policy.Rule],
+    ) -> int:
+        """Take in a page of the room's pre-join history as history rows (always `ignored`,
+        never dispatched), oldest first, in the caller's transaction; the count inserted."""
+        contexts: dict[str, _RoomContext] = {}
+        inserted = 0
+        for event in events_oldest_first:
+            if await self._apply_event(
+                conn, room_id, event, rule_list, history=True, contexts=contexts
+            ):
+                inserted += 1
+        return inserted
 
     async def _room_context(self, conn: psycopg.AsyncConnection, room_id: str) -> _RoomContext:
         cur = await conn.execute(
@@ -592,7 +618,11 @@ class SyncLoop:
         parsed: discovery.Candidate | discovery.Unsupported,
         room: _RoomContext,
         rule_list: list[policy.Rule],
+        history: bool = False,
     ) -> bool:
+        """Store one message. In history mode the row is always `ignored` with the policy
+        reason when the policy refuses it, else `history`; no mention, trigger, queue cap or
+        media promotion applies."""
         cur = await conn.execute(
             "SELECT display_name, facebook_id FROM users WHERE user_id = %s", (parsed.sender,)
         )
@@ -607,6 +637,10 @@ class SyncLoop:
         candidate = parsed if isinstance(parsed, discovery.Candidate) else None
         if isinstance(parsed, discovery.Unsupported):
             status, reason = "ignored", UNSUPPORTED_CONTENT
+        elif history:
+            status, reason, rule_id = self._decide_history(
+                room_id, parsed, room, rule_list, sender_name, sender_facebook_id
+            )
         else:
             mentioned = discovery.mentions_self(parsed, self._self_ids, room.aliases)
             status, reason, rule_id = await self._decide(
@@ -620,11 +654,11 @@ class SyncLoop:
                 mentioned,
                 when,
             )
-            if _stores_body(reason):
-                body = discovery.truncate(parsed.body, self._settings.max_inbound_chars)
-                media = parsed.media
-                if media is not None and room.anonymize:
-                    media = replace(media, name=None)
+        if candidate is not None and _stores_body(reason):
+            body = discovery.truncate(candidate.body, self._settings.max_inbound_chars)
+            media = candidate.media
+            if media is not None and room.anonymize:
+                media = replace(media, name=None)
         inserted = await inbound.insert(
             conn,
             event_id=parsed.event_id,
@@ -638,7 +672,8 @@ class SyncLoop:
             reason=reason,
             rule_id=rule_id,
             media=media,
-            reply_to_event_id=parsed.reply_to if candidate else None,
+            reply_to_event_id=candidate.reply_to if candidate else None,
+            source="history" if history else "sync",
         )
         if inserted and body is not None and candidate and candidate.edited_body is not None:
             await inbound.apply_edit(
@@ -671,6 +706,37 @@ class SyncLoop:
         if promoted:
             log.info("room %s: %s media messages joined a mention", room_id, promoted)
 
+    def _subject(
+        self,
+        room_id: str,
+        candidate: discovery.Candidate,
+        room: _RoomContext,
+        sender_name: str | None,
+        sender_facebook_id: str | None,
+    ) -> policy.Subject:
+        return policy.Subject(
+            room_id=room_id,
+            room_alias=room.alias,
+            room_kind=room.kind,
+            encrypted=room.encrypted,
+            sender_id=candidate.sender,
+            sender_facebook_id=sender_facebook_id,
+            sender_name=sender_name,
+        )
+
+    def _decide_history(
+        self,
+        room_id: str,
+        candidate: discovery.Candidate,
+        room: _RoomContext,
+        rule_list: list[policy.Rule],
+        sender_name: str | None,
+        sender_facebook_id: str | None,
+    ) -> tuple[str, str | None, int | None]:
+        subject = self._subject(room_id, candidate, room, sender_name, sender_facebook_id)
+        decision = policy.evaluate(subject, rule_list, self._settings.default_policy)
+        return "ignored", decision.reason if not decision.allowed else HISTORY, decision.rule_id
+
     async def _decide(
         self,
         conn: psycopg.AsyncConnection,
@@ -683,15 +749,7 @@ class SyncLoop:
         mentioned: bool,
         at: datetime,
     ) -> tuple[str, str | None, int | None]:
-        subject = policy.Subject(
-            room_id=room_id,
-            room_alias=room.alias,
-            room_kind=room.kind,
-            encrypted=room.encrypted,
-            sender_id=candidate.sender,
-            sender_facebook_id=sender_facebook_id,
-            sender_name=sender_name,
-        )
+        subject = self._subject(room_id, candidate, room, sender_name, sender_facebook_id)
         decision = policy.evaluate(subject, rule_list, self._settings.default_policy)
         if not decision.allowed:
             return "ignored", decision.reason, decision.rule_id

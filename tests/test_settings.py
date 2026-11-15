@@ -271,3 +271,11 @@ def test_media_settings_env(monkeypatch):
         monkeypatch.setenv(f"MATRIX_{name.upper()}", "0")
         assert f"MATRIX_{name.upper()}" in problems(ApiSettings), name
         monkeypatch.setenv(f"MATRIX_{name.upper()}", "7")
+
+
+def test_history_crawl_max_events(monkeypatch):
+    assert load_settings(BotSettings).history_crawl_max_events == 2000
+    monkeypatch.setenv("MATRIX_HISTORY_CRAWL_MAX_EVENTS", "0")
+    assert load_settings(BotSettings).history_crawl_max_events == 0
+    monkeypatch.setenv("MATRIX_HISTORY_CRAWL_MAX_EVENTS", "-1")
+    assert "MATRIX_HISTORY_CRAWL_MAX_EVENTS" in problems()

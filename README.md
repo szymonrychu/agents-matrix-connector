@@ -47,6 +47,7 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_SYNC_TIMEOUT_SECONDS` | 30 | bot | Matrix long-poll timeout (1..120) |
 | `MATRIX_RETENTION_DAYS` | 30 | bot | days messages are kept (>= 1) |
 | `MATRIX_BACKFILL_MAX_EVENTS` | 500 | bot | max events read back per room when a sync timeline arrives limited (>= 1) |
+| `MATRIX_HISTORY_CRAWL_MAX_EVENTS` | 2000 | bot | max events the one-time history crawl reads per bound room, one page of at most 100 per bot tick (>= 0; 0 disables the crawl) |
 | `MATRIX_API_ALLOWED_CIDRS` | 127.0.0.1/32 | api | client networks allowed to call the api, comma separated |
 | `MATRIX_AGENT_PORT` | 8001 | api | bind port of the agent listener; must differ from `MATRIX_HTTP_PORT` |
 | `MATRIX_AGENT_TOKEN_SHA256` | empty | api | sha256 hex (64 lowercase characters) of the orchestrator's agent bearer token; empty leaves the agent listener unbound |
@@ -134,6 +135,18 @@ when not plain handled:
   run's session is told why, so the agent can rephrase and send with `orchestrator_chat_send`
 - `forbidden`: an outbound reply the homeserver refused (a failed outbound row)
 - `denied: <kind>` and `not_allowed` also appear on ignored messages
+- `redacted`: ignored, the message was redacted (deleted) in Matrix; its text and attachment
+  are blanked and a still queued message never reaches an agent
+- `history`: ignored, a message from before the bot joined, read by the one-time history crawl
+  of a bound room; never dispatched to an agent (a sender the policy refuses keeps its
+  `denied: <kind>` or `not_allowed` reason and no text)
+
+Each room bound to a session gets one history crawl, ever: the bot pages the room's timeline
+backwards from just before its oldest synced message (or from the sync position when none is
+stored), one page of at most 100 events per bot tick, up to `MATRIX_HISTORY_CRAWL_MAX_EVENTS`
+events. A crawl ends `done` with reason `complete` (the start of the room was reached), `cap`
+(the event cap was reached) or `not_visible` (the homeserver refused to show the history), or
+`failed` with `matrix_error`; a rate limit postpones it.
 
 Only a delivered send suppresses the final answer: when a turn completes, the bot compares its
 final answer, stripped, with the stripped text of every message send of the same session

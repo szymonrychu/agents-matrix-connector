@@ -11,10 +11,19 @@ from pathlib import Path
 from api_helpers import make_settings
 from fastapi.routing import APIRoute
 
-from agents_matrix_connector import anonymize, policy, sender, sync, tracker, worker
+from agents_matrix_connector import (
+    anonymize,
+    history_crawl,
+    policy,
+    sender,
+    sync,
+    tracker,
+    worker,
+)
 from agents_matrix_connector.api import openapi
 from agents_matrix_connector.api.agent import CHAT_PREFIX, create_agent_app
 from agents_matrix_connector.api.app import PREFIX, create_api_app
+from agents_matrix_connector.db import inbound
 
 ROOT = Path(__file__).resolve().parent.parent
 README = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -89,6 +98,9 @@ def test_readme_lists_every_reason() -> None:
         sync.UNSUPPORTED_CONTENT,
         sync.NOT_MENTIONED,
         sync.QUEUE_FULL,
+        inbound.HISTORY,
+        inbound.REDACTED,
+        history_crawl.NOT_VISIBLE,
         worker.NO_PRESET,
         tracker.SESSION_GONE,
         tracker.TURN_FAILED,

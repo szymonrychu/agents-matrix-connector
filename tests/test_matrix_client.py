@@ -820,6 +820,15 @@ async def test_retry_after_http_date(fake, monkeypatch, client):
     assert 3.0 <= slept[0] <= 6.0
 
 
+def test_retry_after_non_ascii_digits_ignored():
+    response = httpx.Response(429, headers={"Retry-After": "\u00b2".encode()}, json={})
+    assert matrix.retry_after_seconds(response) is None
+    fallback = httpx.Response(
+        429, headers={"Retry-After": "\u0661\u0662".encode()}, json={"retry_after_ms": 4000}
+    )
+    assert matrix.retry_after_seconds(fallback) == 4.0
+
+
 async def test_persistent_429_carries_retry_after(fake, monkeypatch, client):
     slept: list[float] = []
 

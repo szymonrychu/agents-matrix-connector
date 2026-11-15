@@ -40,6 +40,8 @@ class ConnectorSettings(BaseServiceSettings):
     sync_timeout_seconds: int = Field(30, ge=1, le=120)
     retention_days: int = Field(30, ge=1)
     backfill_max_events: int = Field(500, ge=1)
+    history_crawl_max_events: int = Field(2000, ge=0)
+    """Max events the one-time history crawl reads per bound room; 0 disables the crawler."""
     api_allowed_cidrs: CsvList = ["127.0.0.1/32"]
     agent_port: int = 8001
     agent_token_sha256: SecretStr = Field(SecretStr(""), repr=False)

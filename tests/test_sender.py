@@ -401,6 +401,7 @@ async def test_bot_loop_runs_sender_between_worker_and_tracker(caplog):
             Tracker(),
             RoomRequests(),
             RoomRequests(),
+            RoomRequests(),
             settings,
             stop,
         ),
@@ -415,7 +416,14 @@ async def test_bot_loop_runs_sender_between_worker_and_tracker(caplog):
     with pytest.raises(MatrixAuthError):
         await asyncio.wait_for(
             bot._work_loop(
-                Worker(), Sender(lost), Tracker(), RoomRequests(), RoomRequests(), settings, stop
+                Worker(),
+                Sender(lost),
+                Tracker(),
+                RoomRequests(),
+                RoomRequests(),
+                RoomRequests(),
+                settings,
+                stop,
             ),
             5,
         )

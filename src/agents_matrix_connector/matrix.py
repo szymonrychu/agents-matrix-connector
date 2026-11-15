@@ -372,7 +372,7 @@ def retry_after_seconds(response: httpx.Response) -> float | None:
     HTTP-date), else the deprecated body `retry_after_ms`, else None. Never negative."""
     header = response.headers.get("retry-after", "").strip()
     if header:
-        if header.isdigit():
+        if header.isascii() and header.isdigit():
             return float(header)
         try:
             when = parsedate_to_datetime(header)
