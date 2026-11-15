@@ -2,6 +2,38 @@
 
 Lessons that outlive a session. Newest first.
 
+## 2026-11-15 decisions
+
+Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
+
+- Ordering: `s` (agent sends) and `o` (worker replies) rows sort by `created_at`, not by their
+  delivery time, so a page cursor stays put while a send is delivered later; `m` rows sort by
+  `origin_ts`.
+- Ids: `o<n>` names a worker reply or notice that was sent without an agent send. They have no
+  `sends` row, so they need their own prefix; `a<n>` names attachment requests.
+- Crawl start token: never the live head. A crawl started from the head could turn a live event
+  into a history row that is never dispatched; it starts just before the oldest stored sync row,
+  else at the committed sync `next_batch`.
+- Pacing: one page of at most 100 events per bot tick is the whole rate limit, so a crawl of many
+  rooms never competes with sync, sends or dispatch for the homeserver.
+- Edits for crawled rows: a page carries the edits that Synapse bundles in `unsigned`
+  (`m.relations.m.replace`), so a crawled row is stored with its latest text and `edited` set
+  without a second request per message.
+- Redaction of a still-`new` row: bot sync moves it to `ignored` (reason `redacted`), so a message
+  withdrawn before dispatch is never sent to an agent. The row is blanked, never deleted.
+- Migration 0011 resets `sync_state.filter_id`: the bot then creates a new filter with
+  `m.room.redaction`. This also makes the earlier `m.sticker` filter change effective, which
+  stored filters had kept out.
+- `not_allowed` counts as denied in history: the sender never passed the allow rules, so text,
+  attachment and name are withheld (`withheld: denied`) like `denied:<kind>` rows.
+- Anonymization applies to the admin view too: a superleader reading any room sees the pseudonym
+  and no attachment name, so the admin route cannot be used to de-anonymize a room.
+- The admin history view replaces the UI feed only on the admin router: the UI keeps its own
+  `GET /matrix/api/v1/rooms/{room_id}/messages` shape, and `_ADMIN_ROUTES` filters by path and
+  method, so the UI handler is registered only when `admin=False`.
+- Reactions are not shown in the feed and edits and redactions are folded only for rows stored
+  from this release on (no rewrite of older rows): both keep the migration forward-only.
+
 ## 2026-11-12 decisions
 
 - Inbound media (T-155 step 2): the mention window is applied only by bot sync, on rows it

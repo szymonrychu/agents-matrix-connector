@@ -947,6 +947,46 @@ four events and only the text mentions the bot. Media of the same sender sent wi
 room's queue cap), and media sent within that window after one is accepted too. Media of other
 senders, and media around a mention that was ignored, stay `not_mentioned`.
 
+### Chat history and attachments
+
+Agents read the past of their room with `GET /chat/v1/history` and ask for the file of an old
+message with `POST /chat/v1/attachments` (both described in the Agent API above). What the feed
+covers:
+
+- Every row the bot stored since it joined the room, plus the one-time crawl of the room's older
+  timeline (`MATRIX_HISTORY_CRAWL_MAX_EVENTS`, default 2000 events, one page of at most 100 per
+  bot tick). Matrix is not a full Messenger archive: the bridge holds only the messages of its
+  portal era, and the room's history visibility can hide what was sent before the bot joined.
+  Pre-join rows are stored as history rows (ignored, never dispatched to an agent).
+- Retention is the same 30 days for every settled row (`MATRIX_RETENTION_DAYS`), measured from the
+  moment the bot stored it, so a crawled old message ages from the crawl, not from its send time.
+- Ids: `m<n>` inbound, `s<n>` agent sends, `o<n>` worker replies and notices sent without an agent
+  send. Outbound reactions are not in the feed and reactions are not shown on messages.
+- Withheld rows: messages of denied senders (`not_allowed` or `denied:<kind>`), encrypted,
+  infrastructure and unsupported rows carry no text, sender or attachment and say why in
+  `withheld`.
+- Edits and redactions are folded into the original row for rows stored from this release on:
+  the latest text with `edited: true`, a blank row with `redacted: true`. Rows stored earlier keep
+  their original text.
+- Anonymized rooms show the pseudonym as `from` and no attachment name; the `from` filter takes
+  only a pseudonym.
+
+Attachment fetch flow: the agent posts the `m<n>` of a message with a file; the api checks the
+binding, the row and the limits (10 requests per room per 600 s, one in flight per message) and
+queues `a<n>`; the bot's attachment fetcher claims one request per tick, re-checks the binding,
+downloads the file from the bot's own homeserver, prepares it like an inbound photo (same
+allowlist and `MATRIX_INBOUND_ATTACH_MAX_BYTES`) and posts it to the session as a new turn. The
+agent reads the outcome with `GET /chat/v1/attachments/{request_id}`: `sent`, or `failed` or
+`refused` with a fixed reason: `room_unbound` (the session left the room), `no_attachment`,
+`session_gone`, `orchestrator_refused`, `orchestrator_unavailable`, `interrupted` (the bot restarted
+mid-fetch), `fetch_error`, or the media reasons `too_large`, `unsupported_type`, `download_failed`
+and `foreign_media`.
+
+Superleaders read the history of any room read only through the admin route
+`GET /chat/v1/admin/rooms/{room_id}/messages`; every read is audited in the log with the calling
+session and room, and there is no attachment fetch on the admin listener. Logs of all these
+paths carry ids, counts and fixed reasons only, never message text, names, media urls or tokens.
+
 ### Read receipts
 
 The bot marks the newest message of a batch read (a public Matrix `m.read` receipt, which
