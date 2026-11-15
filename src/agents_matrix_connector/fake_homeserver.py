@@ -41,6 +41,7 @@ ROUTES = (
     "room_state",
     "joined_members",
     "room_messages",
+    "room_context",
     "send_text",
     "typing",
     "receipt",
@@ -107,6 +108,7 @@ class _Failure:
     status: int
     errcode: str | None
     retry_after_ms: int | None
+    retry_after_header: str | None = None
 
 
 class FakeHomeserver:
@@ -145,6 +147,7 @@ class FakeHomeserver:
             ("GET", ("rooms", None, "state"), "room_state", self._room_state),
             ("GET", ("rooms", None, "joined_members"), "joined_members", self._joined_members),
             ("GET", ("rooms", None, "messages"), "room_messages", self._messages),
+            ("GET", ("rooms", None, "context", None), "room_context", self._context),
             ("PUT", ("rooms", None, "send", None, None), "send_text", self._send),
             ("PUT", ("rooms", None, "typing", None), "typing", self._typing_route),
             (
@@ -231,6 +234,18 @@ class FakeHomeserver:
         room = self._room(room_id)
         return self._append(room, event_type, sender, content, origin_ts=origin_ts)["event_id"]
 
+    def redact(self, room_id: str, event_id: str, sender: str) -> str:
+        """Redact `event_id`: append an `m.room.redaction` event and blank the target's
+        content, as a homeserver does when serving it afterwards."""
+        room = self._room(room_id)
+        redaction = self._append(room, "m.room.redaction", sender, {"redacts": event_id})
+        for _, event in room.timeline:
+            if event["event_id"] == event_id:
+                event["content"] = {}
+                event["unsigned"]["redacted_because"] = copy.deepcopy(redaction)
+                break
+        return redaction["event_id"]
+
     def set_state(self, room_id: str, event_type: str, state_key: str, content: dict) -> None:
         room = self._room(room_id)
         self._append(room, event_type, room.creator, content, state_key)
@@ -304,11 +319,12 @@ class FakeHomeserver:
         status: int,
         errcode: str | None = None,
         retry_after_ms: int | None = None,
+        retry_after_header: str | None = None,
     ) -> None:
         """Answer the next call of `route` (one of ROUTES) with this error; calls queue."""
         if route not in self._failures:
             raise ValueError(f"unknown route {route!r}, expected one of {ROUTES}")
-        self._failures[route].append(_Failure(status, errcode, retry_after_ms))
+        self._failures[route].append(_Failure(status, errcode, retry_after_ms, retry_after_header))
 
     def revoke_token(self) -> None:
         self._token_valid = False
@@ -667,6 +683,24 @@ class FakeHomeserver:
             body["end"] = f"t{last - 1}" if backwards else f"t{last}"
         return JSONResponse(body)
 
+    async def _context(self, request: Request, params: list[str]) -> Response:
+        room = self._joined_room(params[0])
+        if isinstance(room, Response):
+            return room
+        for position, event in room.timeline:
+            if event["event_id"] == params[1]:
+                return JSONResponse(
+                    {
+                        "start": f"t{position - 1}",
+                        "end": f"t{position}",
+                        "event": copy.deepcopy(event),
+                        "events_before": [],
+                        "events_after": [],
+                        "state": [],
+                    }
+                )
+        return matrix_error(404, "M_NOT_FOUND", "Event not found")
+
     async def _send(self, request: Request, params: list[str]) -> Response:
         room_id, event_type, txn_id = params
         room = self._joined_room(room_id)
@@ -817,7 +851,10 @@ def _room_body(state: list[dict], timeline: list[tuple[int, dict]], limited: boo
 def _failure_response(failure: _Failure) -> JSONResponse:
     errcode = failure.errcode or DEFAULT_ERRCODES.get(failure.status, "M_UNKNOWN")
     extra = {} if failure.retry_after_ms is None else {"retry_after_ms": failure.retry_after_ms}
-    return matrix_error(failure.status, errcode, f"Injected failure {failure.status}", **extra)
+    response = matrix_error(failure.status, errcode, f"Injected failure {failure.status}", **extra)
+    if failure.retry_after_header is not None:
+        response.headers["Retry-After"] = failure.retry_after_header
+    return response
 
 
 async def _json_body(request: Request) -> Any:

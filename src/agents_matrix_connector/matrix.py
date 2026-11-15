@@ -3,6 +3,8 @@
 import asyncio
 import json
 import logging
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from types import TracebackType
 from typing import Any, Self
 from urllib.parse import quote
@@ -48,7 +50,20 @@ class MatrixNotFound(MatrixError):
 
 
 class MatrixUnavailable(MatrixError):
-    """Transport error, 5xx, or a 429 that persisted through one retry."""
+    """Transport error, 5xx, or a 429 that persisted through one retry.
+
+    `retry_after` is the seconds the server asked for on such a 429 (uncapped), else None."""
+
+    def __init__(
+        self,
+        status: int | None,
+        errcode: str | None,
+        error: str,
+        *,
+        retry_after: float | None = None,
+    ):
+        super().__init__(status, errcode, error)
+        self.retry_after = retry_after
 
 
 class MediaTooLarge(MatrixError):
@@ -137,18 +152,29 @@ class MatrixClient:
     async def room_messages(
         self,
         room_id: str,
-        from_token: str,
+        from_token: str | None,
         *,
         direction: str = "b",
         limit: int = 100,
         filter: dict | None = None,
     ) -> dict:
         """One page of a room's timeline from `from_token`: `chunk` (newest first when
-        paging backwards), `start` and, while more events exist, `end`."""
-        params = {"from": from_token, "dir": direction, "limit": str(limit)}
+        paging backwards), `start` and, while more events exist, `end`. Without a
+        token the server pages from the edge of the timeline (Matrix v1.3+)."""
+        params = {"dir": direction, "limit": str(limit)}
+        if from_token is not None:
+            params["from"] = from_token
         if filter is not None:
             params["filter"] = json.dumps(filter, separators=(",", ":"))
         return await self._request("GET", _path("rooms", room_id, "messages"), params=params)
+
+    async def event_context(self, room_id: str, event_id: str, *, limit: int = 0) -> dict:
+        """The event with `limit` events around it; `start` and `end` are pagination tokens."""
+        return await self._request(
+            "GET",
+            _path("rooms", room_id, "context", event_id),
+            params={"limit": str(limit)},
+        )
 
     async def resolve_alias(self, alias: str) -> str | None:
         """The room id `alias` points to in the room directory, or None when it is unknown."""
@@ -320,7 +346,11 @@ class MatrixClient:
             return MatrixForbidden(status, errcode, error)
         if status == 404:
             return MatrixNotFound(status, errcode, error)
-        if status == 429 or status >= 500:
+        if status == 429:
+            return MatrixUnavailable(
+                status, errcode, error, retry_after=retry_after_seconds(response)
+            )
+        if status >= 500:
             return MatrixUnavailable(status, errcode, error)
         return MatrixError(status, errcode, error)
 
@@ -337,16 +367,30 @@ def _error_body(response: httpx.Response) -> tuple[str | None, str]:
     return (errcode if isinstance(errcode, str) else None), str(error)
 
 
-def _retry_delay(response: httpx.Response) -> float:
-    """Seconds to wait before retrying a 429: `retry_after_ms` from the body, else the
-    `Retry-After` header, capped at MAX_RETRY_SECONDS."""
-    milliseconds: float = 0
+def retry_after_seconds(response: httpx.Response) -> float | None:
+    """Seconds the server asked to wait: the `Retry-After` header (delta seconds or an
+    HTTP-date), else the deprecated body `retry_after_ms`, else None. Never negative."""
+    header = response.headers.get("retry-after", "").strip()
+    if header:
+        if header.isdigit():
+            return float(header)
+        try:
+            when = parsedate_to_datetime(header)
+        except (TypeError, ValueError):
+            when = None
+        if when is not None:
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=UTC)
+            return max((when - datetime.now(UTC)).total_seconds(), 0.0)
     try:
         body = response.json()
     except ValueError:
-        body = None
+        return None
     if isinstance(body, dict) and isinstance(body.get("retry_after_ms"), int | float):
-        milliseconds = body["retry_after_ms"]
-    elif response.headers.get("retry-after", "").isdigit():
-        milliseconds = int(response.headers["retry-after"]) * 1000
-    return min(max(milliseconds, 0) / 1000, MAX_RETRY_SECONDS)
+        return max(body["retry_after_ms"], 0) / 1000
+    return None
+
+
+def _retry_delay(response: httpx.Response) -> float:
+    """Seconds to wait before retrying a 429, capped at MAX_RETRY_SECONDS."""
+    return min(retry_after_seconds(response) or 0, MAX_RETRY_SECONDS)
