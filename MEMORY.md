@@ -417,3 +417,10 @@ Lessons that outlive a session. Newest first.
   items: the inbound queue status is internal; s and o items carry their delivery status. In an
   anonymized room a `from` filter that is not a pseudonym returns an empty page rather than an
   error, so a real name is never resolved or confirmed.
+
+- 2026-11-15 (T-420, task 4): `GET /chat/v1/history` (agent listener, room from the binding) and
+  `GET /chat/v1/admin/rooms/{room_id}/messages` (admin router only, read only). The UI
+  `room_messages` handler is now registered only when `admin=False`, because `_ADMIN_ROUTES`
+  filters by path and method and would otherwise also expose the UI shape on the admin path.
+  A malformed id is `bad_reference` like an unknown or foreign one (A14); `before` with `after`
+  is `invalid_request`.

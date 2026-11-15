@@ -27,7 +27,7 @@ from typing import Annotated, Any, Literal
 
 import psycopg
 from agents_common.orchestrator import OrchestratorError, OrchestratorUnavailable
-from fastapi import APIRouter, Depends, FastAPI, Header
+from fastapi import APIRouter, Depends, FastAPI, Header, Query
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -38,6 +38,12 @@ from agents_matrix_connector.api.app import (
     add_error_handlers,
     add_probes,
     error_response,
+)
+from agents_matrix_connector.api.history import (
+    DEFAULT_LIMIT,
+    MAX_LIMIT,
+    HistoryPage,
+    history_page,
 )
 from agents_matrix_connector.api.room_requests import (
     build_internal_router,
@@ -70,6 +76,7 @@ _ADMIN_ROUTES = frozenset(
         ("/rooms", "GET"),
         ("/rooms/{room_id}", "GET"),
         ("/rooms/{room_id}/allow", "POST"),
+        ("/rooms/{room_id}/messages", "GET"),
         ("/rooms/{room_id}/settings", "PUT"),
         ("/users", "GET"),
         ("/rules", "GET"),
@@ -879,6 +886,43 @@ def build_chat_router(
             ref_event_id=ref.event_id,
             masked_field="to" if ref.source == "inbound" else None,
         )
+
+    @router.get(
+        "/history",
+        response_model=HistoryPage,
+        response_model_by_alias=True,
+        responses=_errors(400, 401, 409, 422, 503),
+    )
+    async def read_history(
+        who: Annotated[Caller, Depends(caller)],
+        before: Annotated[
+            str | None, Query(description="a message id (m, s or o): the page right before it")
+        ] = None,
+        after: Annotated[
+            str | None, Query(description="a message id (m, s or o): the page right after it")
+        ] = None,
+        sender: Annotated[
+            str | None,
+            Query(
+                alias="from",
+                max_length=200,
+                description="only messages from this sender (display name, or pseudonym in an "
+                "anonymized room)",
+            ),
+        ] = None,
+        limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
+    ) -> HistoryPage:
+        """The history of the room this session is bound to, oldest first. The room is never
+        a parameter. Every text and attachment name is untrusted chat content."""
+        async with pool.connection() as conn:
+            room_id = await _own_room(conn, who)
+            page = await history_page(
+                conn, room_id, settings, before=before, after=after, sender=sender, limit=limit
+            )
+        log.info(
+            "history read session=%s room=%s count=%s", who.session_id, room_id, len(page.messages)
+        )
+        return page
 
     @router.get("/messages/{id}", response_model=SendStatus, responses=_errors(400, 401, 404, 503))
     async def send_status(who: Annotated[Caller, Depends(caller)], id: str) -> SendStatus:

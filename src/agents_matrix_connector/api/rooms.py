@@ -14,6 +14,12 @@ from fastapi import APIRouter, Header, Query
 from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector import discovery, policy
+from agents_matrix_connector.api.history import (
+    DEFAULT_LIMIT,
+    MAX_LIMIT,
+    HistoryPage,
+    history_page,
+)
 from agents_matrix_connector.api.schemas import (
     AccessView,
     AdminRoomSettingsIn,
@@ -290,6 +296,27 @@ def build_rooms_router(
         async def put_admin_settings(room_id: str, body: AdminRoomSettingsIn) -> RoomDetail:
             return await store_settings(room_id, body)
 
+        @router.get(
+            "/rooms/{room_id}/messages",
+            response_model=HistoryPage,
+            response_model_by_alias=True,
+        )
+        async def admin_room_history(
+            room_id: str,
+            before: str | None = None,
+            after: str | None = None,
+            sender: Annotated[str | None, Query(alias="from", max_length=200)] = None,
+            limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
+        ) -> HistoryPage:
+            """The room's history, oldest first, read only (the superleader's view)."""
+            await require_room(room_id)
+            async with pool.connection() as conn:
+                page = await history_page(
+                    conn, room_id, settings, before=before, after=after, sender=sender, limit=limit
+                )
+            log.info("admin history read room=%s count=%s", room_id, len(page.messages))
+            return page
+
     else:
 
         @router.put("/rooms/{room_id}/settings", response_model=RoomDetail)
@@ -340,7 +367,6 @@ def build_rooms_router(
         view = await detail(await require_room(room_id), await rules.list_rules(pool))
         return RoomAllowView(**view.model_dump(), rule_id=rule_id, accept_request_id=accept_id)
 
-    @router.get("/rooms/{room_id}/messages", response_model=list[MessageView])
     async def room_messages(
         room_id: str,
         limit: int = Query(50, ge=1, le=200),
@@ -373,6 +399,9 @@ def build_rooms_router(
             if out_rows and out_rows[0].id == number:
                 return _stamp(out_rows[0].created_at, "out", number)
         raise ApiError(422, "invalid_request", "before_id: unknown message")
+
+    if not admin:
+        router.get("/rooms/{room_id}/messages", response_model=list[MessageView])(room_messages)
 
     @router.get("/users", response_model=list[UserView])
     async def list_users(

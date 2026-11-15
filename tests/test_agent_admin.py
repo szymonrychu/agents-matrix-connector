@@ -109,7 +109,6 @@ async def test_only_the_admin_routes_are_served(admin):
         ("GET", "/settings"),
         ("PUT", "/settings"),
         ("GET", "/messages"),
-        ("GET", f"/rooms/{DM}/messages"),
         ("GET", "/meta"),
     ]:
         r = await client.request(method, path, headers=headers)
