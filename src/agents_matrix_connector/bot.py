@@ -14,6 +14,7 @@ from agents_common.runtime import LostLock, advisory_singleton, run_service
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
 
+from agents_matrix_connector.attachment_fetcher import AttachmentFetcher
 from agents_matrix_connector.bridge import BridgeError, ProvisioningClient
 from agents_matrix_connector.matrix import MatrixAuthError, MatrixClient, MatrixError
 from agents_matrix_connector.receipts import ReadReceipts
@@ -84,13 +85,14 @@ async def _work_loop(
     sender: Sender,
     tracker: Tracker,
     room_requests: RoomRequests,
+    fetcher: AttachmentFetcher,
     settings: BotSettings,
     stop,
 ) -> None:
-    """Worker, Sender, Tracker then RoomRequests tick every poll interval; only a Matrix auth
-    failure escapes."""
+    """Worker, Sender, Tracker, RoomRequests then the AttachmentFetcher tick every poll
+    interval; only a Matrix auth failure escapes."""
     while not stop.is_set():
-        for tick in (worker.tick, sender.tick, tracker.tick, room_requests.tick):
+        for tick in (worker.tick, sender.tick, tracker.tick, room_requests.tick, fetcher.tick):
             try:
                 await tick()
             except MatrixAuthError:
@@ -104,7 +106,7 @@ async def _work_loop(
 async def _locked(
     pool,
     sync: SyncLoop,
-    steps: tuple[Worker, Sender, Tracker, RoomRequests],
+    steps: tuple[Worker, Sender, Tracker, RoomRequests, AttachmentFetcher],
     settings: BotSettings,
     stop: asyncio.Event,
     held: asyncio.Event,
@@ -249,9 +251,12 @@ async def _main(settings, pool, orchestrator, matrix, stop, bridge=None) -> int:
         upload_limit=await upload_limit(matrix),
     )
     room_requests = RoomRequests(pool, matrix, bridge, settings)
+    fetcher = AttachmentFetcher(orchestrator, matrix, pool, settings)
     held = asyncio.Event()
     body = asyncio.create_task(
-        _locked(pool, sync, (worker, sender, tracker, room_requests), settings, stop, held),
+        _locked(
+            pool, sync, (worker, sender, tracker, room_requests, fetcher), settings, stop, held
+        ),
         name="bot",
     )
     stopper = asyncio.create_task(stop.wait())

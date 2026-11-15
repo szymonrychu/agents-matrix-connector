@@ -434,3 +434,14 @@ Lessons that outlive a session. Newest first.
 - The status path parameter is `request_id`; any id that is not the caller's `a<n>` is the same
   404 text (never echoed). `INTERRUPTED` lives in `db/attachment_requests.py`.
 - Settled requests are pruned daily with the other tables (retention_days).
+
+## Attachment fetcher (2026-11-15, T-420)
+
+- `attachment_fetcher.AttachmentFetcher` is the fifth bot tick (after room_requests): one queued
+  request per tick, claimed in its own committed transaction; the binding and row are re-checked
+  on one connection, then no connection is held during the download and the post. The file is
+  posted with `post_message` without `from_user`: it is system delivery, not a user message, so
+  the text tells the agent to reach the chat with `orchestrator_chat_send`.
+- The sender role (`role="admin"`) is computed like the worker does, from `anonymize.is_admin`;
+  anonymized rooms show the pseudonym and never the original file name.
+- Only fixed reasons and ids are logged (`attachment a<id>: <status> (<reason>)`).
