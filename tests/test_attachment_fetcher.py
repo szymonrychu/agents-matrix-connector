@@ -238,3 +238,65 @@ async def test_logs_never_carry_body_or_name(conn, hs, fake, make, caplog):
     assert "attachment a1: sent" in caplog.text
     assert CANARY not in caplog.text and "secret-name" not in caplog.text
     assert "mxc://" not in caplog.text
+
+
+async def test_unexpected_error_settles_failed_and_reraises(conn, hs, fake, make, monkeypatch):
+    session = await bound(conn, fake)
+    m = await media_row(conn, hs, pdf())
+    await queue(conn, session, m)
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("agents_matrix_connector.attachment_fetcher.inbound_media.attach", boom)
+    with pytest.raises(RuntimeError, match="boom"):
+        await make().tick()
+    assert await state(conn) == ("failed", "fetch_error", None)
+
+
+async def test_settle_failure_does_not_mask_original(conn, hs, fake, make, monkeypatch):
+    session = await bound(conn, fake)
+    m = await media_row(conn, hs, pdf())
+    await queue(conn, session, m)
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    async def bad_finish(*args, **kwargs):
+        raise ValueError("settle failed")
+
+    monkeypatch.setattr("agents_matrix_connector.attachment_fetcher.inbound_media.attach", boom)
+    monkeypatch.setattr("agents_matrix_connector.attachment_fetcher.requests.finish", bad_finish)
+    with pytest.raises(RuntimeError, match="boom"):
+        await make().tick()
+
+
+async def test_foreign_media_fails(conn, hs, fake, make):
+    session = await bound(conn, fake)
+    m = await media_row(conn, hs, pdf())
+    await conn.execute(
+        "UPDATE inbound SET media_url = 'mxc://other.example/doc' WHERE id = %s", (m,)
+    )
+    await queue(conn, session, m)
+    await make().tick()
+    assert await state(conn) == ("failed", "foreign_media", None)
+    assert hs.media_downloads == [] and fake.messages == {}
+
+
+async def test_download_failed(conn, hs, fake, make):
+    session = await bound(conn, fake)
+    m = await media_row(conn, hs, pdf())
+    hs.fail_media("doc", 500)
+    await queue(conn, session, m)
+    await make().tick()
+    assert await state(conn) == ("failed", "download_failed", None)
+    assert fake.messages == {}
+
+
+async def test_missing_media_url_is_refused(conn, hs, fake, make):
+    session = await bound(conn, fake)
+    m = await media_row(conn, hs, pdf())
+    await conn.execute("UPDATE inbound SET media_url = NULL WHERE id = %s", (m,))
+    await queue(conn, session, m)
+    await make().tick()
+    assert await state(conn) == ("refused", "no_attachment", None)

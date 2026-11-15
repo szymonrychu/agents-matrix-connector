@@ -38,6 +38,7 @@ SESSION_GONE = "session_gone"
 ORCHESTRATOR_REFUSED = "orchestrator_refused"
 ORCHESTRATOR_UNAVAILABLE = "orchestrator_unavailable"
 INTERRUPTED = requests.INTERRUPTED
+FETCH_ERROR = requests.FETCH_ERROR
 
 
 class AttachmentFetcher:
@@ -70,6 +71,20 @@ class AttachmentFetcher:
             request = await requests.claim_next(conn, self._now())
         if request is None:
             return
+        try:
+            await self._process(request)
+        except Exception:
+            await self._settle_failed(request)
+            raise
+
+    async def _settle_failed(self, request: AttachmentRequest) -> None:
+        """Fail a request still `fetching` after an unexpected error; never masks that error."""
+        try:
+            await self._finish(request, "failed", FETCH_ERROR)
+        except Exception:
+            log.warning("attachment a%s: could not settle after an error", request.id)
+
+    async def _process(self, request: AttachmentRequest) -> None:
         row, anonymized = await self._check(request)
         if row is None:
             return

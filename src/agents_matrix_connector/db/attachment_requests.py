@@ -20,6 +20,8 @@ from psycopg.rows import dict_row
 
 INTERRUPTED = "interrupted"
 """The reason of a `fetching` request a restart cut off."""
+FETCH_ERROR = "fetch_error"
+"""The reason of a `fetching` request the fetcher abandoned on an unexpected error."""
 SETTLED = ("sent", "failed", "refused")
 _FINISHED = frozenset(SETTLED)
 _COLUMNS = (
