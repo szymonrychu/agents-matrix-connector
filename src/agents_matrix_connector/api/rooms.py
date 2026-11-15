@@ -307,6 +307,7 @@ def build_rooms_router(
             after: str | None = None,
             sender: Annotated[str | None, Query(alias="from", max_length=200)] = None,
             limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
+            session: Annotated[str | None, Header(alias="X-Orch-Session")] = None,
         ) -> HistoryPage:
             """The room's history, oldest first, read only (the superleader's view)."""
             await require_room(room_id)
@@ -314,7 +315,12 @@ def build_rooms_router(
                 page = await history_page(
                     conn, room_id, settings, before=before, after=after, sender=sender, limit=limit
                 )
-            log.info("admin history read room=%s count=%s", room_id, len(page.messages))
+            log.info(
+                "admin history read session=%s room=%s count=%s",
+                _session_uuid(session),
+                room_id,
+                len(page.messages),
+            )
             return page
 
     else:

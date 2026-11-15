@@ -86,6 +86,24 @@ async def test_history_cursors_and_limit(agent, conn):
     assert len((await get(agent, session)).json()["messages"]) == 6
 
 
+async def test_admin_history_read_is_audited_with_session(admin, conn, caplog):
+    client, headers = admin
+    await seed(conn)
+    await add_m(conn, DM, t(1))
+    sid = uuid.uuid4()
+    with caplog.at_level("INFO", logger="agents_matrix_connector.api.rooms"):
+        r = await client.get(
+            f"/rooms/{DM}/messages", headers={**headers, "X-Orch-Session": str(sid)}
+        )
+        assert r.status_code == 200
+        await client.get(
+            f"/rooms/{DM}/messages", headers={**headers, "X-Orch-Session": "not-a-uuid"}
+        )
+    lines = [x.getMessage() for x in caplog.records if "admin history read" in x.getMessage()]
+    assert lines[0] == f"admin history read session={sid} room={DM} count=1"
+    assert lines[1] == f"admin history read session=None room={DM} count=1"
+
+
 async def test_history_default_returns_at_most_50(agent, conn):
     session = await bound_room(conn)
     for n in range(55):
