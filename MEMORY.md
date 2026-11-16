@@ -535,8 +535,9 @@ Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
   room-info type, so it never triggers a state fetch.
 - A digest target accepts only `digest_verdict` text ("all go"); a plain "go" on a digest is
   chat. Answers are sent before new approvals are posted in each tick; a retryable delegate
-  error stops the tick and leaves the row pending, any other error finishes it with
-  `[{"error": status}]` so one bad row cannot block the queue.
+  error (no response, 5xx, 401, 403, 408, 429) stops the tick and leaves the row pending; any other
+  4xx finishes it with `[{"error": status}]` so one bad row cannot block the queue, and posts
+  "Could not answer D-<id>: <status>." as a reply to the approver's event (2026-11-16, review fix).
 - The delegate client refuses an `items` that is not a list of objects (non-retryable
   `TaskboardError`); `_normalise` strips trailing spaces with the punctuation ("go ." is go).
 

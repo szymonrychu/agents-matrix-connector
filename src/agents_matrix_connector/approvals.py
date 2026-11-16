@@ -20,6 +20,9 @@ _TEXT_NO_GO = {"no-go", "no go", "nogo", "no", "deny"}
 _DIGEST_GO = {"all go", "go all"}
 
 
+RETRYABLE_4XX = frozenset({401, 403, 408, 429})
+
+
 class TaskboardError(Exception):
     """A failed taskboard call; `status` is None when no response arrived."""
 
@@ -29,7 +32,7 @@ class TaskboardError(Exception):
 
     @property
     def retryable(self) -> bool:
-        return self.status is None or self.status >= 500
+        return self.status is None or self.status >= 500 or self.status in RETRYABLE_4XX
 
 
 class TaskboardDelegate:

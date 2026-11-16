@@ -224,3 +224,48 @@ async def test_refused_answer_is_finished_with_the_error(pool, matrix, hs, setti
     await ApprovalStep(pool, matrix, d, settings).tick()
     await d.aclose()
     assert await answer_status(conn, event_id) == ("done", [{"error": 422}])
+    assert hs.sent_events(ROOM) == [
+        (
+            "m.room.message",
+            {
+                "msgtype": "m.text",
+                "body": "Could not answer D-412: 422.",
+                "m.relates_to": {"m.in_reply_to": {"event_id": event_id}},
+            },
+        )
+    ]
+
+
+async def test_not_found_replies_and_finishes(pool, matrix, hs, settings, conn):
+    def missing(request: httpx.Request) -> httpx.Response:
+        return (
+            httpx.Response(404, json={})
+            if request.method == "POST"
+            else httpx.Response(200, json={"items": []})
+        )
+
+    event_id = await answer_by_reaction(conn, 412)
+    d = TaskboardDelegate("http://tb", "tb-token", transport=httpx.MockTransport(missing))
+    await ApprovalStep(pool, matrix, d, settings).tick()
+    await d.aclose()
+    assert await answer_status(conn, event_id) == ("done", [{"error": 404}])
+    assert bodies(hs) == ["Could not answer D-412: 404."]
+
+
+@pytest.mark.parametrize("status", [401, 403, 408, 429])
+async def test_auth_and_throttle_errors_keep_answer_pending(
+    pool, matrix, hs, settings, conn, status
+):
+    def refuse(request: httpx.Request) -> httpx.Response:
+        return (
+            httpx.Response(status, json={})
+            if request.method == "POST"
+            else httpx.Response(200, json={"items": []})
+        )
+
+    event_id = await answer_by_reaction(conn, 412)
+    d = TaskboardDelegate("http://tb", "tb-token", transport=httpx.MockTransport(refuse))
+    await ApprovalStep(pool, matrix, d, settings).tick()
+    await d.aclose()
+    assert await answer_status(conn, event_id) == ("pending", None)
+    assert hs.sent(ROOM) == []

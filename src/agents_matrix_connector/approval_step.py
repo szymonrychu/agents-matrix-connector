@@ -80,9 +80,13 @@ class ApprovalStep:
                     return
                 log.warning("approvals: answer %s refused (%s)", answer.event_id, exc)
                 results = [{"error": exc.status}]
+                refused = ", ".join(f"D-{d}" for d in answer.decision_ids)
+                refusal = f"Could not answer {refused}: {exc.status}."
+            else:
+                refusal = None
             async with self._pool.connection() as conn:
                 await repo.finish_answer(conn, answer.event_id, results)
-            text = reply_text(results)
+            text = refusal or reply_text(results)
             if text is not None:
                 await self._matrix.send_event(
                     answer.room_id,
