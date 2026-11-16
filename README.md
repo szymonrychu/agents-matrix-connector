@@ -48,6 +48,10 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_RETENTION_DAYS` | 30 | bot | days messages are kept (>= 1) |
 | `MATRIX_BACKFILL_MAX_EVENTS` | 500 | bot | max events read back per room when a sync timeline arrives limited (>= 1) |
 | `MATRIX_HISTORY_CRAWL_MAX_EVENTS` | 2000 | bot | max events the one-time history crawl reads per bound room, one page of at most 100 per bot tick (>= 0; 0 disables the crawl) |
+| `MATRIX_TASKBOARD_URL` | empty | bot | agents-taskboard delegate listener base URL; required when `MATRIX_APPROVALS_ROOM` is set |
+| `MATRIX_TASKBOARD_TOKEN` | empty | bot | bearer token of the taskboard delegate listener; required when `MATRIX_APPROVALS_ROOM` is set |
+| `MATRIX_APPROVALS_ROOM` | empty | bot | Matrix room id (`!...`) where approvals are posted and answered; empty turns approvals off |
+| `MATRIX_APPROVER_IDS` | empty | bot | Matrix user ids whose reactions and replies answer approvals; required with the room; must not include `MATRIX_USER_ID`, `MATRIX_SELF_IDENTITIES` or `MATRIX_BRIDGE_BOTS` |
 | `MATRIX_API_ALLOWED_CIDRS` | 127.0.0.1/32 | api | client networks allowed to call the api, comma separated |
 | `MATRIX_AGENT_PORT` | 8001 | api | bind port of the agent listener; must differ from `MATRIX_HTTP_PORT` |
 | `MATRIX_AGENT_TOKEN_SHA256` | empty | api | sha256 hex (64 lowercase characters) of the orchestrator's agent bearer token; empty leaves the agent listener unbound |

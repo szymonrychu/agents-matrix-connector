@@ -27,6 +27,9 @@ TABLES = {
     "send_files",
     "attachment_requests",
     "history_crawls",
+    "approval_digests",
+    "approval_messages",
+    "approval_answers",
 }
 MIGRATIONS = [
     "0001_init.sql",
@@ -40,6 +43,7 @@ MIGRATIONS = [
     "0009_agent_aliases.sql",
     "0010_attachments.sql",
     "0011_chat_history.sql",
+    "0012_approvals.sql",
 ]
 
 
@@ -91,6 +95,9 @@ def test_writer_comments(db):
         "send_files": "queue: inserted by api with its send, upload and clear by bot",
         "attachment_requests": "queue: inserted by api, transitions by bot attachment fetcher",
         "history_crawls": "queue: inserted and transitioned by bot history crawler",
+        "approval_digests": "writer: bot approvals",
+        "approval_messages": "writer: bot approvals",
+        "approval_answers": "queue: inserted and transitioned by bot approvals",
     }
     with psycopg.connect(db) as conn:
         for table, comment in expected.items():
@@ -588,14 +595,14 @@ def test_migration_0011_resets_sync_filter(pg_url):
     name, url = _empty_db(pg_url)
     try:
         with psycopg.connect(url, autocommit=True) as conn:
-            for migration in MIGRATIONS[:-1]:
+            for migration in MIGRATIONS[:-2]:
                 conn.execute(_migration(migration))
             conn.execute("UPDATE sync_state SET filter_id = 'f1'")
             conn.execute(
                 "INSERT INTO inbound (event_id, room_id, sender, status)"
                 " VALUES ('$old', '!r', '@u:x', 'handled')"
             )
-            conn.execute(_migration(MIGRATIONS[-1]))
+            conn.execute(_migration(MIGRATIONS[-2]))
             filter_id = conn.execute("SELECT filter_id FROM sync_state").fetchone()[0]
             row = conn.execute(
                 "SELECT source, redacted, reply_to_event_id, edited_at FROM inbound"
@@ -655,3 +662,27 @@ def test_send_files_checks_and_cascade_on_send_delete(db):
 def test_sends_text_stays_nullable(db):
     with psycopg.connect(db) as conn:
         assert _columns(conn, "sends")["text"] == ("text", "YES")
+
+
+def test_approval_tables(db):
+    with psycopg.connect(db, autocommit=True) as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO approval_messages (decision_id, room_id, event_id, status)"
+                " VALUES (1, '!r:x', '$e', 'other')"
+            )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO approval_digests (room_id, event_id, decision_ids)"
+                " VALUES ('!r:x', '$d', '{1}')"
+            )
+        conn.execute(
+            "INSERT INTO approval_digests (room_id, event_id, decision_ids)"
+            " VALUES ('!r:x', '$d', '{1,2}')"
+        )
+        primary = conn.execute(
+            "SELECT a.attname FROM pg_index i JOIN pg_attribute a"
+            " ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)"
+            " WHERE i.indrelid = 'approval_answers'::regclass AND i.indisprimary"
+        ).fetchall()
+        assert primary == [("event_id",)]

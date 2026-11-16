@@ -511,3 +511,15 @@ Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
   exception type name and crawl id are logged; a failure while settling never masks it.
 - `retry_after_seconds` accepts only ASCII digits in `Retry-After` (superscript two passes `isdigit()`
   but `float` raises).
+
+## Approvals foundation (2026-11-16, S-63, Task 17)
+
+- Migration is `0012_approvals.sql` (0011 was taken by chat history). Tables `approval_digests`,
+  `approval_messages`, `approval_answers`: the connector is their only writer; answers are a
+  pending/done queue. `test_migration_0011_resets_sync_filter` now indexes `MIGRATIONS[-2]`
+  because it targets the 0011 migration, no longer the last one.
+- `BotSettings.approvals_room` empty turns approvals off; when set, the taskboard url and token,
+  and at least one approver are required, and approvers must not overlap the bot's own
+  identities or bridge bots (a bridged puppet or the bot itself must never answer).
+- `approvals.py` verdict parsers are exact-match only (whole text in a small set): anything
+  ambiguous is not a verdict and stays chat. The delegate client always sends `source: "matrix"`.
