@@ -350,7 +350,7 @@ Inbound messages across all rooms, newest first. Query: `status` (`new`, `in-pro
 
 The agent listener of the `api` subcommand, called by agents-orchestrator on behalf of a session
 leader (the `orchestrator_chat_*` tools). With `MATRIX_AGENT_TOKEN_SHA256` set, the `api`
-subcommand also binds `MATRIX_AGENT_PORT`, which serves only `/chat/v1/*` (the chat routes and the five `/chat/v1/admin` routes), `/healthz` and
+subcommand also binds `MATRIX_AGENT_PORT`, which serves only `/chat/v1/*` (the chat routes and the `/chat/v1/admin` routes), `/healthz` and
 `/readyz`. Base path `/chat/v1`; the OpenAPI document is committed as `openapi-agent.json`
 (regenerate with `uv run python -m agents_matrix_connector.api.openapi --agent >
 openapi-agent.json`) and served at `/chat/v1/openapi.json`.
@@ -704,6 +704,20 @@ The room's history view for the superleader: the same page, query and ids as `GE
 As `PUT /matrix/api/v1/rooms/{room_id}/settings` without `agents_may_send_files`: only the
 web listener may set that flag, so an agent body carrying it is 422 `invalid_request` and a save
 leaves the stored value unchanged.
+
+### `GET /chat/v1/admin/rooms/{room_id}/notes`
+
+The notes of any known room by id, for the superleader and cron sessions (which are room-unbound,
+so no binding is needed). 200 the same `RoomNotes` shape as `GET /chat/v1/notes`; 401
+`unauthorized`; 404 `not_found` for an unknown room; 503 `unavailable`.
+
+### `PUT /chat/v1/admin/rooms/{room_id}/notes`
+
+Replace the notes of any known room, with the same body (`{"body", "expected_version"}`), size
+cap and errors as `PUT /chat/v1/notes` (409 `version_conflict`, 413 `notes_too_large`, 422
+`invalid_request`) plus 404 `not_found` for an unknown room. 200 `RoomNotes`. The optional
+`X-Orch-Slug` header names the writer; each update logs `admin notes update session=<slug>
+room=<id>` (never the body).
 
 ### `GET /chat/v1/admin/users`
 

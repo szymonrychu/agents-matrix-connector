@@ -566,3 +566,12 @@ Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
   room still takes the normal intake path (default deny drops it).
 - `FakeHomeserver.events(room_id)` returns the room's full events, so a test can react to an event
   the bot posted (event ids are positional, not predictable).
+
+## Admin room notes by room id (2026-11-16, S-68 step 17, T-525)
+
+- `GET`/`PUT /chat/v1/admin/rooms/{room_id}/notes` reuse the notes body, cap, version guard and
+  `RoomNotes` shape of the bound-session routes (shared module-level helpers), but take the room
+  from the path and need no binding: cron sessions are room-unbound. An unknown room is 404.
+- The writer name is the optional `X-Orch-Slug` header (the admin routes otherwise ignore session
+  headers); the audit line is `admin notes update session=<slug> room=<id>` and never carries the
+  body. The skill store stays in this release.
