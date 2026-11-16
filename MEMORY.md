@@ -539,3 +539,25 @@ Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
   `[{"error": status}]` so one bad row cannot block the queue.
 - The delegate client refuses an `items` that is not a list of objects (non-retryable
   `TaskboardError`); `_normalise` strips trailing spaces with the punctuation ("go ." is go).
+
+## Approvals chart, e2e and the approvals room (2026-11-16, S-63, Task 20)
+
+- `approvals.room`, `approvals.approverIds` and `approvals.taskboard` (url, token or tokenSecret)
+  render MATRIX_APPROVALS_ROOM, MATRIX_APPROVER_IDS and MATRIX_TASKBOARD_URL into the ConfigMap and
+  MATRIX_TASKBOARD_TOKEN as a secretKeyRef in the bot container only (the api and migrate never
+  hold a delegate token). With a room set, a missing approver list, url, token source or both
+  token sources fail the render.
+- Approvers must be disjoint from the bot identities and bridge bots (settings check): a
+  double puppet could otherwise forge a reaction as an approver, and an agent that can make the
+  bot or a puppet speak would approve its own request.
+- The answer inbox is the connector's `approval_answers` table (pending/done): the sync loop only
+  records, the bot step sends to the taskboard, so a taskboard outage retries instead of losing
+  an answer. A digest is bound to its own decision ids, so "all go" never answers a later approval.
+- Reaction keys are normalised before matching because the emoji keys the bridge carries are
+  undocumented.
+- Verified: the answer intercept (`_approval_answer` in `_apply_joined`) runs for every joined
+  room before rules and classification are consulted, so the approvals room needs no allow rule and
+  no bridge state. The e2e proves it with a bare room and no rule. A non-answer message in that
+  room still takes the normal intake path (default deny drops it).
+- `FakeHomeserver.events(room_id)` returns the room's full events, so a test can react to an event
+  the bot posted (event ids are positional, not predictable).

@@ -4,13 +4,14 @@ the FakeOrchestrator helpers."""
 
 import pytest
 
-from .conftest import BOT, Stack, puppet, text, wait_for
+from .conftest import APPROVALS_ROOM, APPROVER, BOT, Stack, puppet, text, wait_for
 
 pytestmark = pytest.mark.e2e
 
 ALICE = puppet("111")
 BOB = puppet("222")
 CAROL = puppet("333")
+THUMBS_UP = "\N{THUMBS UP SIGN}"
 
 
 def reply(body: str) -> dict:
@@ -241,3 +242,41 @@ def test_restart_exactly_once(stack: Stack) -> None:
     assert len(stack.session_messages(session["id"])) == 3
     for message in stack.session_messages(session["id"])[1:]:
         assert "history" not in message["text"]
+
+
+def test_approval_reaction_reaches_taskboard(stack: Stack) -> None:
+    """A reaction in the approvals room answers the approval at the taskboard. The room has no
+    allow rule and is no bridged portal: the answer intercept does not depend on either."""
+    stack.taskboard.approvals[412] = {
+        "id": 412,
+        "status": "open",
+        "asking_slug": "mx-88",
+        "task_key": "T-88",
+        "question": "merge the PR?",
+        "subject": None,
+    }
+    posted = wait_for(
+        lambda: [c for c in stack.sent(APPROVALS_ROOM) if "D-412" in c["body"]],
+        "the approval posted in the approvals room",
+    )
+    assert posted[0]["body"].startswith("Approval D-412")
+    event_id = next(
+        e["event_id"]
+        for e in stack.hs_server.call(stack.hs.events, APPROVALS_ROOM)
+        if e["sender"] == BOT and "D-412" in e["content"].get("body", "")
+    )
+    reaction = stack.hs_server.call(
+        lambda: stack.hs.post(
+            APPROVALS_ROOM,
+            APPROVER,
+            {"m.relates_to": {"rel_type": "m.annotation", "event_id": event_id, "key": THUMBS_UP}},
+            event_type="m.reaction",
+        )
+    )
+    wait_for(lambda: stack.taskboard.answers, "the answer at the taskboard")
+    assert stack.taskboard.answers == [
+        {"items": [{"id": 412, "verdict": "go", "answer_ref": reaction}], "source": "matrix"}
+    ]
+    assert stack.taskboard.approvals[412]["status"] == "answered"
+    assert stack.room(APPROVALS_ROOM) is None or not stack.inbound(APPROVALS_ROOM)
+    assert stack.sessions() == []

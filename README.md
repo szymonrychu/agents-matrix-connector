@@ -78,6 +78,35 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_ACCESS_TOKEN` | none | bot | Matrix access token (required unless the file is set) |
 | `MATRIX_ACCESS_TOKEN_FILE` | empty | bot | file holding the Matrix access token; wins over the variable, stripped |
 | `MATRIX_BRIDGE_PROVISIONING_URL` | empty | bot | mautrix-meta provisioning base, e.g. `http://mautrix-meta.messaging.svc.cluster.local:29328/_matrix/provision`, called with the bot's own Matrix token; empty fails Facebook targets with `bridge_unconfigured` |
+| `MATRIX_APPROVALS_ROOM` | empty | bot | Matrix room id (`!id:server`) where open taskboard approvals are posted and answered; empty turns approvals off |
+| `MATRIX_APPROVER_IDS` | empty | bot | Matrix user ids (comma separated) whose reactions and quoted replies answer approvals; required with the room, must not include `MATRIX_USER_ID`, `MATRIX_SELF_IDENTITIES` or `MATRIX_BRIDGE_BOTS` |
+| `MATRIX_TASKBOARD_URL` | empty | bot | agents-taskboard delegate listener base URL; required with the room |
+| `MATRIX_TASKBOARD_TOKEN` | empty | bot | bearer token of the taskboard delegate listener; required with the room; a Secret value, never in the ConfigMap |
+
+## Approvals
+
+Approvals are taskboard decisions of kind `approval` that an agent asks and only the user answers.
+With `MATRIX_APPROVALS_ROOM` set, the bot polls the taskboard delegate listener, posts each open
+approval into that room (`Approval D-<id> ...`; two or more new ones also get a digest message)
+and answers it when an approver reacts or replies:
+
+- a thumbs-up or check mark reaction (or a reply `go`, `yes`, `approve`) answers go; a thumbs-down or
+  cross mark reaction (or a reply `no-go`, `no go`, `nogo`, `no`, `deny`) answers no-go; a reply on a digest with `all go` answers exactly the
+  approvals listed in that digest;
+- only users in `MATRIX_APPROVER_IDS` count, only on an event the bot posted, and only with an
+  unambiguous verdict; reactions are matched after normalising the key, because emoji keys over the
+  bridge are undocumented. Anything else (bot, bridge bot, stranger, unknown target, ambiguous
+  text) is ignored as an answer;
+- the approvals room needs no allow rule and need not be a bridged chat: the answer check runs
+  for every joined room before message intake. A message in it that is not an answer is treated
+  like any other chat message, so with the default deny it goes nowhere;
+- the answer is sent to the taskboard with `source: "matrix"` and the answer event id as
+  `answer_ref`; when it was already answered, expired or withdrawn the bot replies with one short
+  line quoting the answer.
+
+The chart renders it from `approvals.room`, `approvals.approverIds` and `approvals.taskboard`
+(`url`, and exactly one of `token` and `tokenSecret`); the delegate token reaches the bot container
+only.
 
 ## API
 

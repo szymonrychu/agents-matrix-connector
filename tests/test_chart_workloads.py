@@ -372,3 +372,70 @@ def test_config_anonymize_admins():
     assert _config()["MATRIX_ANONYMIZE_ADMINS"] == ""
     admins = {"anonymize": {"admins": ["@facebook_1:x", "2"]}}
     assert _config(admins)["MATRIX_ANONYMIZE_ADMINS"] == "@facebook_1:x,2"
+
+
+TB = "".join(["tb", "-", "fixture", "-", "value"])
+APPROVALS = {
+    "approvals": {
+        "room": "!approvals:example.org",
+        "approverIds": ["@a:x", "@b:x"],
+        "taskboard": {"url": "http://taskboard.agents.svc:8002", "token": TB},
+    }
+}
+
+
+def test_approvals_off_by_default():
+    docs = render()
+    data = next(d for d in docs if d["kind"] == "ConfigMap")["data"]
+    assert "MATRIX_APPROVALS_ROOM" not in data
+    assert "MATRIX_APPROVER_IDS" not in data
+    assert "MATRIX_TASKBOARD_URL" not in data
+    for dep in deployments(docs).values():
+        assert "MATRIX_TASKBOARD_TOKEN" not in env_of(main_container(dep))
+    secret = next(d for d in docs if d["kind"] == "Secret")
+    assert "taskboard-token" not in secret["stringData"]
+
+
+def test_approvals_token_only_in_bot():
+    docs = render(APPROVALS)
+    data = next(d for d in docs if d["kind"] == "ConfigMap")["data"]
+    assert data["MATRIX_APPROVALS_ROOM"] == "!approvals:example.org"
+    assert data["MATRIX_APPROVER_IDS"] == "@a:x,@b:x"
+    assert data["MATRIX_TASKBOARD_URL"] == "http://taskboard.agents.svc:8002"
+    deps = deployments(docs)
+    assert env_of(main_container(deps["bot"]))["MATRIX_TASKBOARD_TOKEN"]["valueFrom"] == {
+        "secretKeyRef": {"name": "mx-agents-matrix-connector", "key": "taskboard-token"}
+    }
+    assert "MATRIX_TASKBOARD_TOKEN" not in env_of(main_container(deps["api"]))
+    for dep in deps.values():
+        assert "MATRIX_TASKBOARD_TOKEN" not in env_of(pod(dep)["initContainers"][0])
+    secret = next(d for d in docs if d["kind"] == "Secret")
+    assert secret["stringData"]["taskboard-token"] == TB
+
+
+def test_approvals_existing_secret():
+    docs = render(
+        {"approvals": {"taskboard": {"token": "", "tokenSecret": {"name": "tb-tok", "key": "k"}}}},
+        base=_merge(BASE, APPROVALS),
+    )
+    secret = next(d for d in docs if d["kind"] == "Secret")
+    assert "taskboard-token" not in secret["stringData"]
+    bot = env_of(main_container(deployments(docs)["bot"]))
+    assert bot["MATRIX_TASKBOARD_TOKEN"]["valueFrom"]["secretKeyRef"] == {
+        "name": "tb-tok",
+        "key": "k",
+    }
+
+
+def test_approvals_missing_sources_fail():
+    ok = _merge(BASE, APPROVALS)
+    assert _run(ok).returncode == 0
+    for bad in (
+        {"approvals": {"taskboard": {"token": ""}}},
+        {"approvals": {"taskboard": {"tokenSecret": {"name": "tb-tok"}}}},
+        {"approvals": {"taskboard": {"url": ""}}},
+        {"approvals": {"approverIds": []}},
+    ):
+        proc = _run(_merge(ok, bad))
+        assert proc.returncode != 0, bad
+        assert TB not in proc.stderr

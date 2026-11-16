@@ -119,6 +119,34 @@ matrix-access-token
 {{- end }}
 
 {{/*
+Name of the Secret holding the taskboard delegate token, empty when approvals are off. Fails
+when approvals are on and neither or both of taskboard.token and taskboard.tokenSecret.name are set.
+*/}}
+{{- define "agents-matrix-connector.taskboardSecretName" -}}
+{{- $a := .Values.approvals -}}
+{{- if $a.room -}}
+{{- $named := and $a.taskboard.tokenSecret $a.taskboard.tokenSecret.name -}}
+{{- if and $a.taskboard.token $named -}}
+{{- fail "agents-matrix-connector: set only one of approvals.taskboard.token and approvals.taskboard.tokenSecret.name" -}}
+{{- else if $named -}}
+{{- $a.taskboard.tokenSecret.name -}}
+{{- else if $a.taskboard.token -}}
+{{- include "agents-matrix-connector.fullname" . -}}
+{{- else -}}
+{{- fail "agents-matrix-connector: the taskboard delegate token is required with approvals.room: set approvals.taskboard.token or approvals.taskboard.tokenSecret.name" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{- define "agents-matrix-connector.taskboardSecretKey" -}}
+{{- if and .Values.approvals.taskboard.tokenSecret .Values.approvals.taskboard.tokenSecret.name -}}
+{{- .Values.approvals.taskboard.tokenSecret.key | default "token" -}}
+{{- else -}}
+taskboard-token
+{{- end -}}
+{{- end }}
+
+{{/*
 Name of the Secret holding the agent token sha256, empty when none is set (the agent listener
 then stays unbound). Fails on an inline hash that is not 64 lowercase hex, without echoing it.
 */}}
@@ -145,8 +173,8 @@ agent-token-sha256
 {{/*
 Container env for a component. Call with (dict "context" . "component" "api"): the settings
 ConfigMap and the database URL for every container; the orchestrator token for api and bot (not
-migrate); the api allowlist and the agent token sha256 for api only. The Matrix token is never an
-env var.
+migrate); the api allowlist and the agent token sha256 for api only; the taskboard delegate token
+for bot only, when approvals are on. The Matrix token is never an env var.
 */}}
 {{- define "agents-matrix-connector.env" -}}
 envFrom:
@@ -179,5 +207,12 @@ env:
 {{- if eq .component "bot" }}
   - name: MATRIX_ACCESS_TOKEN_FILE
     value: /var/run/secrets/matrix/token
+{{- with include "agents-matrix-connector.taskboardSecretName" .context }}
+  - name: MATRIX_TASKBOARD_TOKEN
+    valueFrom:
+      secretKeyRef:
+        name: {{ . }}
+        key: {{ include "agents-matrix-connector.taskboardSecretKey" $.context }}
+{{- end }}
 {{- end }}
 {{- end }}
