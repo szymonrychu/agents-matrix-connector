@@ -10,6 +10,8 @@ Lessons that outlive a session. Newest first.
   file) and the fetcher refuses with `no_attachment` for any withheld row, so a denied sender's
   file is neither revealed nor delivered. Withheld rows also null `from` for all four kinds, as
   the spec says (the code had nulled it for denied only).
+  The `from` filter (name or digest) never matches a withheld row of any kind (`db.history.page`
+  takes the reasons from `withheld_kind`'s table), else filtering by a name would confirm the sender.
 
 ## 2026-11-15 decisions
 

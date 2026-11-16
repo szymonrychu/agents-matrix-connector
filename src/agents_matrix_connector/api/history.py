@@ -153,6 +153,7 @@ async def history_page(
         after=cursors["after"],
         sender_name=sender_name,
         sender_digest=sender_digest,
+        withheld_reasons=list(_WITHHELD),
         limit=limit,
     )
 

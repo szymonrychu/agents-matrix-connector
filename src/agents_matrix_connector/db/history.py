@@ -10,6 +10,7 @@ while it is delivered). Paging is keyset on that triple. The mxc url is never se
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -23,8 +24,11 @@ Cursor = tuple[datetime, str, int]
 _REF = re.compile(r"([mso])([1-9][0-9]*)", re.ASCII)
 _BIGINT_MAX = 2**63 - 1
 
-_DENIED = "(COALESCE(i.reason, '') = 'not_allowed' OR COALESCE(i.reason, '') LIKE 'denied:%%')"
-"""An inbound row the access policy refused (reason `not_allowed` or `denied: <kind>`)."""
+_WITHHELD = (
+    "(COALESCE(i.reason, '') = ANY(%(withheld)s) OR COALESCE(i.reason, '') LIKE 'denied:%%')"
+)
+"""An inbound row withheld from agents: a reason in the caller's exact list (the one source of
+truth is `api.history.withheld_kind`) or `denied: <kind>`."""
 
 _REPLY_TO = """CASE WHEN {event} IS NULL THEN NULL ELSE COALESCE(
     (SELECT 'm' || ri.id FROM inbound ri WHERE ri.room_id = {room} AND ri.event_id = {event}),
@@ -124,12 +128,15 @@ async def page(
     after: Cursor | None,
     sender_name: str | None,
     sender_digest: str | None,
+    withheld_reasons: Sequence[str],
     limit: int,
 ) -> tuple[list[FeedRow], bool]:
     """Up to `limit` feed rows in ascending order and whether more exist in the paging
     direction: older than `before`, newer than `after`, else the newest page (more = older).
     A sender filter (`sender_name` case-insensitive, or `sender_digest`, the 12 hex characters
-    of the sender's sha256) returns inbound rows only and never denied ones."""
+    of the sender's sha256) returns inbound rows only and never withheld ones (`withheld_reasons`
+    are the exact reasons withheld, plus any `denied:` prefix), so a filter cannot confirm who
+    sent one."""
     if before is not None and after is not None:
         raise ValueError("give at most one of before and after")
     params: dict[str, Any] = {"room": room_id, "limit": limit + 1}
@@ -149,7 +156,8 @@ async def page(
         m_sql += " AND left(encode(sha256(convert_to(i.sender, 'UTF8')), 'hex'), 12) = %(digest)s"
         params["digest"] = sender_digest
     if filtered:
-        m_sql += f" AND NOT {_DENIED}"
+        m_sql += f" AND NOT {_WITHHELD}"
+        params["withheld"] = list(withheld_reasons)
     branches = [m_sql]
     if not filtered:
         s_sql, o_sql = _S_SELECT, _O_SELECT

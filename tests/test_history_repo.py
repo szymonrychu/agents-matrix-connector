@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from history_helpers import ALICE, BOB, add_m, add_o, add_s
 
+from agents_matrix_connector.api.history import _WITHHELD
 from agents_matrix_connector.db import history
 
 R = "!r:x"
@@ -16,7 +17,14 @@ def t(seconds: int) -> datetime:
 
 
 async def _page(conn, **kw):
-    args = {"before": None, "after": None, "sender_name": None, "sender_digest": None, "limit": 50}
+    args = {
+        "before": None,
+        "after": None,
+        "sender_name": None,
+        "sender_digest": None,
+        "limit": 50,
+        "withheld_reasons": list(_WITHHELD),
+    }
     args.update(kw)
     return await history.page(conn, R, **args)
 
@@ -183,6 +191,8 @@ async def test_sender_filters(conn):
     a2 = await add_m(conn, R, t(2), name="ALICE")
     await add_m(conn, R, t(3), name="Alice", status="ignored", reason="not_allowed")
     await add_m(conn, R, t(4), name="Alice", status="ignored", reason="denied: user")
+    for n, reason in enumerate(_WITHHELD):
+        await add_m(conn, R, t(20 + n), name="Alice", status="ignored", reason=reason)
     b1 = await add_m(conn, R, t(5), sender=BOB, name="Bob")
     await add_s(conn, R, t(6))
     await add_o(conn, R, t(7))
