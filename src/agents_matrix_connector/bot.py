@@ -14,6 +14,8 @@ from agents_common.runtime import LostLock, advisory_singleton, run_service
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
 
+from agents_matrix_connector.approval_step import ApprovalStep
+from agents_matrix_connector.approvals import TaskboardDelegate
 from agents_matrix_connector.attachment_fetcher import AttachmentFetcher
 from agents_matrix_connector.bridge import BridgeError, ProvisioningClient
 from agents_matrix_connector.history_crawl import HistoryCrawler
@@ -86,19 +88,21 @@ async def _work_loop(
     sender: Sender,
     tracker: Tracker,
     room_requests: RoomRequests,
+    approvals: ApprovalStep,
     fetcher: AttachmentFetcher,
     crawler: HistoryCrawler,
     settings: BotSettings,
     stop,
 ) -> None:
-    """Worker, Sender, Tracker, RoomRequests, the AttachmentFetcher then the HistoryCrawler
-    tick every poll interval; only a Matrix auth failure escapes."""
+    """Worker, Sender, Tracker, RoomRequests, ApprovalStep, the AttachmentFetcher then the
+    HistoryCrawler tick every poll interval; only a Matrix auth failure escapes."""
     while not stop.is_set():
         for tick in (
             worker.tick,
             sender.tick,
             tracker.tick,
             room_requests.tick,
+            approvals.tick,
             fetcher.tick,
             crawler.tick,
         ):
@@ -115,7 +119,9 @@ async def _work_loop(
 async def _locked(
     pool,
     sync: SyncLoop,
-    steps: tuple[Worker, Sender, Tracker, RoomRequests, AttachmentFetcher, HistoryCrawler],
+    steps: tuple[
+        Worker, Sender, Tracker, RoomRequests, AttachmentFetcher, HistoryCrawler, ApprovalStep
+    ],
     settings: BotSettings,
     stop: asyncio.Event,
     held: asyncio.Event,
@@ -167,6 +173,7 @@ async def run_bot(
     matrix_transport: httpx.AsyncBaseTransport | None = None,
     orchestrator_transport: httpx.AsyncBaseTransport | None = None,
     bridge_transport: httpx.AsyncBaseTransport | None = None,
+    taskboard_transport: httpx.AsyncBaseTransport | None = None,
 ) -> int:
     """Run the bot until SIGTERM. Returns 0 on a clean stop, 78 on a wrong Matrix identity,
     1 when the token is rejected, the singleton lock is lost or the process fails."""
@@ -195,9 +202,20 @@ async def run_bot(
             if settings.bridge_provisioning_url
             else None
         )
+        delegate = (
+            TaskboardDelegate(
+                settings.taskboard_url,
+                settings.taskboard_token.get_secret_value(),
+                transport=taskboard_transport,
+            )
+            if settings.approvals_enabled
+            else None
+        )
         try:
-            code = await _main(settings, pool, orchestrator, matrix, stop, bridge)
+            code = await _main(settings, pool, orchestrator, matrix, stop, bridge, delegate)
         finally:
+            if delegate is not None:
+                await delegate.aclose()
             if bridge is not None:
                 await bridge.aclose()
             await matrix.aclose()
@@ -234,7 +252,7 @@ async def upload_limit(matrix: MatrixClient) -> int | None:
         return None
 
 
-async def _main(settings, pool, orchestrator, matrix, stop, bridge=None) -> int:
+async def _main(settings, pool, orchestrator, matrix, stop, bridge=None, delegate=None) -> int:
     try:
         who = await matrix.whoami()
     except MatrixAuthError as exc:
@@ -262,7 +280,8 @@ async def _main(settings, pool, orchestrator, matrix, stop, bridge=None) -> int:
     room_requests = RoomRequests(pool, matrix, bridge, settings)
     fetcher = AttachmentFetcher(orchestrator, matrix, pool, settings)
     crawler = HistoryCrawler(matrix, pool, sync, settings)
-    steps = (worker, sender, tracker, room_requests, fetcher, crawler)
+    approvals = ApprovalStep(pool, matrix, delegate, settings)
+    steps = (worker, sender, tracker, room_requests, approvals, fetcher, crawler)
     held = asyncio.Event()
     body = asyncio.create_task(
         _locked(pool, sync, steps, settings, stop, held),
