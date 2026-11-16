@@ -4,7 +4,7 @@ No routes here; the agent and admin listeners mount them. Identity comes only fr
 connector sets (`role`, `from`); every text and attachment name is untrusted chat content. In
 a room flagged `anonymize_names`, `from` is the pseudonym, the `from` filter accepts only a
 pseudonym and attachment names are left out. Denied, encrypted, infrastructure and unsupported
-rows are withheld (no text, no attachment, and no sender for denied ones). The caller's one
+rows are withheld (no text, no attachment and no sender). The caller's one
 connection serves the whole page.
 """
 
@@ -74,12 +74,19 @@ class HistoryPage(BaseModel):
     has_more_after: bool
 
 
-def _withheld(row: history.FeedRow) -> Withheld | None:
-    if row.kind != "m" or row.reason is None:
+def withheld_kind(reason: str | None) -> Withheld | None:
+    """Why an inbound row with this reason is withheld from agents, else None. The one
+    predicate for every read path (history feed, attachment request and fetch): sync stores
+    body and media of such rows, so withholding is applied at read time."""
+    if reason is None:
         return None
-    if row.reason.startswith("denied:"):
+    if reason.startswith("denied:"):
         return "denied"
-    return _WITHHELD.get(row.reason)
+    return _WITHHELD.get(reason)
+
+
+def _withheld(row: history.FeedRow) -> Withheld | None:
+    return withheld_kind(row.reason) if row.kind == "m" else None
 
 
 def _bad_reference(field: str) -> ApiError:
@@ -158,7 +165,7 @@ async def history_page(
                 row.sender, facebook_id(row.sender), settings.anonymize_admins
             )
             role = "admin" if admin else "member"
-            if withheld != "denied":
+            if withheld is None:
                 # The display name else the user id, as prompt.sender_name (typed for InboundRow).
                 label = labeler.user(row.sender) if anonymized else row.sender_name or row.sender
         hidden = withheld is not None or row.redacted

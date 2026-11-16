@@ -106,10 +106,7 @@ async def test_withheld_rows(conn, reason, withheld):
     (item,) = (await _page(conn)).messages
     assert item.withheld == withheld
     assert item.text is None and item.attachment is None and item.truncated is False
-    if withheld == "denied":
-        assert item.from_ is None
-    else:
-        assert item.from_ == "Alice A"
+    assert item.from_ is None
 
 
 async def test_not_withheld_reasons(conn):

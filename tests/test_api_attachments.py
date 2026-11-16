@@ -83,6 +83,27 @@ async def test_fetch_without_attachment(agent, conn):
     assert await count(conn) == 0
 
 
+WITHHELD_REASONS = [
+    "not_allowed",
+    "denied: user",
+    "room_encrypted",
+    "room_infrastructure",
+    "unsupported_content",
+]
+
+
+@pytest.mark.parametrize("reason", WITHHELD_REASONS)
+async def test_fetch_withheld_row_looks_like_no_attachment(agent, conn, reason):
+    session = await bound(conn)
+    text = await add_m(conn, R, NOW)
+    withheld = await add_m(conn, R, NOW, media=MEDIA, status="ignored", reason=reason)
+    plain = await fetch(agent, session, f"m{text}")
+    r = await fetch(agent, session, f"m{withheld}")
+    rig.refused(r, 409, "no_attachment")
+    assert r.json() == plain.json()
+    assert await count(conn) == 0
+
+
 @pytest.mark.parametrize("kind", ["video", "audio"])
 async def test_fetch_video_refused(agent, conn, kind):
     session = await bound(conn)

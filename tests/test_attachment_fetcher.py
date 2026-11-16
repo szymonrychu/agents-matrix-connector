@@ -300,3 +300,19 @@ async def test_missing_media_url_is_refused(conn, hs, fake, make):
     await queue(conn, session, m)
     await make().tick()
     assert await state(conn) == ("refused", "no_attachment", None)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["not_allowed", "denied: user", "room_encrypted", "room_infrastructure", "unsupported_content"],
+)
+async def test_withheld_row_is_refused_without_download(conn, hs, fake, make, reason):
+    session = await bound(conn, fake)
+    m = await media_row(conn, hs, pdf())
+    await queue(conn, session, m)
+    await conn.execute(
+        "UPDATE inbound SET status = 'ignored', reason = %s WHERE id = %s", (reason, m)
+    )
+    await make().tick()
+    assert await state(conn) == ("refused", "no_attachment", None)
+    assert hs.media_downloads == [] and fake.messages == {}

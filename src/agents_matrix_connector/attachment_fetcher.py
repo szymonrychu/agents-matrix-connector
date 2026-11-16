@@ -22,6 +22,7 @@ from agents_common.orchestrator import (
 from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector import anonymize, discovery, inbound_media, prompt
+from agents_matrix_connector.api.history import withheld_kind
 from agents_matrix_connector.clock import utcnow
 from agents_matrix_connector.db import attachment_requests as requests
 from agents_matrix_connector.db import bindings, inbound, rules
@@ -128,6 +129,7 @@ class AttachmentFetcher:
                 or row.room_id != request.room_id
                 or row.redacted
                 or row.media_url is None
+                or withheld_kind(row.reason) is not None
             ):
                 await self._finish(request, "refused", NO_ATTACHMENT, conn=conn)
                 return None, False

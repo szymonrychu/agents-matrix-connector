@@ -44,6 +44,7 @@ from agents_matrix_connector.api.history import (
     MAX_LIMIT,
     HistoryPage,
     history_page,
+    withheld_kind,
 )
 from agents_matrix_connector.api.room_requests import (
     build_internal_router,
@@ -1008,7 +1009,12 @@ def build_chat_router(
             row = await inbound.get(conn, parsed[1])
             if row is None or row.room_id != room_id:
                 raise _bad_reference("id", _NOT_A_MESSAGE)
-            if row.redacted or row.media_kind is None or row.media_url is None:
+            if (
+                row.redacted
+                or row.media_kind is None
+                or row.media_url is None
+                or withheld_kind(row.reason) is not None
+            ):
                 raise ApiError(
                     409,
                     "no_attachment",
