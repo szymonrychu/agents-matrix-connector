@@ -182,6 +182,8 @@ def test_readme_lists_every_agent_route() -> None:
         f"POST {CHAT_PREFIX}/admin/rooms/{{room_id}}/allow",
         f"GET {CHAT_PREFIX}/admin/rooms/{{room_id}}/messages",
         f"PUT {CHAT_PREFIX}/admin/rooms/{{room_id}}/settings",
+        f"GET {CHAT_PREFIX}/admin/rooms/{{room_id}}/notes",
+        f"PUT {CHAT_PREFIX}/admin/rooms/{{room_id}}/notes",
         f"GET {CHAT_PREFIX}/admin/users",
         f"GET {CHAT_PREFIX}/admin/rules",
         f"POST {CHAT_PREFIX}/admin/rules",

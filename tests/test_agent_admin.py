@@ -171,3 +171,55 @@ def test_admin_openapi_body_has_no_files_flag():
 
     schema = json.loads(openapi.export_agent())["components"]["schemas"]
     assert "agents_may_send_files" not in schema["AdminRoomSettingsIn"]["properties"]
+
+
+async def test_admin_notes_get_without_binding(admin, conn):
+    client, headers = admin
+    await seed(conn)
+    r = await client.get(f"/rooms/{DM}/notes", headers=headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["room_id"] == DM and body["body"] == "" and body["version"] == 0
+    assert body["rule"] and body["max_chars"] > 0
+
+
+async def test_admin_notes_item_update(admin, conn, caplog):
+    client, headers = admin
+    await seed(conn)
+    slug = {"X-Orch-Slug": "cron-dream"}
+    with caplog.at_level("INFO", logger="agents_matrix_connector.api.agent"):
+        put = await client.put(
+            f"/rooms/{DM}/notes",
+            json={"body": "- likes tea", "expected_version": 0},
+            headers={**headers, **slug},
+        )
+    assert put.status_code == 200, put.text
+    assert put.json()["version"] == 1 and put.json()["body"] == "- likes tea"
+    assert (await client.get(f"/rooms/{DM}/notes", headers=headers)).json()["version"] == 1
+    stale = await client.put(
+        f"/rooms/{DM}/notes", json={"body": "x", "expected_version": 0}, headers=headers
+    )
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "version_conflict"
+    lines = [x.getMessage() for x in caplog.records if "admin notes update" in x.getMessage()]
+    assert lines == [f"admin notes update session=cron-dream room={DM}"]
+    assert "likes tea" not in caplog.text
+
+
+async def test_admin_notes_unknown_room_404(admin, conn):
+    client, headers = admin
+    await seed(conn)
+    assert (await client.get("/rooms/!nope:x/notes", headers=headers)).status_code == 404
+    r = await client.put(
+        "/rooms/!nope:x/notes", json={"body": "x", "expected_version": 0}, headers=headers
+    )
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "not_found"
+
+
+async def test_admin_notes_need_bearer(admin, conn):
+    client, _ = admin
+    await seed(conn)
+    assert (await client.get(f"/rooms/{DM}/notes")).status_code == 401
+    r = await client.put(f"/rooms/{DM}/notes", json={"body": "x", "expected_version": 0})
+    assert r.status_code == 401

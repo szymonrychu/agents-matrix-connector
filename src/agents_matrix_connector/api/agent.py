@@ -88,6 +88,8 @@ _ADMIN_ROUTES = frozenset(
         ("/rules/{rule_id}", "DELETE"),
         ("/room-requests", "POST"),
         ("/room-requests/{request_id}", "GET"),
+        ("/rooms/{room_id}/notes", "GET"),
+        ("/rooms/{room_id}/notes", "PUT"),
     }
 )
 HEALTH_METHODS = frozenset({"GET", "HEAD"})
@@ -1084,16 +1086,7 @@ def build_chat_router(
     notes_errors = _errors(400, 401, 409, 413, 422, 503)
 
     def room_notes(room_id: str, row: notes.NotesRow | None) -> RoomNotes:
-        body = row.body if row else ""
-        return RoomNotes(
-            room_id=room_id,
-            body=body,
-            version=row.version if row else 0,
-            updated_at=row.updated_at if row else None,
-            chars=len(body),
-            max_chars=settings.room_notes_max_chars,
-            rule=memory_rule(settings),
-        )
+        return _room_notes(settings, room_id, row)
 
     @router.get("/notes", response_model=RoomNotes, responses=_errors(400, 401, 409, 503))
     async def get_notes(who: Annotated[Caller, Depends(caller)]) -> RoomNotes:
@@ -1114,19 +1107,10 @@ def build_chat_router(
     async def put_notes(who: Annotated[Caller, Depends(caller)], body: NotesIn) -> RoomNotes:
         """Replace the notes of the room this session is bound to, guarded by the version read
         before (0 creates); an empty body forgets them. Over the cap is 413."""
-        cap = settings.room_notes_max_chars
-        if len(body.body) > cap:
-            raise ApiError(
-                413,
-                "notes_too_large",
-                f"body: at most {cap} characters, got {len(body.body)}",
-            )
+        _check_notes_cap(settings, body)
         async with pool.connection() as conn, conn.transaction():
             room_id = await _own_room(conn, who)
-            row = await notes.put(conn, room_id, body.body, body.expected_version, who.slug)
-            if row is None:
-                current = await notes.get(conn, room_id)
-                raise _version_conflict(body.expected_version, current.version if current else 0)
+            row = await _store_notes(conn, room_id, body, who.slug)
         log.info(
             "notes write session=%s room=%s version=%s chars=%s",
             who.session_id,
@@ -1255,6 +1239,79 @@ def build_chat_router(
     return router
 
 
+def _room_notes(settings: ApiSettings, room_id: str, row: notes.NotesRow | None) -> RoomNotes:
+    body = row.body if row else ""
+    return RoomNotes(
+        room_id=room_id,
+        body=body,
+        version=row.version if row else 0,
+        updated_at=row.updated_at if row else None,
+        chars=len(body),
+        max_chars=settings.room_notes_max_chars,
+        rule=memory_rule(settings),
+    )
+
+
+def _check_notes_cap(settings: ApiSettings, body: NotesIn) -> None:
+    cap = settings.room_notes_max_chars
+    if len(body.body) > cap:
+        raise ApiError(
+            413, "notes_too_large", f"body: at most {cap} characters, got {len(body.body)}"
+        )
+
+
+async def _store_notes(
+    conn: psycopg.AsyncConnection, room_id: str, body: NotesIn, slug: str | None
+) -> notes.NotesRow:
+    row = await notes.put(conn, room_id, body.body, body.expected_version, slug)
+    if row is None:
+        current = await notes.get(conn, room_id)
+        raise _version_conflict(body.expected_version, current.version if current else 0)
+    return row
+
+
+def build_admin_notes_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRouter:
+    """The notes of any known room by id for the superleader and cron sessions, which are
+    room-unbound. The same item-level body and version guard as the bound-session routes."""
+    router = APIRouter()
+
+    async def require_room(room_id: str) -> None:
+        if await directory.get_room(pool, room_id) is None:
+            raise ApiError(404, "not_found", f"room {room_id!r} not found")
+
+    @router.get(
+        "/rooms/{room_id}/notes",
+        response_model=RoomNotes,
+        responses=_errors(401, 404, 503),
+    )
+    async def get_admin_notes(room_id: str) -> RoomNotes:
+        """The notes of any known room (empty, version 0, when none); needs no binding."""
+        await require_room(room_id)
+        async with pool.connection() as conn:
+            row = await notes.get(conn, room_id)
+        return _room_notes(settings, room_id, row)
+
+    @router.put(
+        "/rooms/{room_id}/notes",
+        response_model=RoomNotes,
+        responses=_errors(401, 404, 409, 413, 422, 503),
+    )
+    async def put_admin_notes(
+        room_id: str,
+        body: NotesIn,
+        slug: Annotated[str | None, Header(alias="X-Orch-Slug")] = None,
+    ) -> RoomNotes:
+        """Replace the notes of any known room, guarded by the version read before."""
+        _check_notes_cap(settings, body)
+        await require_room(room_id)
+        async with pool.connection() as conn, conn.transaction():
+            row = await _store_notes(conn, room_id, body, slug)
+        log.info("admin notes update session=%s room=%s", slug, room_id)
+        return _room_notes(settings, room_id, row)
+
+    return router
+
+
 def build_admin_router(
     pool: AsyncConnectionPool, orchestrator: Any, settings: ApiSettings
 ) -> APIRouter:
@@ -1265,6 +1322,7 @@ def build_admin_router(
         build_rooms_router(pool, orchestrator, settings, admin=True),
         build_rules_router(pool, orchestrator),
         build_room_requests_router(pool, settings),
+        build_admin_notes_router(pool, settings),
     ):
         admin.routes.extend(
             route
