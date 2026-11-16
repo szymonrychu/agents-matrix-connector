@@ -2,6 +2,15 @@
 
 Lessons that outlive a session. Newest first.
 
+## 2026-11-16 decisions
+
+- Withheld attachment guard (T-420 final review): sync stores body and media_url of `not_allowed`
+  rows, so "withheld" is a read-time property. `api.history.withheld_kind(reason)` is the one
+  predicate; POST /chat/v1/attachments answers 409 `no_attachment` (same body as a row without
+  file) and the fetcher refuses with `no_attachment` for any withheld row, so a denied sender's
+  file is neither revealed nor delivered. Withheld rows also null `from` for all four kinds, as
+  the spec says (the code had nulled it for denied only).
+
 ## 2026-11-15 decisions
 
 Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
@@ -445,7 +454,7 @@ Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
   keyset paging on (at, kind, id); s and o rows sort by created_at so a cursor stays put while a
   send is delivered. One SQL fragment (_REPLY_TO) resolves an event id to m/s/o/unknown for both
   inbound replies and worker replies. `history.parse_ref` is the m/s/o id parser for the feed
-  (sends.parse_ref still parses the m/s references of the send routes). `status` is null on m
+  (the send routes use it too). `status` is null on m
   items: the inbound queue status is internal; s and o items carry their delivery status. In an
   anonymized room a `from` filter that is not a pseudonym returns an empty page rather than an
   error, so a real name is never resolved or confirmed.
