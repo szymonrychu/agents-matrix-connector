@@ -269,3 +269,19 @@ async def test_auth_and_throttle_errors_keep_answer_pending(
     await d.aclose()
     assert await answer_status(conn, event_id) == ("pending", None)
     assert hs.sent(ROOM) == []
+
+
+async def test_answer_without_decision_ids_is_finished_not_sent(step, hs, board, conn):
+    event_id = "$orphan"
+    await conn.execute(
+        "INSERT INTO approval_answers (event_id, room_id, sender, target_event_id, verdict,"
+        " status) VALUES (%s, %s, %s, '$unknown', 'go', 'pending')",
+        (event_id, ROOM, APPROVER),
+    )
+    await step.tick()
+    assert board.answers == []
+    assert await answer_status(conn, event_id) == ("done", [])
+    assert bodies(hs) == ["Nothing to answer here."]
+    await step.tick()
+    assert board.answers == []
+    assert bodies(hs) == ["Nothing to answer here."]

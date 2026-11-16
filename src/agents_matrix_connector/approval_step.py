@@ -24,6 +24,7 @@ from agents_matrix_connector.settings import BotSettings
 log = logging.getLogger(__name__)
 
 POST_LIMIT = 20
+NOTHING_TO_ANSWER = "Nothing to answer here."
 REPLY_PHRASES = {
     "already_answered": "already answered",
     "expired": "expired",
@@ -68,6 +69,11 @@ class ApprovalStep:
         async with self._pool.connection() as conn:
             pending = await repo.claim_pending_answers(conn)
         for answer in pending:
+            if not answer.decision_ids:
+                async with self._pool.connection() as conn:
+                    await repo.finish_answer(conn, answer.event_id, [])
+                await self._reply(answer, NOTHING_TO_ANSWER)
+                continue
             items = [
                 {"id": d, "verdict": answer.verdict, "answer_ref": answer.event_id}
                 for d in answer.decision_ids
@@ -86,18 +92,21 @@ class ApprovalStep:
                 refusal = None
             async with self._pool.connection() as conn:
                 await repo.finish_answer(conn, answer.event_id, results)
-            text = refusal or reply_text(results)
-            if text is not None:
-                await self._matrix.send_event(
-                    answer.room_id,
-                    "m.room.message",
-                    f"approval-reply-{answer.event_id}",
-                    {
-                        "msgtype": "m.text",
-                        "body": text,
-                        "m.relates_to": {"m.in_reply_to": {"event_id": answer.event_id}},
-                    },
-                )
+            await self._reply(answer, refusal or reply_text(results))
+
+    async def _reply(self, answer: repo.PendingAnswer, text: str | None) -> None:
+        if text is None:
+            return
+        await self._matrix.send_event(
+            answer.room_id,
+            "m.room.message",
+            f"approval-reply-{answer.event_id}",
+            {
+                "msgtype": "m.text",
+                "body": text,
+                "m.relates_to": {"m.in_reply_to": {"event_id": answer.event_id}},
+            },
+        )
 
     async def _post_new(self) -> None:
         assert self._delegate is not None

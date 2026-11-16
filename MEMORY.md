@@ -4,6 +4,10 @@ Lessons that outlive a session. Newest first.
 
 ## 2026-11-16 decisions
 
+- Orphan approval answers (S-63 retro F2, 2026-11-16): `_answer_pending` finishes an answer whose
+  target resolves to no decision ids (results `[]`) and replies "Nothing to answer here." instead
+  of posting an empty batch (the taskboard rejects `items` with min_length=1, so it would retry
+  forever). It never calls the taskboard for such an answer.
 - Withheld attachment guard (T-420 final review): sync stores body and media_url of `not_allowed`
   rows, so "withheld" is a read-time property. `api.history.withheld_kind(reason)` is the one
   predicate; POST /chat/v1/attachments answers 409 `no_attachment` (same body as a row without
