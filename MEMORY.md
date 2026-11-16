@@ -511,3 +511,54 @@ Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
   exception type name and crawl id are logged; a failure while settling never masks it.
 - `retry_after_seconds` accepts only ASCII digits in `Retry-After` (superscript two passes `isdigit()`
   but `float` raises).
+
+## Approvals foundation (2026-11-16, S-63, Task 17)
+
+- Migration is `0012_approvals.sql` (0011 was taken by chat history). Tables `approval_digests`,
+  `approval_messages`, `approval_answers`: the connector is their only writer; answers are a
+  pending/done queue. `test_migration_0011_resets_sync_filter` now indexes `MIGRATIONS[-2]`
+  because it targets the 0011 migration, no longer the last one.
+- `BotSettings.approvals_room` empty turns approvals off; when set, the taskboard url and token,
+  and at least one approver are required, and approvers must not overlap the bot's own
+  identities or bridge bots (a bridged puppet or the bot itself must never answer).
+- `approvals.py` verdict parsers are exact-match only (whole text in a small set): anything
+  ambiguous is not a verdict and stays chat. The delegate client always sends `source: "matrix"`.
+
+## Approval answers from Matrix (2026-11-16, S-63, Task 19)
+
+- Sync intercepts approval answers in `_apply_joined` before message intake, never in
+  `_apply_event`: the pre-join history crawl also goes through `_apply_event`, and an old
+  reaction must never answer an approval. Only events recorded as answers are skipped; an
+  ambiguous reply falls through and reaches the bound session as chat.
+- `m.reaction` joins the sync filter and the gap backfill (`BACKFILL_FILTER`,
+  `_messages_oldest_first`), so a reaction during a limited sync is not lost. It is not a
+  room-info type, so it never triggers a state fetch.
+- A digest target accepts only `digest_verdict` text ("all go"); a plain "go" on a digest is
+  chat. Answers are sent before new approvals are posted in each tick; a retryable delegate
+  error (no response, 5xx, 401, 403, 408, 429) stops the tick and leaves the row pending; any other
+  4xx finishes it with `[{"error": status}]` so one bad row cannot block the queue, and posts
+  "Could not answer D-<id>: <status>." as a reply to the approver's event (2026-11-16, review fix).
+- The delegate client refuses an `items` that is not a list of objects (non-retryable
+  `TaskboardError`); `_normalise` strips trailing spaces with the punctuation ("go ." is go).
+
+## Approvals chart, e2e and the approvals room (2026-11-16, S-63, Task 20)
+
+- `approvals.room`, `approvals.approverIds` and `approvals.taskboard` (url, token or tokenSecret)
+  render MATRIX_APPROVALS_ROOM, MATRIX_APPROVER_IDS and MATRIX_TASKBOARD_URL into the ConfigMap and
+  MATRIX_TASKBOARD_TOKEN as a secretKeyRef in the bot container only (the api and migrate never
+  hold a delegate token). With a room set, a missing approver list, url, token source or both
+  token sources fail the render.
+- Approvers must be disjoint from the bot identities and bridge bots (settings check): a
+  double puppet could otherwise forge a reaction as an approver, and an agent that can make the
+  bot or a puppet speak would approve its own request.
+- The answer inbox is the connector's `approval_answers` table (pending/done): the sync loop only
+  records, the bot step sends to the taskboard, so a taskboard outage retries instead of losing
+  an answer. A digest is bound to its own decision ids, so "all go" never answers a later approval.
+- Reaction keys are normalised before matching because the emoji keys the bridge carries are
+  undocumented.
+- Verified: the answer intercept (`_approval_answer` in `_apply_joined`) runs for every joined
+  room before rules and classification are consulted, so the approvals room needs no allow rule and
+  no bridge state. The e2e proves it with a bare room and no rule. A non-answer message in that
+  room still takes the normal intake path (default deny drops it).
+- `FakeHomeserver.events(room_id)` returns the room's full events, so a test can react to an event
+  the bot posted (event ids are positional, not predictable).

@@ -34,12 +34,16 @@ from agents_common.fake_orchestrator import FakeOrchestrator
 from psycopg import sql
 
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
+from agents_matrix_connector.fake_taskboard import FakeTaskboard
 
 ORCH_TOKEN = "e2e-orchestrator-token"
 HS_TOKEN = "e2e-homeserver-token"
+TASKBOARD_TOKEN = "e2e-taskboard-token"
 SERVER = "e2e.test"
 BOT = f"@agents:{SERVER}"
 BRIDGE_BOT = f"@facebookbot:{SERVER}"
+APPROVALS_ROOM = "!approvals:test"
+APPROVER = f"@approver:{SERVER}"
 WAIT_SECONDS = 30.0
 API = "/matrix/api/v1"
 CHAT = "/chat/v1"
@@ -145,8 +149,10 @@ class Stack:
         self.db_name = f"e2e_{uuid.uuid4().hex}"
         self.hs = FakeHomeserver(BOT, HS_TOKEN)
         self.orch = FakeOrchestrator(ORCH_TOKEN)
+        self.taskboard = FakeTaskboard(TASKBOARD_TOKEN)
         self.hs_server = Served(self.hs.app, "fake homeserver")
         self.orch_server = Served(self.orch.app, "fake orchestrator")
+        self.taskboard_server = Served(self.taskboard.app, "fake taskboard")
         self.api_port, self.bot_port, self.agent_port = free_port(), free_port(), free_port()
         self.agent_token = secrets.token_hex(32)
         self.procs: dict[str, subprocess.Popen] = {}
@@ -166,6 +172,10 @@ class Stack:
             "MATRIX_USER_ID": BOT,
             "MATRIX_ACCESS_TOKEN": HS_TOKEN,
             "MATRIX_BRIDGE_BOTS": BRIDGE_BOT,
+            "MATRIX_APPROVALS_ROOM": APPROVALS_ROOM,
+            "MATRIX_APPROVER_IDS": APPROVER,
+            "MATRIX_TASKBOARD_URL": self.taskboard_server.url,
+            "MATRIX_TASKBOARD_TOKEN": TASKBOARD_TOKEN,
             "MATRIX_HTTP_HOST": "127.0.0.1",
             "MATRIX_HTTP_PORT": str(port),
             "MATRIX_AGENT_PORT": str(self.agent_port),
@@ -190,6 +200,10 @@ class Stack:
             conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(self.db_name)))
         self.hs_server.start()
         self.orch_server.start()
+        self.taskboard_server.start()
+        self.hs_server.call(
+            self.hs.add_room, APPROVALS_ROOM, [], {BOT: "Agents bot", APPROVER: "Approver"}
+        )
         self.preset_id = str(self.orch_server.call(self.orch.add_preset, "chat").id)
         migrate = subprocess.run(
             [console_script(), "migrate"],
@@ -241,6 +255,7 @@ class Stack:
                 proc.stderr.close()
         self.hs_server.stop()
         self.orch_server.stop()
+        self.taskboard_server.stop()
         with (
             contextlib.suppress(psycopg.Error),
             psycopg.connect(self.admin_url, autocommit=True) as conn,

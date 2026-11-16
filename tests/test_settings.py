@@ -279,3 +279,57 @@ def test_history_crawl_max_events(monkeypatch):
     assert load_settings(BotSettings).history_crawl_max_events == 0
     monkeypatch.setenv("MATRIX_HISTORY_CRAWL_MAX_EVENTS", "-1")
     assert "MATRIX_HISTORY_CRAWL_MAX_EVENTS" in problems()
+
+
+APPROVER = "@facebook_100000241356957:szymonrichert.pl"
+
+
+def approvals_env(monkeypatch, **overrides):
+    env = {
+        "MATRIX_APPROVALS_ROOM": "!r:x",
+        "MATRIX_TASKBOARD_URL": "http://agents-taskboard-delegate:8003",
+        "MATRIX_TASKBOARD_TOKEN": "t",
+        "MATRIX_APPROVER_IDS": APPROVER,
+        **overrides,
+    }
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+
+def test_approvals_off_by_default():
+    assert not load_settings(BotSettings).approvals_enabled
+
+
+def test_approvals_settings_valid(monkeypatch):
+    approvals_env(monkeypatch)
+    s = load_settings(BotSettings)
+    assert s.approvals_enabled
+    assert s.approver_ids == [APPROVER]
+    assert s.taskboard_token.get_secret_value() == "t"
+    assert "SecretStr" in repr(s.taskboard_token)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    ["MATRIX_USER_ID", "MATRIX_SELF_IDENTITIES", "MATRIX_BRIDGE_BOTS"],
+)
+def test_approvals_settings_refuse_overlap(monkeypatch, identity):
+    bot_id = "@someone:example.org"
+    approvals_env(monkeypatch, MATRIX_APPROVER_IDS=f"{APPROVER},{bot_id}")
+    monkeypatch.setenv(identity, bot_id)
+    assert problems()["MATRIX_APPROVER_IDS"] == (
+        "must not include MATRIX_USER_ID, MATRIX_SELF_IDENTITIES or MATRIX_BRIDGE_BOTS"
+    )
+
+
+def test_approvals_settings_required_parts(monkeypatch):
+    approvals_env(monkeypatch, MATRIX_TASKBOARD_TOKEN=" ")
+    assert problems()["MATRIX_TASKBOARD_TOKEN"] == "required when MATRIX_APPROVALS_ROOM is set"
+    approvals_env(monkeypatch, MATRIX_TASKBOARD_TOKEN="t", MATRIX_TASKBOARD_URL="taskboard")
+    assert problems()["MATRIX_TASKBOARD_URL"] == "required when MATRIX_APPROVALS_ROOM is set"
+    approvals_env(monkeypatch, MATRIX_TASKBOARD_URL="http://tb", MATRIX_APPROVER_IDS="")
+    assert problems()["MATRIX_APPROVER_IDS"] == "required when MATRIX_APPROVALS_ROOM is set"
+    approvals_env(monkeypatch, MATRIX_APPROVER_IDS=APPROVER, MATRIX_APPROVALS_ROOM="#alias:x")
+    assert problems()["MATRIX_APPROVALS_ROOM"] == "not a room id"
+    approvals_env(monkeypatch, MATRIX_APPROVALS_ROOM="!r:x", MATRIX_APPROVER_IDS="nobody")
+    assert problems()["MATRIX_APPROVER_IDS"] == "not a Matrix user id (@name:server)"

@@ -34,6 +34,7 @@ TYPES = [
     "m.room.encryption",
     "m.bridge",
     "uk.half-shot.bridge",
+    "m.reaction",
 ]
 
 

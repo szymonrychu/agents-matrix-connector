@@ -156,6 +156,7 @@ async def test_work_loop_runs_room_requests_then_fetcher_then_crawler():
             Step("sender"),
             Step("tracker"),
             Step("rooms"),
+            Step("approvals"),
             Step("fetcher"),
             Step("crawler", True),
             settings,
@@ -163,7 +164,7 @@ async def test_work_loop_runs_room_requests_then_fetcher_then_crawler():
         ),
         5,
     )
-    assert order == ["worker", "sender", "tracker", "rooms", "fetcher", "crawler"]
+    assert order == ["worker", "sender", "tracker", "rooms", "approvals", "fetcher", "crawler"]
 
 
 def bridge_transport(answer):

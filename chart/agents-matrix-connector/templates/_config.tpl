@@ -29,6 +29,17 @@ MATRIX_ROOM_SKILLS_MAX: {{ .Values.limits.roomSkillsMax | int | toString | quote
 {{- with .Values.roomMemory.rule }}
 MATRIX_ROOM_MEMORY_RULE: {{ . | quote }}
 {{- end }}
+{{- with .Values.approvals }}
+{{- if .room }}
+{{- $_ := include "agents-matrix-connector.taskboardSecretName" $ }}
+{{- if not .approverIds }}
+{{- fail "agents-matrix-connector: approvals.approverIds is required with approvals.room" }}
+{{- end }}
+MATRIX_APPROVALS_ROOM: {{ .room | quote }}
+MATRIX_APPROVER_IDS: {{ join "," .approverIds | quote }}
+MATRIX_TASKBOARD_URL: {{ required "approvals.taskboard.url is required with approvals.room" .taskboard.url | quote }}
+{{- end }}
+{{- end }}
 {{- range $k, $v := .Values.env }}
 {{- if not (hasPrefix "MATRIX_" $k) }}
 {{- fail (printf "agents-matrix-connector: env key %q must start with MATRIX_" $k) }}

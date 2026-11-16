@@ -325,6 +325,48 @@ def parse_message(
     )
 
 
+@dataclass(frozen=True)
+class ApprovalEvent:
+    """An approver's reaction (`reaction_key`) or quoted reply (`text`) on `target_event_id`
+    in the approvals room; whether it is a verdict on an approval is decided later."""
+
+    event_id: str
+    sender: str
+    target_event_id: str
+    reaction_key: str | None
+    text: str | None
+
+
+def parse_approval_event(
+    room_id: str, event: dict, approvals_room: str, approver_ids: frozenset[str]
+) -> ApprovalEvent | None:
+    """None unless the event is in the approvals room, sent by an approver, and is either an
+    `m.annotation` reaction or an `m.text` reply (`m.in_reply_to`) that is not an edit."""
+    sender = event.get("sender")
+    if room_id != approvals_room or sender not in approver_ids:
+        return None
+    event_id = str(event.get("event_id", ""))
+    content = _content(event)
+    relates = content.get("m.relates_to")
+    if not isinstance(relates, dict):
+        return None
+    if event.get("type") == "m.reaction":
+        target, key = relates.get("event_id"), relates.get("key")
+        if relates.get("rel_type") != "m.annotation" or not isinstance(target, str):
+            return None
+        return ApprovalEvent(event_id, sender, target, key, None) if isinstance(key, str) else None
+    if event.get("type") != "m.room.message" or content.get("msgtype") != "m.text":
+        return None
+    if relates.get("rel_type") == "m.replace":
+        return None
+    reply = relates.get("m.in_reply_to")
+    target = reply.get("event_id") if isinstance(reply, dict) else None
+    body = content.get("body")
+    if not isinstance(target, str) or not isinstance(body, str):
+        return None
+    return ApprovalEvent(event_id, sender, target, None, body)
+
+
 MAX_ALIASES = 10
 MAX_ALIAS_CHARS = 64
 

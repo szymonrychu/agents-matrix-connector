@@ -99,6 +99,26 @@ agentApi:
     name: ""
     key: token-sha256
 
+# Approvals: the bot mirrors open taskboard approvals into one Matrix room and turns an approver's
+# reaction or quoted reply into an answer through the taskboard delegate listener. Empty room
+# turns it off (and renders nothing below). With a room, approverIds, taskboard.url and exactly
+# one of taskboard.token and taskboard.tokenSecret.name are required. The approvers must not be
+# the bot, its self identities or the bridge bots. The delegate token reaches the bot container
+# only, never the api.
+approvals:
+  # MATRIX_APPROVALS_ROOM: Matrix room id (!id:server) the approvals are posted and answered in.
+  room: ""
+  # MATRIX_APPROVER_IDS: Matrix user ids whose reactions and replies answer (comma joined).
+  approverIds: []
+  taskboard:
+    # MATRIX_TASKBOARD_URL: the agents-taskboard delegate listener base.
+    url: ""
+    # Chart Secret key taskboard-token; or tokenSecret (a Secret you manage).
+    token: ""
+    tokenSecret:
+      name: ""
+      key: token
+
 # Extra MATRIX_* settings; keys must start with MATRIX_.
 env: {}
 

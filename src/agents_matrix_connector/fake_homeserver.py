@@ -278,6 +278,10 @@ class FakeHomeserver:
         """Contents the bot sent into the room, in order, one per distinct transaction."""
         return copy.deepcopy(self._sent.get(room_id, []))
 
+    def events(self, room_id: str) -> list[dict]:
+        """Every timeline event of the room (full events with `event_id` and `sender`), in order."""
+        return [copy.deepcopy(event) for _, event in self._room(room_id).timeline]
+
     def sent_events(self, room_id: str) -> list[tuple[str, dict]]:
         """`(event type, content)` the bot sent into the room, in order."""
         return copy.deepcopy(self._sent_events.get(room_id, []))

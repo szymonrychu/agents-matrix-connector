@@ -171,6 +171,26 @@ class BotSettings(ConnectorSettings):
     """mautrix-meta provisioning base (`.../_matrix/provision`); empty disables Facebook
     targets (`bridge_unconfigured`)."""
 
+    taskboard_url: str = ""
+    """agents-taskboard delegate listener base; used only when approvals are on."""
+    taskboard_token: SecretStr = Field(SecretStr(""), repr=False)
+    approvals_room: str = ""
+    """Matrix room id where approvals are posted and answered; empty turns approvals off."""
+    approver_ids: CsvList = []
+    """Matrix user ids whose reactions and replies answer approvals."""
+
+    @property
+    def approvals_enabled(self) -> bool:
+        return bool(self.approvals_room)
+
+    @field_validator("approver_ids")
+    @classmethod
+    def _approver_ids(cls, value: list[str], info: ValidationInfo) -> list[str]:
+        for item in value:
+            if not USER_ID_RE.match(item):
+                raise ValueError(f"{_var(info)}::not a Matrix user id (@name:server)")
+        return value
+
     @field_validator("bridge_provisioning_url")
     @classmethod
     def _bridge_provisioning_url(cls, value: str, info: ValidationInfo) -> str:
@@ -191,4 +211,25 @@ class BotSettings(ConnectorSettings):
             self.access_token = SecretStr(text)
         if not self.access_token.get_secret_value():
             raise ValueError("MATRIX_ACCESS_TOKEN::required")
+        return self
+
+    @model_validator(mode="after")
+    def _approvals(self):
+        if not self.approvals_room:
+            return self
+        if not self.approvals_room.startswith("!"):
+            raise ValueError("MATRIX_APPROVALS_ROOM::not a room id")
+        parsed = urlparse(self.taskboard_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("MATRIX_TASKBOARD_URL::required when MATRIX_APPROVALS_ROOM is set")
+        self.taskboard_url = self.taskboard_url.rstrip("/")
+        if not self.taskboard_token.get_secret_value().strip():
+            raise ValueError("MATRIX_TASKBOARD_TOKEN::required when MATRIX_APPROVALS_ROOM is set")
+        if not self.approver_ids:
+            raise ValueError("MATRIX_APPROVER_IDS::required when MATRIX_APPROVALS_ROOM is set")
+        if set(self.approver_ids) & (self.self_ids() | set(self.bridge_bots)):
+            raise ValueError(
+                "MATRIX_APPROVER_IDS::must not include MATRIX_USER_ID,"
+                " MATRIX_SELF_IDENTITIES or MATRIX_BRIDGE_BOTS"
+            )
         return self
