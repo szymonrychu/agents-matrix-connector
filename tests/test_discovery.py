@@ -3,6 +3,7 @@ import re
 import pytest
 
 from agents_matrix_connector.discovery import (
+    ApprovalEvent,
     Candidate,
     Edit,
     Media,
@@ -17,6 +18,7 @@ from agents_matrix_connector.discovery import (
     facebook_id,
     mentions_self,
     normalize_aliases,
+    parse_approval_event,
     parse_edit,
     parse_message,
     parse_redaction,
@@ -465,3 +467,66 @@ def test_bundled_edit_same_sender_only():
     event = {**msg(), **bundled("@alice:hs.test")}
     result = parse_message("!r", event, SELF, BOTS)
     assert (result.body, result.edited_body, result.edited_ts) == ("hi", "latest", 9)
+
+
+APPROVALS = "!approvals:hs.test"
+APPROVER = "@owner:hs.test"
+APPROVERS = frozenset({APPROVER})
+
+
+def reaction(sender=APPROVER, key="\N{THUMBS UP SIGN}", target="$a412"):
+    relates = {"rel_type": "m.annotation", "event_id": target, "key": key}
+    return {
+        "type": "m.reaction",
+        "event_id": "$r",
+        "sender": sender,
+        "content": {"m.relates_to": relates},
+    }
+
+
+def reply(body, sender=APPROVER, target="$a412", **relates):
+    content = {
+        "msgtype": "m.text",
+        "body": body,
+        "m.relates_to": {"m.in_reply_to": {"event_id": target}, **relates},
+    }
+    return {"type": "m.room.message", "event_id": "$t", "sender": sender, "content": content}
+
+
+def test_approval_reaction_from_approver_parsed():
+    assert parse_approval_event(APPROVALS, reaction(), APPROVALS, APPROVERS) == ApprovalEvent(
+        "$r", APPROVER, "$a412", "\N{THUMBS UP SIGN}", None
+    )
+
+
+def test_approval_event_ignores_other_room_and_other_senders():
+    assert parse_approval_event("!other:hs.test", reaction(), APPROVALS, APPROVERS) is None
+    for sender in ("@me:hs.test", BOTS[0], GHOST, "@stranger:hs.test"):
+        assert parse_approval_event(APPROVALS, reaction(sender), APPROVALS, APPROVERS) is None
+        assert parse_approval_event(APPROVALS, reply("go", sender), APPROVALS, APPROVERS) is None
+
+
+def test_approval_reply_parsed_and_edit_ignored():
+    assert parse_approval_event(APPROVALS, reply("go"), APPROVALS, APPROVERS) == ApprovalEvent(
+        "$t", APPROVER, "$a412", None, "go"
+    )
+    edit = reply("go", rel_type="m.replace", event_id="$t0")
+    assert parse_approval_event(APPROVALS, edit, APPROVALS, APPROVERS) is None
+
+
+def test_approval_event_needs_well_formed_relation():
+    no_key = reaction()
+    del no_key["content"]["m.relates_to"]["key"]
+    other_rel = reaction()
+    other_rel["content"]["m.relates_to"]["rel_type"] = "m.thread"
+    no_reply = {
+        "type": "m.room.message",
+        "event_id": "$t",
+        "sender": APPROVER,
+        "content": {"msgtype": "m.text", "body": "go"},
+    }
+    notice = reply("go")
+    notice["content"]["msgtype"] = "m.notice"
+    bad_target = reply("go", target=None)
+    for event in (no_key, other_rel, no_reply, notice, bad_target):
+        assert parse_approval_event(APPROVALS, event, APPROVALS, APPROVERS) is None

@@ -31,6 +31,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from agents_matrix_connector import discovery, policy
 from agents_matrix_connector.clock import utcnow
+from agents_matrix_connector.db import approvals as approvals_repo
 from agents_matrix_connector.db import directory, inbound, room_requests, rules
 from agents_matrix_connector.matrix import (
     MatrixAuthError,
@@ -53,11 +54,13 @@ EVENT_TYPES = [
     "m.room.encryption",
     "m.bridge",
     "uk.half-shot.bridge",
+    "m.reaction",
 ]
 ROOM_INFO_TYPES = frozenset(EVENT_TYPES) - {
     *discovery.MESSAGE_TYPES,
     "m.room.member",
     "m.room.redaction",
+    "m.reaction",
 }
 REDACTED = inbound.REDACTED
 HISTORY = inbound.HISTORY
@@ -80,7 +83,9 @@ QUEUE_FULL = "queue_full"
 _BODYLESS = frozenset({policy.ROOM_ENCRYPTED, policy.ROOM_INFRASTRUCTURE, UNSUPPORTED_CONTENT})
 
 BACKFILL_PAGE = 100
-BACKFILL_FILTER = {"types": [*discovery.MESSAGE_TYPES, "m.room.member", "m.room.redaction"]}
+BACKFILL_FILTER = {
+    "types": [*discovery.MESSAGE_TYPES, "m.room.member", "m.room.redaction", "m.reaction"]
+}
 
 BACKOFF_INITIAL_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 60.0
@@ -168,7 +173,7 @@ def _timestamp(event: Mapping) -> datetime | None:
 
 
 def _messages_oldest_first(newest_first: list[dict]) -> list[dict]:
-    wanted = (*discovery.MESSAGE_TYPES, "m.room.redaction")
+    wanted = (*discovery.MESSAGE_TYPES, "m.room.redaction", "m.reaction")
     return [e for e in reversed(newest_first) if e.get("type") in wanted]
 
 
@@ -215,6 +220,7 @@ class SyncLoop:
         self._now = now
         self._self_ids = settings.self_ids()
         self._bridge_bots = tuple(settings.bridge_bots)
+        self._approver_ids = frozenset(settings.approver_ids)
         self._puppet = re.compile(settings.puppet_pattern)
         self._bridge_server = settings.user_id.split(":", 1)[1]
         self._alias_pending: set[str] = set()
@@ -519,7 +525,23 @@ class SyncLoop:
         if newly_joined:
             timeline = _after_join(room, timeline, self._settings.user_id)
         for event in recovered + timeline:
+            if await self._approval_answer(conn, room_id, event):
+                continue
             await self._apply_event(conn, room_id, event, rule_list)
+
+    async def _approval_answer(
+        self, conn: psycopg.AsyncConnection, room_id: str, event: dict
+    ) -> bool:
+        """True when the event is an approver's verdict on a posted approval, recorded as a
+        pending answer; anything else goes on to message intake unchanged."""
+        if not self._settings.approvals_enabled:
+            return False
+        approval = discovery.parse_approval_event(
+            room_id, event, self._settings.approvals_room, self._approver_ids
+        )
+        return approval is not None and await approvals_repo.record_answer_event(
+            conn, room_id, approval
+        )
 
     async def _apply_event(
         self,

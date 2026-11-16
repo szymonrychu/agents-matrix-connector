@@ -32,6 +32,11 @@ def test_text_verdicts():
     assert [text_verdict(t) for t in texts] == [GO, GO, NO_GO, NO_GO, None, GO]
 
 
+def test_trailing_punctuation_after_space_is_ignored():
+    assert [text_verdict(t) for t in ("go .", "no-go !", "go . !")] == [GO, NO_GO, GO]
+    assert digest_verdict("all go .") == GO
+
+
 def test_digest_verdict():
     assert [digest_verdict(t) for t in ("all go", "All go!", "go")] == [GO, GO, None]
 
@@ -103,6 +108,20 @@ async def test_delegate_client_errors():
     with pytest.raises(TaskboardError) as unreachable:
         await down.open_approvals()
     assert unreachable.value.status is None and unreachable.value.retryable
+
+
+async def test_delegate_client_refuses_items_that_are_not_a_list():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"items": {"id": 1, "result": "answered"}})
+
+    client = TaskboardDelegate("http://tb", "t", transport=httpx.MockTransport(handler))
+    with pytest.raises(TaskboardError) as listed:
+        await client.open_approvals()
+    assert listed.value.status == 200 and not listed.value.retryable
+    with pytest.raises(TaskboardError) as answered:
+        await client.answer([{"id": 1, "verdict": GO}])
+    assert answered.value.status == 200 and not answered.value.retryable
+    await client.aclose()
 
 
 async def test_fake_taskboard_answers():

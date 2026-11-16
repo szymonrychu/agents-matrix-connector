@@ -523,3 +523,19 @@ Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
   identities or bridge bots (a bridged puppet or the bot itself must never answer).
 - `approvals.py` verdict parsers are exact-match only (whole text in a small set): anything
   ambiguous is not a verdict and stays chat. The delegate client always sends `source: "matrix"`.
+
+## Approval answers from Matrix (2026-11-16, S-63, Task 19)
+
+- Sync intercepts approval answers in `_apply_joined` before message intake, never in
+  `_apply_event`: the pre-join history crawl also goes through `_apply_event`, and an old
+  reaction must never answer an approval. Only events recorded as answers are skipped; an
+  ambiguous reply falls through and reaches the bound session as chat.
+- `m.reaction` joins the sync filter and the gap backfill (`BACKFILL_FILTER`,
+  `_messages_oldest_first`), so a reaction during a limited sync is not lost. It is not a
+  room-info type, so it never triggers a state fetch.
+- A digest target accepts only `digest_verdict` text ("all go"); a plain "go" on a digest is
+  chat. Answers are sent before new approvals are posted in each tick; a retryable delegate
+  error stops the tick and leaves the row pending, any other error finishes it with
+  `[{"error": status}]` so one bad row cannot block the queue.
+- The delegate client refuses an `items` that is not a list of objects (non-retryable
+  `TaskboardError`); `_normalise` strips trailing spaces with the punctuation ("go ." is go).

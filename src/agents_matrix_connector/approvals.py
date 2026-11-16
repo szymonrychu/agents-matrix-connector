@@ -54,14 +54,15 @@ class TaskboardDelegate:
         await self._client.aclose()
 
     async def open_approvals(self) -> list[dict]:
-        body = await self._call("GET", BASE, params={"status": "open", "limit": 200})
-        return list(body.get("items", []))
+        return await self._items("GET", BASE, params={"status": "open", "limit": 200})
 
     async def answer(self, items: list[dict]) -> list[dict]:
-        body = await self._call("POST", f"{BASE}/answer", json={"items": items, "source": "matrix"})
-        return list(body.get("items", []))
+        return await self._items(
+            "POST", f"{BASE}/answer", json={"items": items, "source": "matrix"}
+        )
 
-    async def _call(self, method: str, path: str, **kwargs: Any) -> dict:
+    async def _items(self, method: str, path: str, **kwargs: Any) -> list[dict]:
+        """The `items` list of a taskboard answer; anything but a list of objects is refused."""
         try:
             response = await self._client.request(method, path, **kwargs)
         except httpx.HTTPError as exc:
@@ -72,7 +73,10 @@ class TaskboardDelegate:
             body = response.json()
         except ValueError:
             raise TaskboardError(response.status_code, "taskboard answered non-JSON") from None
-        return body if isinstance(body, dict) else {}
+        items = body.get("items", []) if isinstance(body, dict) else []
+        if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
+            raise TaskboardError(response.status_code, "taskboard answered malformed items")
+        return items
 
 
 def approval_text(item: dict) -> str:
@@ -99,7 +103,7 @@ def reaction_verdict(key: str) -> str | None:
 
 def _normalise(body: str) -> str:
     lines = [ln for ln in body.splitlines() if ln.strip() and not ln.lstrip().startswith(">")]
-    return " ".join(" ".join(lines).split()).casefold().rstrip(".!")
+    return " ".join(" ".join(lines).split()).casefold().rstrip(" .!")
 
 
 def text_verdict(body: str) -> str | None:

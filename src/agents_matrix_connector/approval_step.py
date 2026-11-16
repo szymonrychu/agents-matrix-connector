@@ -24,6 +24,22 @@ from agents_matrix_connector.settings import BotSettings
 log = logging.getLogger(__name__)
 
 POST_LIMIT = 20
+REPLY_PHRASES = {
+    "already_answered": "already answered",
+    "expired": "expired",
+    "withdrawn": "was withdrawn",
+    "not_found": "is not open",
+}
+
+
+def reply_text(results: list[dict]) -> str | None:
+    """One short line naming every approval this answer did not answer, or None."""
+    parts = [
+        f"D-{r['id']} {REPLY_PHRASES.get(r.get('result'), 'is not open')}."
+        for r in results
+        if "id" in r and r.get("result") != "answered"
+    ]
+    return " ".join(parts) or None
 
 
 class ApprovalStep:
@@ -42,7 +58,42 @@ class ApprovalStep:
     async def tick(self) -> None:
         if self._delegate is None:
             return
+        await self._answer_pending()
         await self._post_new()
+
+    async def _answer_pending(self) -> None:
+        """Send each pending answer to the taskboard; a short reply quotes the answer event
+        when some of its approvals were not answered. Taskboard down: stop, retry next tick."""
+        assert self._delegate is not None
+        async with self._pool.connection() as conn:
+            pending = await repo.claim_pending_answers(conn)
+        for answer in pending:
+            items = [
+                {"id": d, "verdict": answer.verdict, "answer_ref": answer.event_id}
+                for d in answer.decision_ids
+            ]
+            try:
+                results = await self._delegate.answer(items)
+            except TaskboardError as exc:
+                if exc.retryable:
+                    log.warning("approvals: taskboard unavailable (%s); answers wait", exc)
+                    return
+                log.warning("approvals: answer %s refused (%s)", answer.event_id, exc)
+                results = [{"error": exc.status}]
+            async with self._pool.connection() as conn:
+                await repo.finish_answer(conn, answer.event_id, results)
+            text = reply_text(results)
+            if text is not None:
+                await self._matrix.send_event(
+                    answer.room_id,
+                    "m.room.message",
+                    f"approval-reply-{answer.event_id}",
+                    {
+                        "msgtype": "m.text",
+                        "body": text,
+                        "m.relates_to": {"m.in_reply_to": {"event_id": answer.event_id}},
+                    },
+                )
 
     async def _post_new(self) -> None:
         assert self._delegate is not None
