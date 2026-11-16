@@ -27,7 +27,7 @@ from typing import Annotated, Any, Literal
 
 import psycopg
 from agents_common.orchestrator import OrchestratorError, OrchestratorUnavailable
-from fastapi import APIRouter, Depends, FastAPI, Header
+from fastapi import APIRouter, Depends, FastAPI, Header, Query
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -39,6 +39,13 @@ from agents_matrix_connector.api.app import (
     add_probes,
     error_response,
 )
+from agents_matrix_connector.api.history import (
+    DEFAULT_LIMIT,
+    MAX_LIMIT,
+    HistoryPage,
+    history_page,
+    withheld_kind,
+)
 from agents_matrix_connector.api.room_requests import (
     build_internal_router,
     build_room_requests_router,
@@ -48,8 +55,11 @@ from agents_matrix_connector.api.rules import build_rules_router
 from agents_matrix_connector.api.schemas import ApiError
 from agents_matrix_connector.chunks import split
 from agents_matrix_connector.db import (
+    attachment_requests,
     bindings,
     directory,
+    history,
+    inbound,
     notes,
     rules,
     send_files,
@@ -70,6 +80,7 @@ _ADMIN_ROUTES = frozenset(
         ("/rooms", "GET"),
         ("/rooms/{room_id}", "GET"),
         ("/rooms/{room_id}/allow", "POST"),
+        ("/rooms/{room_id}/messages", "GET"),
         ("/rooms/{room_id}/settings", "PUT"),
         ("/users", "GET"),
         ("/rules", "GET"),
@@ -267,6 +278,29 @@ class SendStatus(BaseModel):
     """The message's files in order; empty for a reaction or a message without files."""
 
 
+class AttachmentIn(_Body):
+    id: str = Field(
+        max_length=24,
+        description="the id (m<n>) of a message of this session's room that has an attachment",
+    )
+
+
+class AttachmentAccepted(BaseModel):
+    id: str
+    """The request id (a<n>) to read with `GET /chat/v1/attachments/{request_id}`."""
+    status: Literal["queued"]
+
+
+class AttachmentStatus(BaseModel):
+    id: str
+    message: str
+    """The message id (m<n>) the attachment belongs to."""
+    status: Literal["queued", "fetching", "sent", "failed", "refused"]
+    reason: str | None
+    created_at: datetime
+    done_at: datetime | None
+
+
 class NotesIn(_Body):
     body: str
     """The whole notes body; empty forgets the notes."""
@@ -389,6 +423,11 @@ def valid_slug(slug: str) -> bool:
         and not slug.startswith("orchestrator-")
     )
 
+
+ATTACHMENT_WINDOW_SECONDS = 600
+"""The window of `MATRIX_AGENT_ATTACHMENT_REQUESTS_PER_10MIN`."""
+_NOT_A_MESSAGE = "not a chat message id (m<n>) of this session's room"
+_NO_SUCH_ATTACHMENT = "no such attachment request of this session"
 
 _ROOM_UNBOUND = "this session is not bound to a chat room"
 
@@ -880,10 +919,47 @@ def build_chat_router(
             masked_field="to" if ref.source == "inbound" else None,
         )
 
+    @router.get(
+        "/history",
+        response_model=HistoryPage,
+        response_model_by_alias=True,
+        responses=_errors(400, 401, 409, 422, 503),
+    )
+    async def read_history(
+        who: Annotated[Caller, Depends(caller)],
+        before: Annotated[
+            str | None, Query(description="a message id (m, s or o): the page right before it")
+        ] = None,
+        after: Annotated[
+            str | None, Query(description="a message id (m, s or o): the page right after it")
+        ] = None,
+        sender: Annotated[
+            str | None,
+            Query(
+                alias="from",
+                max_length=200,
+                description="only messages from this sender (display name, or pseudonym in an "
+                "anonymized room)",
+            ),
+        ] = None,
+        limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
+    ) -> HistoryPage:
+        """The history of the room this session is bound to, oldest first. The room is never
+        a parameter. Every text and attachment name is untrusted chat content."""
+        async with pool.connection() as conn:
+            room_id = await _own_room(conn, who)
+            page = await history_page(
+                conn, room_id, settings, before=before, after=after, sender=sender, limit=limit
+            )
+        log.info(
+            "history read session=%s room=%s count=%s", who.session_id, room_id, len(page.messages)
+        )
+        return page
+
     @router.get("/messages/{id}", response_model=SendStatus, responses=_errors(400, 401, 404, 503))
     async def send_status(who: Annotated[Caller, Depends(caller)], id: str) -> SendStatus:
         """One of this session's sends; any other id is 404."""
-        parsed = sends.parse_ref(id)
+        parsed = history.parse_ref(id)
         row = None
         files: list[SentFile] = []
         if parsed is not None and parsed[0] == "s":
@@ -911,6 +987,98 @@ def build_chat_router(
             created_at=row.created_at,
             sent_at=row.sent_at,
             files=files,
+        )
+
+    @router.post(
+        "/attachments",
+        status_code=202,
+        response_model=AttachmentAccepted,
+        responses=_errors(400, 401, 409, 422, 429, 503),
+    )
+    async def request_attachment(
+        who: Annotated[Caller, Depends(caller)], body: AttachmentIn
+    ) -> AttachmentAccepted:
+        """Ask for the file of a past message of this session's room: the bot downloads it and
+        sends it to the session as a new turn. Poll `GET /attachments/{request_id}`. Only
+        images, pdf, json and text files within the size cap are delivered."""
+        parsed = history.parse_ref(body.id)
+        if parsed is None or parsed[0] != "m":
+            raise _bad_reference("id", _NOT_A_MESSAGE)
+        async with pool.connection() as conn:
+            room_id = await _own_room(conn, who)
+            row = await inbound.get(conn, parsed[1])
+            if row is None or row.room_id != room_id:
+                raise _bad_reference("id", _NOT_A_MESSAGE)
+            if (
+                row.redacted
+                or row.media_kind is None
+                or row.media_url is None
+                or withheld_kind(row.reason) is not None
+            ):
+                raise ApiError(
+                    409,
+                    "no_attachment",
+                    "id: the message has no attachment that can be fetched",
+                )
+            if row.media_kind in ("video", "audio"):
+                raise ApiError(
+                    422, "unsupported_type", "id: video and audio are not delivered to agents"
+                )
+            if media.parse_mxc(row.media_url, bridge_server) is None:
+                raise ApiError(422, "foreign_media", "id: the attachment is on another server")
+            async with conn.transaction():
+                await _lock(conn, "attachments", room_id)
+                limit = settings.agent_attachment_requests_per_10min
+                if (
+                    await attachment_requests.count_recent(conn, room_id, ATTACHMENT_WINDOW_SECONDS)
+                    >= limit
+                ):
+                    raise ApiError(
+                        429,
+                        "rate_limited",
+                        f"at most {limit} attachment requests per room in "
+                        f"{ATTACHMENT_WINDOW_SECONDS} s",
+                    )
+                request_id = await attachment_requests.insert(
+                    conn,
+                    session_id=who.session_id,
+                    slug=who.slug,
+                    room_id=room_id,
+                    inbound_id=row.id,
+                )
+        if request_id is None:
+            raise ApiError(409, "already_fetching", "id: this attachment is already being fetched")
+        log.info(
+            "attachment requested session=%s id=a%s message=m%s",
+            who.session_id,
+            request_id,
+            row.id,
+        )
+        return AttachmentAccepted(id=f"a{request_id}", status="queued")
+
+    @router.get(
+        "/attachments/{request_id}",
+        response_model=AttachmentStatus,
+        responses=_errors(400, 401, 404, 503),
+    )
+    async def attachment_status(
+        who: Annotated[Caller, Depends(caller)], request_id: str
+    ) -> AttachmentStatus:
+        """One of this session's attachment requests; any other id is 404."""
+        number = attachment_requests.parse_request_ref(request_id)
+        row = None
+        if number is not None:
+            async with pool.connection() as conn:
+                row = await attachment_requests.get(conn, number)
+        if row is None or row.session_id != who.session_id:
+            raise ApiError(404, "not_found", _NO_SUCH_ATTACHMENT)
+        return AttachmentStatus(
+            id=f"a{row.id}",
+            message=f"m{row.inbound_id}",
+            status=row.status,
+            reason=row.reason,
+            created_at=row.created_at,
+            done_at=row.done_at,
         )
 
     notes_errors = _errors(400, 401, 409, 413, 422, 503)

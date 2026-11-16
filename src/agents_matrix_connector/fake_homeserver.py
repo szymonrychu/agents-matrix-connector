@@ -35,11 +35,13 @@ from starlette.types import Receive, Scope, Send
 ROUTES = (
     "whoami",
     "create_filter",
+    "get_filter",
     "sync",
     "join",
     "room_state",
     "joined_members",
     "room_messages",
+    "room_context",
     "send_text",
     "typing",
     "receipt",
@@ -106,6 +108,7 @@ class _Failure:
     status: int
     errcode: str | None
     retry_after_ms: int | None
+    retry_after_header: str | None = None
 
 
 class FakeHomeserver:
@@ -128,6 +131,7 @@ class FakeHomeserver:
         self._typing: dict[str, bool] = {}
         self._receipts: list[tuple[str, str, str]] = []
         self._timeline_limit: int | None = None
+        self._empty_page = False
         self._media: dict[tuple[str, str], bytes] = {}
         self._media_failures: dict[str, int] = {}
         self.media_downloads: list[str] = []
@@ -137,11 +141,13 @@ class FakeHomeserver:
         self._table: list[tuple[str, tuple[str | None, ...], str, Handler]] = [
             ("GET", ("account", "whoami"), "whoami", self._whoami),
             ("POST", ("user", None, "filter"), "create_filter", self._create_filter),
+            ("GET", ("user", None, "filter", None), "get_filter", self._get_filter),
             ("GET", ("sync",), "sync", self._sync),
             ("POST", ("join", None), "join", self._join),
             ("GET", ("rooms", None, "state"), "room_state", self._room_state),
             ("GET", ("rooms", None, "joined_members"), "joined_members", self._joined_members),
             ("GET", ("rooms", None, "messages"), "room_messages", self._messages),
+            ("GET", ("rooms", None, "context", None), "room_context", self._context),
             ("PUT", ("rooms", None, "send", None, None), "send_text", self._send),
             ("PUT", ("rooms", None, "typing", None), "typing", self._typing_route),
             (
@@ -228,6 +234,18 @@ class FakeHomeserver:
         room = self._room(room_id)
         return self._append(room, event_type, sender, content, origin_ts=origin_ts)["event_id"]
 
+    def redact(self, room_id: str, event_id: str, sender: str) -> str:
+        """Redact `event_id`: append an `m.room.redaction` event and blank the target's
+        content, as a homeserver does when serving it afterwards."""
+        room = self._room(room_id)
+        redaction = self._append(room, "m.room.redaction", sender, {"redacts": event_id})
+        for _, event in room.timeline:
+            if event["event_id"] == event_id:
+                event["content"] = {}
+                event["unsigned"]["redacted_because"] = copy.deepcopy(redaction)
+                break
+        return redaction["event_id"]
+
     def set_state(self, room_id: str, event_type: str, state_key: str, content: dict) -> None:
         room = self._room(room_id)
         self._append(room, event_type, room.creator, content, state_key)
@@ -250,6 +268,11 @@ class FakeHomeserver:
         if limit is not None and limit < 1:
             raise ValueError("limit must be at least 1")
         self._timeline_limit = limit
+
+    def empty_page_next(self) -> None:
+        """The next `/messages` call answers an empty chunk that still has an `end` token
+        (Synapse does this when a page holds only filtered-out events)."""
+        self._empty_page = True
 
     def sent(self, room_id: str) -> list[dict]:
         """Contents the bot sent into the room, in order, one per distinct transaction."""
@@ -296,11 +319,12 @@ class FakeHomeserver:
         status: int,
         errcode: str | None = None,
         retry_after_ms: int | None = None,
+        retry_after_header: str | None = None,
     ) -> None:
         """Answer the next call of `route` (one of ROUTES) with this error; calls queue."""
         if route not in self._failures:
             raise ValueError(f"unknown route {route!r}, expected one of {ROUTES}")
-        self._failures[route].append(_Failure(status, errcode, retry_after_ms))
+        self._failures[route].append(_Failure(status, errcode, retry_after_ms, retry_after_header))
 
     def revoke_token(self) -> None:
         self._token_valid = False
@@ -450,6 +474,12 @@ class FakeHomeserver:
         filter_id = str(len(self._filters))
         self._filters[filter_id] = copy.deepcopy(body)
         return JSONResponse({"filter_id": filter_id})
+
+    async def _get_filter(self, request: Request, params: list[str]) -> Response:
+        user_id, filter_id = params
+        if user_id != self.user_id or filter_id not in self._filters:
+            return matrix_error(404, "M_NOT_FOUND", "No row found")
+        return JSONResponse(copy.deepcopy(self._filters[filter_id]))
 
     async def _sync(self, request: Request, params: list[str]) -> Response:
         query = request.query_params
@@ -640,6 +670,9 @@ class FakeHomeserver:
         else:
             candidates = [(p, e) for p, e in room.timeline if p > position]
         candidates = [(p, e) for p, e in candidates if _wanted(e, types)]
+        if self._empty_page:
+            self._empty_page = False
+            return JSONResponse({"start": f"t{position}", "chunk": [], "end": f"t{position}"})
         chunk = candidates[:limit]
         body: dict[str, Any] = {
             "start": start if start is not None else f"t{position}",
@@ -649,6 +682,24 @@ class FakeHomeserver:
             last = chunk[-1][0]
             body["end"] = f"t{last - 1}" if backwards else f"t{last}"
         return JSONResponse(body)
+
+    async def _context(self, request: Request, params: list[str]) -> Response:
+        room = self._joined_room(params[0])
+        if isinstance(room, Response):
+            return room
+        for position, event in room.timeline:
+            if event["event_id"] == params[1]:
+                return JSONResponse(
+                    {
+                        "start": f"t{position - 1}",
+                        "end": f"t{position}",
+                        "event": copy.deepcopy(event),
+                        "events_before": [],
+                        "events_after": [],
+                        "state": [],
+                    }
+                )
+        return matrix_error(404, "M_NOT_FOUND", "Event not found")
 
     async def _send(self, request: Request, params: list[str]) -> Response:
         room_id, event_type, txn_id = params
@@ -800,7 +851,10 @@ def _room_body(state: list[dict], timeline: list[tuple[int, dict]], limited: boo
 def _failure_response(failure: _Failure) -> JSONResponse:
     errcode = failure.errcode or DEFAULT_ERRCODES.get(failure.status, "M_UNKNOWN")
     extra = {} if failure.retry_after_ms is None else {"retry_after_ms": failure.retry_after_ms}
-    return matrix_error(failure.status, errcode, f"Injected failure {failure.status}", **extra)
+    response = matrix_error(failure.status, errcode, f"Injected failure {failure.status}", **extra)
+    if failure.retry_after_header is not None:
+        response.headers["Retry-After"] = failure.retry_after_header
+    return response
 
 
 async def _json_body(request: Request) -> Any:

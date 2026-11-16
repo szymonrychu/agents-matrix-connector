@@ -11,10 +11,19 @@ from pathlib import Path
 from api_helpers import make_settings
 from fastapi.routing import APIRoute
 
-from agents_matrix_connector import anonymize, policy, sender, sync, tracker, worker
+from agents_matrix_connector import (
+    anonymize,
+    history_crawl,
+    policy,
+    sender,
+    sync,
+    tracker,
+    worker,
+)
 from agents_matrix_connector.api import openapi
 from agents_matrix_connector.api.agent import CHAT_PREFIX, create_agent_app
 from agents_matrix_connector.api.app import PREFIX, create_api_app
+from agents_matrix_connector.db import inbound
 
 ROOT = Path(__file__).resolve().parent.parent
 README = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -89,6 +98,9 @@ def test_readme_lists_every_reason() -> None:
         sync.UNSUPPORTED_CONTENT,
         sync.NOT_MENTIONED,
         sync.QUEUE_FULL,
+        inbound.HISTORY,
+        inbound.REDACTED,
+        history_crawl.NOT_VISIBLE,
         worker.NO_PRESET,
         tracker.SESSION_GONE,
         tracker.TURN_FAILED,
@@ -155,6 +167,9 @@ def test_readme_lists_every_agent_route() -> None:
         f"GET {CHAT_PREFIX}/rooms",
         f"POST {CHAT_PREFIX}/messages",
         f"POST {CHAT_PREFIX}/reactions",
+        f"GET {CHAT_PREFIX}/history",
+        f"POST {CHAT_PREFIX}/attachments",
+        f"GET {CHAT_PREFIX}/attachments/{{request_id}}",
         f"GET {CHAT_PREFIX}/messages/{{id}}",
         f"GET {CHAT_PREFIX}/notes",
         f"PUT {CHAT_PREFIX}/notes",
@@ -165,6 +180,7 @@ def test_readme_lists_every_agent_route() -> None:
         f"GET {CHAT_PREFIX}/admin/rooms",
         f"GET {CHAT_PREFIX}/admin/rooms/{{room_id}}",
         f"POST {CHAT_PREFIX}/admin/rooms/{{room_id}}/allow",
+        f"GET {CHAT_PREFIX}/admin/rooms/{{room_id}}/messages",
         f"PUT {CHAT_PREFIX}/admin/rooms/{{room_id}}/settings",
         f"GET {CHAT_PREFIX}/admin/users",
         f"GET {CHAT_PREFIX}/admin/rules",

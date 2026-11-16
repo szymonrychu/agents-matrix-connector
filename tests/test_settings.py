@@ -251,6 +251,7 @@ MEDIA_DEFAULTS = {
     "agent_image_max_bytes": 8000000,
     "agent_file_max_bytes": 25000000,
     "agent_room_file_bytes_per_hour": 209715200,
+    "agent_attachment_requests_per_10min": 10,
 }
 
 
@@ -270,3 +271,11 @@ def test_media_settings_env(monkeypatch):
         monkeypatch.setenv(f"MATRIX_{name.upper()}", "0")
         assert f"MATRIX_{name.upper()}" in problems(ApiSettings), name
         monkeypatch.setenv(f"MATRIX_{name.upper()}", "7")
+
+
+def test_history_crawl_max_events(monkeypatch):
+    assert load_settings(BotSettings).history_crawl_max_events == 2000
+    monkeypatch.setenv("MATRIX_HISTORY_CRAWL_MAX_EVENTS", "0")
+    assert load_settings(BotSettings).history_crawl_max_events == 0
+    monkeypatch.setenv("MATRIX_HISTORY_CRAWL_MAX_EVENTS", "-1")
+    assert "MATRIX_HISTORY_CRAWL_MAX_EVENTS" in problems()

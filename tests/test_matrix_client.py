@@ -762,3 +762,100 @@ async def test_media_token_redacted_in_errors(caplog):
         assert TOKEN not in str(err) and TOKEN not in repr(err.args)
         assert TOKEN not in "".join(traceback.format_exception(err))
     assert TOKEN not in caplog.text
+
+
+async def test_room_messages_without_from(fake, recorder, client):
+    fake.add_room(ROOM, [], {BOT: "Bot", ALICE: "Alice"})
+    fake.post(ROOM, ALICE, {"msgtype": "m.text", "body": "hi"})
+    page = await client.room_messages(ROOM, None, limit=5)
+    assert [e["content"]["body"] for e in page["chunk"] if e["type"] == "m.room.message"] == ["hi"]
+    request = [r for r in recorder.requests if r.url.path.endswith("/messages")][-1]
+    assert "from" not in request.url.params
+    assert request.url.params["dir"] == "b"
+
+
+async def test_event_context_start_token(fake, recorder, client):
+    fake.add_room(ROOM, [], {BOT: "Bot", ALICE: "Alice"})
+    first = fake.post(ROOM, ALICE, {"msgtype": "m.text", "body": "one"})
+    second = fake.post(ROOM, ALICE, {"msgtype": "m.text", "body": "two"})
+    one = await client.event_context(ROOM, first)
+    two = await client.event_context(ROOM, second)
+    assert one["event"]["event_id"] == first
+    assert int(two["start"][1:]) == int(one["start"][1:]) + 1
+    assert two["end"] == f"t{int(two['start'][1:]) + 1}"
+    request = [r for r in recorder.requests if "/context/" in r.url.path][0]
+    assert request.url.params["limit"] == "0"
+    with pytest.raises(MatrixNotFound):
+        await client.event_context(ROOM, "$missing:hs")
+
+
+async def test_retry_after_header_preferred(fake, monkeypatch, client):
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(matrix, "_sleep", fake_sleep)
+    fake.add_room(ROOM, [], {BOT: "Bot", ALICE: "Alice"})
+    fake.fail_next("send_text", 429, retry_after_ms=9000, retry_after_header="3")
+    assert await client.send_text(ROOM, "t1", "hi")
+    assert slept == [3.0]
+
+
+async def test_retry_after_http_date(fake, monkeypatch, client):
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(matrix, "_sleep", fake_sleep)
+    fake.add_room(ROOM, [], {BOT: "Bot", ALICE: "Alice"})
+    when = format_datetime(datetime.now(UTC) + timedelta(seconds=6), usegmt=True)
+    fake.fail_next("send_text", 429, retry_after_header=when)
+    assert await client.send_text(ROOM, "t1", "hi")
+    assert len(slept) == 1
+    assert 3.0 <= slept[0] <= 6.0
+
+
+def test_retry_after_non_ascii_digits_ignored():
+    response = httpx.Response(429, headers={"Retry-After": "\u00b2".encode()}, json={})
+    assert matrix.retry_after_seconds(response) is None
+    fallback = httpx.Response(
+        429, headers={"Retry-After": "\u0661\u0662".encode()}, json={"retry_after_ms": 4000}
+    )
+    assert matrix.retry_after_seconds(fallback) == 4.0
+
+
+async def test_persistent_429_carries_retry_after(fake, monkeypatch, client):
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(matrix, "_sleep", fake_sleep)
+    fake.add_room(ROOM, [], {BOT: "Bot", ALICE: "Alice"})
+    fake.fail_next("send_text", 429, retry_after_header="120")
+    fake.fail_next("send_text", 429, retry_after_header="120")
+    with pytest.raises(MatrixUnavailable) as exc:
+        await client.send_text(ROOM, "t1", "hi")
+    assert slept == [10.0]
+    assert exc.value.retry_after == 120.0
+    fake.fail_next("send_text", 500)
+    with pytest.raises(MatrixUnavailable) as other:
+        await client.send_text(ROOM, "t2", "hi")
+    assert other.value.retry_after is None
+
+
+async def test_redact_helper_strips_content(fake, client):
+    fake.add_room(ROOM, [], {BOT: "Bot", ALICE: "Alice"})
+    target = fake.post(ROOM, ALICE, {"msgtype": "m.text", "body": "secret"})
+    redaction = fake.redact(ROOM, target, ALICE)
+    page = await client.room_messages(ROOM, None, limit=10)
+    by_id = {e["event_id"]: e for e in page["chunk"]}
+    assert by_id[target]["content"] == {}
+    assert by_id[target]["unsigned"]["redacted_because"]["event_id"] == redaction
+    assert by_id[redaction]["type"] == "m.room.redaction"
+    assert by_id[redaction]["content"] == {"redacts": target}

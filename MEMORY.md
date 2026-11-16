@@ -2,6 +2,49 @@
 
 Lessons that outlive a session. Newest first.
 
+## 2026-11-16 decisions
+
+- Withheld attachment guard (T-420 final review): sync stores body and media_url of `not_allowed`
+  rows, so "withheld" is a read-time property. `api.history.withheld_kind(reason)` is the one
+  predicate; POST /chat/v1/attachments answers 409 `no_attachment` (same body as a row without
+  file) and the fetcher refuses with `no_attachment` for any withheld row, so a denied sender's
+  file is neither revealed nor delivered. Withheld rows also null `from` for all four kinds, as
+  the spec says (the code had nulled it for denied only).
+  The `from` filter (name or digest) never matches a withheld row of any kind (`db.history.page`
+  takes the reasons from `withheld_kind`'s table), else filtering by a name would confirm the sender.
+
+## 2026-11-15 decisions
+
+Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
+
+- Ordering: `s` (agent sends) and `o` (worker replies) rows sort by `created_at`, not by their
+  delivery time, so a page cursor stays put while a send is delivered later; `m` rows sort by
+  `origin_ts`.
+- Ids: `o<n>` names a worker reply or notice that was sent without an agent send. They have no
+  `sends` row, so they need their own prefix; `a<n>` names attachment requests.
+- Crawl start token: never the live head. A crawl started from the head could turn a live event
+  into a history row that is never dispatched; it starts just before the oldest stored sync row,
+  else at the committed sync `next_batch`.
+- Pacing: one page of at most 100 events per bot tick is the whole rate limit, so a crawl of many
+  rooms never competes with sync, sends or dispatch for the homeserver.
+- Edits for crawled rows: a page carries the edits that Synapse bundles in `unsigned`
+  (`m.relations.m.replace`), so a crawled row is stored with its latest text and `edited` set
+  without a second request per message.
+- Redaction of a still-`new` row: bot sync moves it to `ignored` (reason `redacted`), so a message
+  withdrawn before dispatch is never sent to an agent. The row is blanked, never deleted.
+- Migration 0011 resets `sync_state.filter_id`: the bot then creates a new filter with
+  `m.room.redaction`. This also makes the earlier `m.sticker` filter change effective, which
+  stored filters had kept out.
+- `not_allowed` counts as denied in history: the sender never passed the allow rules, so text,
+  attachment and name are withheld (`withheld: denied`) like `denied:<kind>` rows.
+- Anonymization applies to the admin view too: a superleader reading any room sees the pseudonym
+  and no attachment name, so the admin route cannot be used to de-anonymize a room.
+- The admin history view replaces the UI feed only on the admin router: the UI keeps its own
+  `GET /matrix/api/v1/rooms/{room_id}/messages` shape, and `_ADMIN_ROUTES` filters by path and
+  method, so the UI handler is registered only when `admin=False`.
+- Reactions are not shown in the feed and edits and redactions are folded only for rows stored
+  from this release on (no rewrite of older rows): both keep the migration forward-only.
+
 ## 2026-11-12 decisions
 
 - Inbound media (T-155 step 2): the mention window is applied only by bot sync, on rows it
@@ -393,3 +436,78 @@ Lessons that outlive a session. Newest first.
   preamble (not part of the editable template, so custom preambles cannot drop it). Identity is
   only connector-set attributes; bodies are escaped, so claims in content never grant trust.
 - 2026-11-12: forwarded chat batches are posted `from_user=True` (T-137): `Worker._dispatch` and `Worker._deliver` pass it to agents-common, so the orchestrator stamps `last_user_message_at` and the web pins the superleader the user last talked to across Matrix and web. Every sender the room rules allow counts as the user (the rules already decide who may reach an agent). Tracker notes (`tracker._tell`, failure and rejection text) are system text and stay unflagged. Needs agents-orchestrator 7.16.0 deployed first (PostMessage forbids unknown fields) and agents-common v0.15.0.
+
+- 2026-11-15 (T-420 chat-history, migration 0011): inbound gains reply_to_event_id, source
+  (sync|history), edited_at, redacted; attachment_requests and history_crawls queues added;
+  sync_state.filter_id is cleared so the bot creates a new filter (with m.room.redaction, Task
+  2). Edits and redactions fold into the original row (no rewrite of rows stored earlier);
+  redaction blanks text and media and ignores a still-queued row (reason redacted). History
+  rows are always status ignored (reason history), so they never dispatch. The REDACTED and
+  HISTORY reason constants live in db/inbound.py, the table owner.
+- 2026-11-15 (T-420 Task 2): the sync loop verifies a stored filter id against SYNC_FILTER
+  (GET filter) before reuse and creates a new one when it differs or is gone, because an old pod
+  during a rolling deploy can re-save a filter without m.room.redaction (A21). Backfill no longer
+  stops at an empty chunk that still has an `end` token (Synapse returns those when a page holds
+  only filtered events); an empty page counts as one event toward the cap so the loop stays
+  bounded. Edits are applied right after the original's insert (bundled edits) or as m.replace
+  events through inbound.apply_edit (same sender only); redactions blank the row, and a message
+  the server already redacted is stored blank as ignored/redacted.
+- 2026-11-15 (T-420 Task 3): the history feed is one UNION ALL statement (db/history.py) with
+  keyset paging on (at, kind, id); s and o rows sort by created_at so a cursor stays put while a
+  send is delivered. One SQL fragment (_REPLY_TO) resolves an event id to m/s/o/unknown for both
+  inbound replies and worker replies. `history.parse_ref` is the m/s/o id parser for the feed
+  (the send routes use it too). `status` is null on m
+  items: the inbound queue status is internal; s and o items carry their delivery status. In an
+  anonymized room a `from` filter that is not a pseudonym returns an empty page rather than an
+  error, so a real name is never resolved or confirmed.
+
+- 2026-11-15 (T-420, task 4): `GET /chat/v1/history` (agent listener, room from the binding) and
+  `GET /chat/v1/admin/rooms/{room_id}/messages` (admin router only, read only). The UI
+  `room_messages` handler is now registered only when `admin=False`, because `_ADMIN_ROUTES`
+  filters by path and method and would otherwise also expose the UI shape on the admin path.
+  A malformed id is `bad_reference` like an unknown or foreign one (A14); `before` with `after`
+  is `invalid_request`.
+
+## 2026-11-15 Attachment requests (T-420, Task 5)
+- `db.history.parse_ref` is the one m/s/o id parser; `sends.parse_ref` is gone and `sends.resolve`
+  rejects `o` ids like any unusable reference (uniform 422 bad_reference).
+- `POST /chat/v1/attachments` takes the per-room advisory lock `attachments:<room>` for the
+  rate-limit count and the insert, so two requests cannot both pass the 10-per-600-s count. The
+  in-flight dedupe is the partial unique index on `inbound_id`, not a read-then-write.
+- The status path parameter is `request_id`; any id that is not the caller's `a<n>` is the same
+  404 text (never echoed). `INTERRUPTED` lives in `db/attachment_requests.py`.
+- Settled requests are pruned daily with the other tables (retention_days).
+
+## Attachment fetcher (2026-11-15, T-420)
+
+- `attachment_fetcher.AttachmentFetcher` is the fifth bot tick (after room_requests): one queued
+  request per tick, claimed in its own committed transaction; the binding and row are re-checked
+  on one connection, then no connection is held during the download and the post. The file is
+  posted with `post_message` without `from_user`: it is system delivery, not a user message, so
+  the text tells the agent to reach the chat with `orchestrator_chat_send`.
+- The sender role (`role="admin"`) is computed like the worker does, from `anonymize.is_admin`;
+  anonymized rooms show the pseudonym and never the original file name.
+- Only fixed reasons and ids are logged (`attachment a<id>: <status> (<reason>)`).
+
+## History crawl (2026-11-15, T-420, Task 8)
+
+- `history_crawl.HistoryCrawler` is the sixth bot tick (after the attachment fetcher): one
+  `/messages` page of at most 100 events per tick, up to `MATRIX_HISTORY_CRAWL_MAX_EVENTS`
+  (default 2000, 0 disables) per room, one crawl per room ever (`history_crawls.room_id` unique,
+  queued from active `room_bindings`). The crawler is the table's only writer.
+- The start token is never the live edge: just before the room's oldest stored sync row
+  (`/context` start), else the committed sync `next_batch` (everything older was already offered
+  to sync). With no sync position yet the crawl stays queued. A live event therefore can never
+  become a history row instead of being dispatched.
+- History rows go through `SyncLoop.intake_history` / `_apply_event(history=True)`: always
+  `ignored`, reason `history` or the policy refusal, `source='history'`, no mention, trigger,
+  queue cap or media promotion. History mode uses its own room-context cache so the concurrent
+  sync loop's per-response cache is never shared.
+- An empty page with `end` counts as one event toward the cap, so a crawl always ends.
+- A 429's `retry_after` is capped at the crawler-only `MAX_CRAWL_RETRY_SECONDS` (600 s) before the
+  crawl is deferred (not_before is scheduled, never slept); without one the crawl waits `DEFAULT_RETRY_SECONDS` (60 s).
+- A non-Matrix exception on a crawl ends it as `failed` with reason `internal_error` (2026-11-15):
+  otherwise the same oldest crawl would come back every tick and block every other room. Only the
+  exception type name and crawl id are logged; a failure while settling never masks it.
+- `retry_after_seconds` accepts only ASCII digits in `Retry-After` (superscript two passes `isdigit()`
+  but `float` raises).

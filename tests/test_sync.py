@@ -28,6 +28,7 @@ TYPES = [
     "m.room.message",
     "m.sticker",
     "m.room.member",
+    "m.room.redaction",
     "m.room.name",
     "m.room.canonical_alias",
     "m.room.encryption",
@@ -1108,3 +1109,194 @@ async def test_sticker_backfilled(fake, client, pool, monkeypatch):
     await loop.run_once()
     rows = await fetch(pool, "SELECT body, media_kind FROM inbound ORDER BY id")
     assert rows == [("", "sticker"), ("live", None)]
+
+
+async def row_state(pool) -> list[tuple]:
+    return await fetch(
+        pool,
+        "SELECT body, status, reason, reply_to_event_id, edited_at IS NOT NULL, redacted"
+        " FROM inbound ORDER BY id",
+    )
+
+
+def redact(fake, target: str, sender: str = ALICE) -> None:
+    fake.post(DM, sender, {"redacts": target}, event_type="m.room.redaction")
+
+
+def edit(fake, target: str, new: str, sender: str = ALICE) -> None:
+    fake.post(
+        DM,
+        sender,
+        {
+            "msgtype": "m.text",
+            "body": f"* {new}",
+            "m.new_content": {"msgtype": "m.text", "body": new},
+            "m.relates_to": {"rel_type": "m.replace", "event_id": target},
+        },
+    )
+
+
+async def test_reply_relation_stored(fake, client, pool):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    fake.post(
+        DM,
+        ALICE,
+        text("> <@a:hs> old\n\nanswer", **{"m.relates_to": {"m.in_reply_to": {"event_id": "$o"}}}),
+    )
+    await loop.run_once()
+    assert await row_state(pool) == [("answer", "new", None, "$o", False, False)]
+
+
+async def test_edit_from_sender_updates_body(fake, client, pool):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    original = fake.post(DM, ALICE, text("typo"))
+    await loop.run_once()
+    edit(fake, original, "fixed")
+    await loop.run_once()
+    assert await row_state(pool) == [("fixed", "new", None, None, True, False)]
+
+
+async def test_edit_in_same_sync_as_original(fake, client, pool):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    edit(fake, fake.post(DM, ALICE, text("typo")), "fixed")
+    await loop.run_once()
+    assert await row_state(pool) == [("fixed", "new", None, None, True, False)]
+
+
+async def test_bundled_edit_applied_on_insert(fake, client, pool):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    event_id = fake.post(DM, ALICE, text("typo"))
+    fake._room(DM).timeline[-1][1]["unsigned"]["m.relations"] = {
+        "m.replace": {
+            "sender": ALICE,
+            "origin_server_ts": 1_800_000_000_000,
+            "content": {"m.new_content": {"msgtype": "m.text", "body": "bundled"}},
+        }
+    }
+    assert event_id
+    await loop.run_once()
+    assert await row_state(pool) == [("bundled", "new", None, None, True, False)]
+
+
+async def test_edit_from_other_sender_ignored(fake, client, pool):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    original = fake.post(DM, ALICE, text("mine"))
+    await loop.run_once()
+    edit(fake, original, "hijacked", sender=BOB)
+    await loop.run_once()
+    assert await row_state(pool) == [("mine", "new", None, None, False, False)]
+
+
+async def test_redaction_blanks_stored_row(fake, client, pool):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    original = fake.post(DM, ALICE, text("oops"))
+    await loop.run_once()
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE inbound SET status = 'handled'")
+    redact(fake, original)
+    await loop.run_once()
+    assert await row_state(pool) == [(None, "handled", None, None, False, True)]
+
+
+async def test_redaction_of_queued_row_ignores_it(fake, client, pool):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    original = fake.post(DM, ALICE, text("oops"))
+    await loop.run_once()
+    redact(fake, original)
+    await loop.run_once()
+    assert await row_state(pool) == [(None, "ignored", inbound.REDACTED, None, False, True)]
+    async with pool.connection() as conn:
+        assert await inbound.rooms_ready(conn, T0) == []
+
+
+async def test_redaction_does_not_refetch_room_state(fake, client, pool, monkeypatch):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    original = fake.post(DM, ALICE, text("oops"))
+    await loop.run_once()
+    calls: list[str] = []
+    real = client.room_state
+
+    async def spy(room_id, *args, **kwargs):
+        calls.append(room_id)
+        return await real(room_id, *args, **kwargs)
+
+    monkeypatch.setattr(client, "room_state", spy)
+    redact(fake, original)
+    await loop.run_once()
+    assert calls == []
+    assert (await row_state(pool))[0][5] is True
+
+
+async def test_sync_filter_includes_redaction():
+    assert "m.room.redaction" in sync_module.SYNC_FILTER["room"]["timeline"]["types"]
+    assert "m.room.redaction" not in sync_module.ROOM_INFO_TYPES
+    assert "m.room.redaction" in sync_module.BACKFILL_FILTER["types"]
+    assert sync_module.REDACTED == inbound.REDACTED
+
+
+async def test_stale_stored_filter_is_replaced(fake, client, pool, monkeypatch):
+    """A rolling deploy: an old pod re-saves a filter id without m.room.redaction."""
+    await joined_and_synced(fake, client, pool)
+    old = {**sync_module.SYNC_FILTER}
+    old["room"] = {
+        **old["room"],
+        "timeline": {"types": [t for t in TYPES if t != "m.room.redaction"], "limit": 50},
+    }
+    stale = await client.create_filter(BOT, old)
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE sync_state SET filter_id = %s", (stale,))
+    created: list[str] = []
+    real_create = client.create_filter
+
+    async def spy_create(user_id, definition):
+        created.append(await real_create(user_id, definition))
+        return created[-1]
+
+    monkeypatch.setattr(client, "create_filter", spy_create)
+    await make_loop(client, pool).run_once()
+    assert len(created) == 1 and created[0] != stale
+    assert (await sync_state(pool))[1] == created[0]
+    # A current stored filter is kept.
+    await make_loop(client, pool).run_once()
+    assert len(created) == 1
+
+
+async def test_backfill_continues_past_empty_chunk(fake, client, pool, monkeypatch):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    fake.post(DM, ALICE, text("recorded"))
+    await loop.run_once()
+    monkeypatch.setattr(sync_module, "BACKFILL_PAGE", 2)
+    fake.limit_timeline(2)
+    for n in range(5):
+        fake.post(DM, ALICE, text(f"missed {n}"))
+    fake.empty_page_next()
+    await loop.run_once()
+    assert await bodies(pool) == ["recorded"] + [f"missed {n}" for n in range(5)]
+
+
+async def test_redacted_event_in_backfill_stored_blank(fake, client, pool, monkeypatch):
+    loop = await joined_and_synced(fake, client, pool)
+    await rules.add_rule(pool, "allow", "room", DM, None)
+    fake.post(DM, ALICE, text("recorded"))
+    await loop.run_once()
+    fake.limit_timeline(2)
+    gone = fake.post(DM, ALICE, text("secret"))
+    for n in range(3):
+        fake.post(DM, ALICE, text(f"missed {n}"))
+    event = [e for _, e in fake._room(DM).timeline if e["event_id"] == gone][0]
+    event["content"] = {}
+    event["unsigned"]["redacted_because"] = {"type": "m.room.redaction"}
+    await loop.run_once()
+    rows = await row_state(pool)
+    assert rows[0][0] == "recorded"
+    assert (None, "ignored", inbound.REDACTED, None, False, True) in rows
+    assert [r[0] for r in rows[1:]].count("missed 0") == 1

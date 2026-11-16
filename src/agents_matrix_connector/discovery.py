@@ -123,6 +123,35 @@ class Candidate:
     mention_ids: tuple[str, ...]
     origin_ts: int
     media: Media | None = None
+    reply_to: str | None = None
+    edited_body: str | None = None
+    edited_ts: int | None = None
+
+
+@dataclass(frozen=True)
+class Edit:
+    """An `m.replace` event: the new text of `target`, by `sender`."""
+
+    event_id: str
+    room_id: str
+    sender: str
+    target: str
+    body: str
+    origin_ts: int
+
+
+@dataclass(frozen=True)
+class Redaction:
+    event_id: str
+    target: str
+
+
+@dataclass(frozen=True)
+class Redacted:
+    """A message event the server already redacted (it arrives without its content)."""
+
+    event_id: str
+    sender: str
 
 
 @dataclass(frozen=True)
@@ -172,9 +201,77 @@ def _media(content: dict, kind: str, body: str) -> tuple[str, Media] | None:
     )
 
 
+def strip_reply_fallback(body: str) -> str:
+    """Drop the reply fallback: the leading run of `>` lines and one blank line after it."""
+    lines = body.split("\n")
+    i = 0
+    while i < len(lines) and lines[i].startswith(">"):
+        i += 1
+    if i == 0:
+        return body
+    if i < len(lines) and lines[i] == "":
+        i += 1
+    return "\n".join(lines[i:])
+
+
+def _new_body(event: object) -> str | None:
+    if not isinstance(event, dict):
+        return None
+    new = _content(event).get("m.new_content")
+    body = new.get("body") if isinstance(new, dict) else None
+    return body if isinstance(body, str) else None
+
+
+def bundled_edit(event: dict, sender: str) -> tuple[str, int] | None:
+    """The latest edit the server bundled into the event (`unsigned.m.relations.m.replace`),
+    only when the original sender made it: (new body, origin_server_ts)."""
+    unsigned = event.get("unsigned")
+    relations = unsigned.get("m.relations") if isinstance(unsigned, dict) else None
+    replace = relations.get("m.replace") if isinstance(relations, dict) else None
+    body = _new_body(replace)
+    if body is None or replace.get("sender") != sender:
+        return None
+    ts = _int(replace.get("origin_server_ts"))
+    return (body, ts) if ts is not None else None
+
+
+def parse_edit(
+    room_id: str, event: dict, self_ids: frozenset[str], bridge_bots: Sequence[str]
+) -> Edit | None:
+    sender = str(event.get("sender", ""))
+    if event.get("type") not in MESSAGE_TYPES or sender in self_ids or sender in bridge_bots:
+        return None
+    relates = _content(event).get("m.relates_to")
+    if not isinstance(relates, dict) or relates.get("rel_type") != "m.replace":
+        return None
+    target = relates.get("event_id")
+    body = _new_body(event)
+    if not isinstance(target, str) or body is None:
+        return None
+    return Edit(
+        event_id=str(event.get("event_id", "")),
+        room_id=room_id,
+        sender=sender,
+        target=target,
+        body=body,
+        origin_ts=int(event.get("origin_server_ts") or 0),
+    )
+
+
+def parse_redaction(event: dict) -> Redaction | None:
+    if event.get("type") != "m.room.redaction":
+        return None
+    target = _content(event).get("redacts")
+    if not isinstance(target, str):
+        target = event.get("redacts")
+    if not isinstance(target, str):
+        return None
+    return Redaction(str(event.get("event_id", "")), target)
+
+
 def parse_message(
     room_id: str, event: dict, self_ids: frozenset[str], bridge_bots: Sequence[str]
-) -> Candidate | Skip | Unsupported:
+) -> Candidate | Skip | Unsupported | Redacted:
     event_id = str(event.get("event_id", ""))
     sender = str(event.get("sender", ""))
     skip = Skip(event_id, sender)
@@ -189,7 +286,16 @@ def parse_message(
         return skip
     body = content.get("body")
     if not isinstance(body, str):
+        unsigned = event.get("unsigned")
+        if isinstance(unsigned, dict) and isinstance(unsigned.get("redacted_because"), dict):
+            return Redacted(event_id, sender)
         return skip
+    reply_to: str | None = None
+    reply = relates.get("m.in_reply_to") if isinstance(relates, dict) else None
+    if isinstance(reply, dict):
+        if isinstance(reply.get("event_id"), str):
+            reply_to = reply["event_id"]
+        body = strip_reply_fallback(body)
     msgtype = content.get("msgtype")
     media: Media | None = None
     if event_type == "m.sticker" or msgtype in _MEDIA_MSGTYPES:
@@ -203,6 +309,7 @@ def parse_message(
     formatted = content.get("formatted_body")
     mentions = content.get("m.mentions")
     ids = mentions.get("user_ids") if isinstance(mentions, dict) else None
+    edited = bundled_edit(event, sender)
     return Candidate(
         event_id=event_id,
         room_id=room_id,
@@ -212,6 +319,9 @@ def parse_message(
         mention_ids=tuple(i for i in ids if isinstance(i, str)) if isinstance(ids, list) else (),
         origin_ts=int(event.get("origin_server_ts") or 0),
         media=media,
+        reply_to=reply_to,
+        edited_body=edited[0] if edited else None,
+        edited_ts=edited[1] if edited else None,
     )
 
 

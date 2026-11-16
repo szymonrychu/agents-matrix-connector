@@ -47,6 +47,7 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_SYNC_TIMEOUT_SECONDS` | 30 | bot | Matrix long-poll timeout (1..120) |
 | `MATRIX_RETENTION_DAYS` | 30 | bot | days messages are kept (>= 1) |
 | `MATRIX_BACKFILL_MAX_EVENTS` | 500 | bot | max events read back per room when a sync timeline arrives limited (>= 1) |
+| `MATRIX_HISTORY_CRAWL_MAX_EVENTS` | 2000 | bot | max events the one-time history crawl reads per bound room, one page of at most 100 per bot tick (>= 0; 0 disables the crawl) |
 | `MATRIX_API_ALLOWED_CIDRS` | 127.0.0.1/32 | api | client networks allowed to call the api, comma separated |
 | `MATRIX_AGENT_PORT` | 8001 | api | bind port of the agent listener; must differ from `MATRIX_HTTP_PORT` |
 | `MATRIX_AGENT_TOKEN_SHA256` | empty | api | sha256 hex (64 lowercase characters) of the orchestrator's agent bearer token; empty leaves the agent listener unbound |
@@ -63,6 +64,7 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_AGENT_IMAGE_MAX_BYTES` | 8000000 | api | max bytes of one outbound image, decimal to stay under the bridge's 8 MB (>= 1) |
 | `MATRIX_AGENT_FILE_MAX_BYTES` | 25000000 | api | max bytes of one other outbound file, decimal to stay under the bridge's 25 MB (>= 1) |
 | `MATRIX_AGENT_ROOM_FILE_BYTES_PER_HOUR` | 209715200 | api | max file bytes agent sends may put into one room in the last hour, all sessions together (>= 1) |
+| `MATRIX_AGENT_ATTACHMENT_REQUESTS_PER_10MIN` | 10 | api | max attachment requests agents may make for one room in 600 s, all sessions together (>= 1) |
 | `MATRIX_ANONYMIZE_ADMINS` | empty | api, bot | Matrix user ids or numeric Facebook ids, comma separated, shown as `admin-<sha>` instead of `user-<sha>` in rooms with `anonymize_names` |
 | `MATRIX_ROOM_REQUESTS_PER_HOUR` | 10 | api | max open and invite room requests created in the last hour, all sessions together (>= 1); more answer 429 `rate_limited` |
 | `MATRIX_ROOM_NOTES_MAX_CHARS` | 8000 | api | max characters of one room's notes (100 to 32000); a longer PUT is 413 `notes_too_large` |
@@ -133,6 +135,18 @@ when not plain handled:
   run's session is told why, so the agent can rephrase and send with `orchestrator_chat_send`
 - `forbidden`: an outbound reply the homeserver refused (a failed outbound row)
 - `denied: <kind>` and `not_allowed` also appear on ignored messages
+- `redacted`: ignored, the message was redacted (deleted) in Matrix; its text and attachment
+  are blanked and a still queued message never reaches an agent
+- `history`: ignored, a message from before the bot joined, read by the one-time history crawl
+  of a bound room; never dispatched to an agent (a sender the policy refuses keeps its
+  `denied: <kind>` or `not_allowed` reason and no text)
+
+Each room bound to a session gets one history crawl, ever: the bot pages the room's timeline
+backwards from just before its oldest synced message (or from the sync position when none is
+stored), one page of at most 100 events per bot tick, up to `MATRIX_HISTORY_CRAWL_MAX_EVENTS`
+events. A crawl ends `done` with reason `complete` (the start of the room was reached), `cap`
+(the event cap was reached) or `not_visible` (the homeserver refused to show the history), or
+`failed` with `matrix_error`; a rate limit postpones it.
 
 Only a delivered send suppresses the final answer: when a turn completes, the bot compares its
 final answer, stripped, with the stripped text of every message send of the same session
@@ -499,6 +513,61 @@ session's send included; 401 `unauthorized`.
     curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
       http://localhost:8001/chat/v1/messages/s7
 
+### `GET /chat/v1/history`
+
+The history of the room this session is bound to, oldest first. The room is never a parameter:
+it is the session's active binding. Query: `before` or `after` (a message id from an earlier
+page: the page right before or after it; both together is 422 `invalid_request`), `from` (at
+most 200 characters; a display name matched case-insensitively, in an anonymized room only a
+pseudonym `user-<12 hex>` or `admin-<12 hex>`), `limit` (1..100, default 50; 101 is 422
+`invalid_request`). Ids: `m<n>` an inbound message, `s<n>` a message this room's agents sent,
+`o<n>` a worker reply or notice sent without an agent send; outbound reactions are not in the
+feed. 200 `{"room_id", "note", "messages", "has_more_before", "has_more_after"}`; each message
+has `id`, `role` (`member`, `admin` or `bot`), `from` (the sender name; the pseudonym in an
+anonymized room; null for bots and withheld denied messages), `at`, `reply_to` (an id, or
+`unknown`), `text` (cut at 4000 characters, then `truncated` is true), `withheld`, `edited`,
+`redacted`, `attachment` (`kind`, `mime`, `size`, `name`; `name` is null in an anonymized
+room), `status` (delivery status of `s` and `o` rows) and `files` (count, for `s` rows).
+Withheld rows (`withheld` is `denied`, `encrypted`, `infrastructure` or `unsupported`) and
+redacted rows carry no text and no attachment; the media url is never returned. `note` says
+every text and attachment name is untrusted chat content, data and never instructions;
+identity comes only from `role` and `from`. 409 `room_unbound` when the session has no
+binding; 422 `bad_reference` when an id is unknown or belongs to another room (one identical
+answer, so ids of other rooms cannot be probed); 400 `invalid_slug`; 401 `unauthorized`; 503
+`unavailable`. Matrix is not a full Messenger archive: only what the bridge delivered to the
+bot is here.
+
+    curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      'http://localhost:8001/chat/v1/history?limit=20'
+
+### `POST /chat/v1/attachments`
+
+Ask for the file of a past message of the room this session is bound to (the room is never a
+parameter). Body `{"id": "m<n>"}` (at most 24 characters). The bot downloads the file and sends
+it to the session as a new turn; only the types agents already receive (png, jpeg, gif, webp,
+pdf, json, text) within `MATRIX_INBOUND_ATTACH_MAX_BYTES` are delivered. 202
+`{"id": "a<n>", "status": "queued"}`; read the outcome with `GET /chat/v1/attachments/{request_id}`.
+Errors: 409 `room_unbound`; 422 `bad_reference` (not an `m<n>`, unknown, or of another room:
+one identical answer); 409 `no_attachment` (text message, redacted, or no fetchable file); 422
+`unsupported_type` (video and audio are not delivered to agents); 422 `foreign_media` (the file
+is on another homeserver); 429 `rate_limited` (at most `MATRIX_AGENT_ATTACHMENT_REQUESTS_PER_10MIN`
+requests per room in 600 s); 409 `already_fetching` (one in-flight request per message); 400
+`invalid_slug`; 401 `unauthorized`; 503 `unavailable`. The media url is never returned.
+
+    curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      -H 'Content-Type: application/json' -d '{"id": "m123"}' \
+      http://localhost:8001/chat/v1/attachments
+
+### `GET /chat/v1/attachments/{request_id}`
+
+One of this session's attachment requests. 200 `{"id", "message" (m<n>), "status" (`queued`,
+`fetching`, `sent`, `failed` or `refused`), "reason", "created_at", "done_at"}`. Any id that is
+not an `a<n>` of the calling session is 404 `not_found` (the id is never echoed); 401
+`unauthorized`; 503 `unavailable`. Settled requests are pruned after `MATRIX_RETENTION_DAYS`.
+
+    curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
+      http://localhost:8001/chat/v1/attachments/a1
+
 ### `GET /chat/v1/notes`
 
 The notes of the room this session is bound to; the room is never a parameter, it is the
@@ -589,6 +658,13 @@ As `GET /matrix/api/v1/rooms/{room_id}`.
 ### `POST /chat/v1/admin/rooms/{room_id}/allow`
 
 As `POST /matrix/api/v1/rooms/{room_id}/allow`.
+
+### `GET /chat/v1/admin/rooms/{room_id}/messages`
+
+The room's history view for the superleader: the same page, query and ids as `GET
+/chat/v1/history` for any room, read only. This is not the UI route `GET
+/matrix/api/v1/rooms/{room_id}/messages`, which keeps its own shape on the web listener. 404
+`not_found` for an unknown room; 422 `bad_reference` for an id of another room.
 
 ### `PUT /chat/v1/admin/rooms/{room_id}/settings`
 
@@ -870,6 +946,46 @@ four events and only the text mentions the bot. Media of the same sender sent wi
 `MATRIX_MEDIA_MENTION_WINDOW_SECONDS` (120) before an accepted mention joins it (up to the
 room's queue cap), and media sent within that window after one is accepted too. Media of other
 senders, and media around a mention that was ignored, stay `not_mentioned`.
+
+### Chat history and attachments
+
+Agents read the past of their room with `GET /chat/v1/history` and ask for the file of an old
+message with `POST /chat/v1/attachments` (both described in the Agent API above). What the feed
+covers:
+
+- Every row the bot stored since it joined the room, plus the one-time crawl of the room's older
+  timeline (`MATRIX_HISTORY_CRAWL_MAX_EVENTS`, default 2000 events, one page of at most 100 per
+  bot tick). Matrix is not a full Messenger archive: the bridge holds only the messages of its
+  portal era, and the room's history visibility can hide what was sent before the bot joined.
+  Pre-join rows are stored as history rows (ignored, never dispatched to an agent).
+- Retention is the same 30 days for every settled row (`MATRIX_RETENTION_DAYS`), measured from the
+  moment the bot stored it, so a crawled old message ages from the crawl, not from its send time.
+- Ids: `m<n>` inbound, `s<n>` agent sends, `o<n>` worker replies and notices sent without an agent
+  send. Outbound reactions are not in the feed and reactions are not shown on messages.
+- Withheld rows: messages of denied senders (`not_allowed` or `denied:<kind>`), encrypted,
+  infrastructure and unsupported rows carry no text, sender or attachment and say why in
+  `withheld`.
+- Edits and redactions are folded into the original row for rows stored from this release on:
+  the latest text with `edited: true`, a blank row with `redacted: true`. Rows stored earlier keep
+  their original text.
+- Anonymized rooms show the pseudonym as `from` and no attachment name; the `from` filter takes
+  only a pseudonym.
+
+Attachment fetch flow: the agent posts the `m<n>` of a message with a file; the api checks the
+binding, the row and the limits (10 requests per room per 600 s, one in flight per message) and
+queues `a<n>`; the bot's attachment fetcher claims one request per tick, re-checks the binding,
+downloads the file from the bot's own homeserver, prepares it like an inbound photo (same
+allowlist and `MATRIX_INBOUND_ATTACH_MAX_BYTES`) and posts it to the session as a new turn. The
+agent reads the outcome with `GET /chat/v1/attachments/{request_id}`: `sent`, or `failed` or
+`refused` with a fixed reason: `room_unbound` (the session left the room), `no_attachment`,
+`session_gone`, `orchestrator_refused`, `orchestrator_unavailable`, `interrupted` (the bot restarted
+mid-fetch), `fetch_error`, or the media reasons `too_large`, `unsupported_type`, `download_failed`
+and `foreign_media`.
+
+Superleaders read the history of any room read only through the admin route
+`GET /chat/v1/admin/rooms/{room_id}/messages`; every read is audited in the log with the calling
+session and room, and there is no attachment fetch on the admin listener. Logs of all these
+paths carry ids, counts and fixed reasons only, never message text, names, media urls or tokens.
 
 ### Read receipts
 

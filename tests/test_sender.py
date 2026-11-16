@@ -396,7 +396,14 @@ async def test_bot_loop_runs_sender_between_worker_and_tracker(caplog):
 
     await asyncio.wait_for(
         bot._work_loop(
-            Worker(), Sender(RuntimeError("boom")), Tracker(), RoomRequests(), settings, stop
+            Worker(),
+            Sender(RuntimeError("boom")),
+            Tracker(),
+            RoomRequests(),
+            RoomRequests(),
+            RoomRequests(),
+            settings,
+            stop,
         ),
         5,
     )
@@ -408,7 +415,17 @@ async def test_bot_loop_runs_sender_between_worker_and_tracker(caplog):
     lost = MatrixAuthError(401, "M_UNKNOWN_TOKEN", "gone")
     with pytest.raises(MatrixAuthError):
         await asyncio.wait_for(
-            bot._work_loop(Worker(), Sender(lost), Tracker(), RoomRequests(), settings, stop), 5
+            bot._work_loop(
+                Worker(),
+                Sender(lost),
+                Tracker(),
+                RoomRequests(),
+                RoomRequests(),
+                RoomRequests(),
+                settings,
+                stop,
+            ),
+            5,
         )
     assert calls == ["worker", "sender"]
 

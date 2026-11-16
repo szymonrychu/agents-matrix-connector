@@ -778,6 +778,30 @@ async def test_daily_prune(tracker, pool, clock, hs):
     assert len(inbound_left) == 6
 
 
+async def test_daily_prune_removes_settled_attachment_requests(tracker, pool, clock, hs):
+    old = T0 - timedelta(days=31)
+    recent = T0 - timedelta(days=28)
+    async with pool.connection() as conn:
+        for tag, at in (("old", old), ("recent", recent)):
+            for n, status in enumerate(("queued", "fetching", "sent", "failed", "refused")):
+                await conn.execute(
+                    "INSERT INTO attachment_requests (session_id, room_id, inbound_id, status,"
+                    " reason, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (uuid.uuid4(), ROOM, n + (100 if tag == "old" else 0), status, tag, at),
+                )
+    await tracker.tick()
+    left = await fetch(pool, "SELECT reason, status FROM attachment_requests ORDER BY id")
+    assert left == [
+        ("old", "queued"),
+        ("old", "fetching"),
+        ("recent", "queued"),
+        ("recent", "fetching"),
+        ("recent", "sent"),
+        ("recent", "failed"),
+        ("recent", "refused"),
+    ]
+
+
 async def test_agent_rows_rechecked_before_send(
     tracker, pool, orch, orch_client, hs, matrix, clock
 ):

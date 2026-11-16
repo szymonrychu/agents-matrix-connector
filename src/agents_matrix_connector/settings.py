@@ -40,6 +40,8 @@ class ConnectorSettings(BaseServiceSettings):
     sync_timeout_seconds: int = Field(30, ge=1, le=120)
     retention_days: int = Field(30, ge=1)
     backfill_max_events: int = Field(500, ge=1)
+    history_crawl_max_events: int = Field(2000, ge=0)
+    """Max events the one-time history crawl reads per bound room; 0 disables the crawler."""
     api_allowed_cidrs: CsvList = ["127.0.0.1/32"]
     agent_port: int = 8001
     agent_token_sha256: SecretStr = Field(SecretStr(""), repr=False)
@@ -76,6 +78,8 @@ class ConnectorSettings(BaseServiceSettings):
     """Max bytes of one other outbound file (decimal, under the bridge's 25 MB)."""
     agent_room_file_bytes_per_hour: int = Field(209715200, ge=1)
     """Max file bytes agent sends may put into one room in the last hour."""
+    agent_attachment_requests_per_10min: int = Field(10, ge=1)
+    """Max attachment requests agents may make for one room in 600 seconds."""
     anonymize_admins: CsvList = []
     """Matrix user ids or numeric Facebook ids shown as `admin-<sha>` in anonymized rooms."""
 

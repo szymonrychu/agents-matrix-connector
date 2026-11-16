@@ -1,5 +1,5 @@
-"""The bot process: Matrix sync, dispatch worker, agent sender, reply tracker and room
-requests under one singleton lock."""
+"""The bot process: Matrix sync, dispatch worker, agent sender, reply tracker, room requests,
+attachment fetcher and history crawler under one singleton lock."""
 
 import asyncio
 import contextlib
@@ -14,7 +14,9 @@ from agents_common.runtime import LostLock, advisory_singleton, run_service
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
 
+from agents_matrix_connector.attachment_fetcher import AttachmentFetcher
 from agents_matrix_connector.bridge import BridgeError, ProvisioningClient
+from agents_matrix_connector.history_crawl import HistoryCrawler
 from agents_matrix_connector.matrix import MatrixAuthError, MatrixClient, MatrixError
 from agents_matrix_connector.receipts import ReadReceipts
 from agents_matrix_connector.room_requests import RoomRequests
@@ -84,13 +86,22 @@ async def _work_loop(
     sender: Sender,
     tracker: Tracker,
     room_requests: RoomRequests,
+    fetcher: AttachmentFetcher,
+    crawler: HistoryCrawler,
     settings: BotSettings,
     stop,
 ) -> None:
-    """Worker, Sender, Tracker then RoomRequests tick every poll interval; only a Matrix auth
-    failure escapes."""
+    """Worker, Sender, Tracker, RoomRequests, the AttachmentFetcher then the HistoryCrawler
+    tick every poll interval; only a Matrix auth failure escapes."""
     while not stop.is_set():
-        for tick in (worker.tick, sender.tick, tracker.tick, room_requests.tick):
+        for tick in (
+            worker.tick,
+            sender.tick,
+            tracker.tick,
+            room_requests.tick,
+            fetcher.tick,
+            crawler.tick,
+        ):
             try:
                 await tick()
             except MatrixAuthError:
@@ -104,7 +115,7 @@ async def _work_loop(
 async def _locked(
     pool,
     sync: SyncLoop,
-    steps: tuple[Worker, Sender, Tracker, RoomRequests],
+    steps: tuple[Worker, Sender, Tracker, RoomRequests, AttachmentFetcher, HistoryCrawler],
     settings: BotSettings,
     stop: asyncio.Event,
     held: asyncio.Event,
@@ -249,9 +260,12 @@ async def _main(settings, pool, orchestrator, matrix, stop, bridge=None) -> int:
         upload_limit=await upload_limit(matrix),
     )
     room_requests = RoomRequests(pool, matrix, bridge, settings)
+    fetcher = AttachmentFetcher(orchestrator, matrix, pool, settings)
+    crawler = HistoryCrawler(matrix, pool, sync, settings)
+    steps = (worker, sender, tracker, room_requests, fetcher, crawler)
     held = asyncio.Event()
     body = asyncio.create_task(
-        _locked(pool, sync, (worker, sender, tracker, room_requests), settings, stop, held),
+        _locked(pool, sync, steps, settings, stop, held),
         name="bot",
     )
     stopper = asyncio.create_task(stop.wait())

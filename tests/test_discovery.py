@@ -4,16 +4,22 @@ import pytest
 
 from agents_matrix_connector.discovery import (
     Candidate,
+    Edit,
     Media,
+    Redacted,
+    Redaction,
     Skip,
     Unsupported,
     alias_mentioned,
+    bundled_edit,
     classify,
     effective_trigger,
     facebook_id,
     mentions_self,
     normalize_aliases,
+    parse_edit,
     parse_message,
+    parse_redaction,
     truncate,
 )
 from agents_matrix_connector.policy import Rule, Subject, evaluate
@@ -372,3 +378,90 @@ def test_caption_rule():
 
 def test_text_candidate_has_no_media():
     assert parse_message("!r", msg(), SELF, BOTS).media is None
+
+
+def test_parse_message_reply_to_and_fallback_stripped():
+    content = {
+        "msgtype": "m.text",
+        "body": "> <@a:x> old\n> more\n\nnew text",
+        "m.relates_to": {"m.in_reply_to": {"event_id": "$orig"}},
+    }
+    result = parse_message("!r", msg(content=content), SELF, BOTS)
+    assert isinstance(result, Candidate)
+    assert result.body == "new text"
+    assert result.reply_to == "$orig"
+
+
+def test_quote_lines_kept_without_reply_relation():
+    content = {"msgtype": "m.text", "body": "> quote\nreal"}
+    result = parse_message("!r", msg(content=content), SELF, BOTS)
+    assert result.body == "> quote\nreal"
+    assert result.reply_to is None
+
+
+def edit_event(sender="@alice:hs.test", new=None):
+    content = {
+        "msgtype": "m.text",
+        "body": "* fixed",
+        "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig"},
+    }
+    if new is not False:
+        content["m.new_content"] = new or {"msgtype": "m.text", "body": "fixed"}
+    return msg(sender=sender, content=content)
+
+
+def test_parse_edit():
+    event = edit_event()
+    assert parse_edit("!r", event, SELF, BOTS) == Edit(
+        "$e", "!r", "@alice:hs.test", "$orig", "fixed", 5
+    )
+    assert parse_edit("!r", edit_event(new=False), SELF, BOTS) is None
+    assert parse_edit("!r", edit_event(new={"msgtype": "m.text"}), SELF, BOTS) is None
+    assert parse_edit("!r", edit_event(sender="@me:hs.test"), SELF, BOTS) is None
+    assert parse_edit("!r", edit_event(sender=BOTS[0]), SELF, BOTS) is None
+    assert parse_edit("!r", msg(), SELF, BOTS) is None
+    assert isinstance(parse_message("!r", event, SELF, BOTS), Skip)
+
+
+def test_parse_redaction_content_and_top_level():
+    new = {"type": "m.room.redaction", "event_id": "$r", "content": {"redacts": "$x"}}
+    assert parse_redaction(new) == Redaction("$r", "$x")
+    old = {"type": "m.room.redaction", "event_id": "$r", "redacts": "$y", "content": {}}
+    assert parse_redaction(old) == Redaction("$r", "$y")
+    assert parse_redaction({"type": "m.room.message", "content": {"redacts": "$x"}}) is None
+    assert parse_redaction({"type": "m.room.redaction", "content": {}}) is None
+
+
+def test_parse_message_redacted_event():
+    event = {
+        "type": "m.room.message",
+        "event_id": "$e",
+        "sender": "@alice:hs.test",
+        "content": {},
+        "unsigned": {"redacted_because": {"type": "m.room.redaction"}},
+    }
+    assert parse_message("!r", event, SELF, BOTS) == Redacted("$e", "@alice:hs.test")
+    event["unsigned"] = {}
+    assert isinstance(parse_message("!r", event, SELF, BOTS), Skip)
+
+
+def test_bundled_edit_same_sender_only():
+    def bundled(sender):
+        return {
+            "unsigned": {
+                "m.relations": {
+                    "m.replace": {
+                        "sender": sender,
+                        "origin_server_ts": 9,
+                        "content": {"m.new_content": {"msgtype": "m.text", "body": "latest"}},
+                    }
+                }
+            }
+        }
+
+    assert bundled_edit(bundled("@alice:hs.test"), "@alice:hs.test") == ("latest", 9)
+    assert bundled_edit(bundled("@bob:hs.test"), "@alice:hs.test") is None
+    assert bundled_edit({}, "@alice:hs.test") is None
+    event = {**msg(), **bundled("@alice:hs.test")}
+    result = parse_message("!r", event, SELF, BOTS)
+    assert (result.body, result.edited_body, result.edited_ts) == ("hi", "latest", 9)
