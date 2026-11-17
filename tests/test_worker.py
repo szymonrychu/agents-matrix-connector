@@ -20,7 +20,12 @@ from agents_matrix_connector.db.bindings import BindingRow
 from agents_matrix_connector.discovery import Media
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
 from agents_matrix_connector.matrix import MatrixClient
-from agents_matrix_connector.prompt import ADMIN_TRUST_RULE, DEFAULT_PREAMBLE, MEMORY_RULE
+from agents_matrix_connector.prompt import (
+    ADMIN_TRUST_RULE,
+    DEFAULT_PREAMBLE,
+    MEMORY_RULE,
+    REPLY_RULE,
+)
 from agents_matrix_connector.settings import BotSettings
 from agents_matrix_connector.tracker import Tracker
 from agents_matrix_connector.worker import Worker, binding_state, check_action
@@ -1392,7 +1397,14 @@ async def test_preamble_default_when_nothing_overrides(conn, fake, make_worker, 
     await preset()
     text = await _first_text(conn, fake, make_worker)
     assert text.startswith(
-        DEFAULT_PREAMBLE + "\n\n" + ADMIN_TRUST_RULE + "\n\n" + MEMORY_RULE + "\n\n<chat"
+        DEFAULT_PREAMBLE
+        + "\n\n"
+        + ADMIN_TRUST_RULE
+        + "\n\n"
+        + REPLY_RULE
+        + "\n\n"
+        + MEMORY_RULE
+        + "\n\n<chat"
     )
 
 
@@ -1407,6 +1419,7 @@ async def test_global_preamble_replaces_default_and_renders_variables(
     text = await _first_text(conn, fake, make_worker)
     assert text.startswith(
         f"Global for Alice {DM} from Alice A at {T0.isoformat()}\n\n{ADMIN_TRUST_RULE}\n\n"
+        f"{REPLY_RULE}\n\n"
         f"{MEMORY_RULE}\n\n<chat"
     )
 
@@ -1422,7 +1435,9 @@ async def test_rule_preamble_beats_global(conn, fake, make_worker, preset):
         )
     ).fetchall()
     text = await _first_text(conn, fake, make_worker, rule_id)
-    assert text.startswith(f"Rule family\n\n{ADMIN_TRUST_RULE}\n\n{MEMORY_RULE}\n\n<chat")
+    assert text.startswith(
+        f"Rule family\n\n{ADMIN_TRUST_RULE}\n\n{REPLY_RULE}\n\n{MEMORY_RULE}\n\n<chat"
+    )
 
 
 async def test_rule_without_preamble_falls_to_global(conn, fake, make_worker, preset):
@@ -1436,7 +1451,9 @@ async def test_rule_without_preamble_falls_to_global(conn, fake, make_worker, pr
         )
     ).fetchall()
     text = await _first_text(conn, fake, make_worker, rule_id)
-    assert text.startswith(f"Global\n\n{ADMIN_TRUST_RULE}\n\n{MEMORY_RULE}\n\n<chat")
+    assert text.startswith(
+        f"Global\n\n{ADMIN_TRUST_RULE}\n\n{REPLY_RULE}\n\n{MEMORY_RULE}\n\n<chat"
+    )
 
 
 async def test_broken_stored_preamble_falls_back_to_default(conn, fake, make_worker, preset):
@@ -1444,7 +1461,14 @@ async def test_broken_stored_preamble_falls_back_to_default(conn, fake, make_wor
     await conn.execute("UPDATE settings SET preamble = '{{ nope }}' WHERE id = 1")
     text = await _first_text(conn, fake, make_worker)
     assert text.startswith(
-        DEFAULT_PREAMBLE + "\n\n" + ADMIN_TRUST_RULE + "\n\n" + MEMORY_RULE + "\n\n<chat"
+        DEFAULT_PREAMBLE
+        + "\n\n"
+        + ADMIN_TRUST_RULE
+        + "\n\n"
+        + REPLY_RULE
+        + "\n\n"
+        + MEMORY_RULE
+        + "\n\n<chat"
     )
 
 
@@ -1484,7 +1508,7 @@ async def test_anonymized_room_shows_pseudonyms_not_names(conn, fake, make_worke
     label = pseudonym(ALICE)
     text = await anonymized_first_text(conn, fake, make_worker, True)
     assert text.startswith(
-        f"{label} / {label}\n\n{ADMIN_TRUST_RULE}\n\n{MEMORY_RULE}\n\n"
+        f"{label} / {label}\n\n{ADMIN_TRUST_RULE}\n\n{REPLY_RULE}\n\n{MEMORY_RULE}\n\n"
         f'<chat room="{label}" kind="dm"'
     )
     assert f'from="{label}" facebook_id=""' in text
@@ -1518,7 +1542,8 @@ async def test_room_without_flag_keeps_names(conn, fake, make_worker, preset):
     await preset()
     text = await anonymized_first_text(conn, fake, make_worker, False)
     assert text.startswith(
-        f'Alice A / Alice A\n\n{ADMIN_TRUST_RULE}\n\n{MEMORY_RULE}\n\n<chat room="Alice A"'
+        f"Alice A / Alice A\n\n{ADMIN_TRUST_RULE}\n\n{REPLY_RULE}\n\n{MEMORY_RULE}\n\n"
+        '<chat room="Alice A"'
     )
     assert 'from="Alice A" facebook_id="111"' in text
 

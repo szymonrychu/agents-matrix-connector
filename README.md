@@ -160,12 +160,6 @@ when not plain handled:
 - `message_failed`: failed, the orchestrator message failed
 - `message_cancelled`: failed, the orchestrator message was cancelled
 - `timeout`: failed, no result within `MATRIX_RUN_TIMEOUT_SECONDS`
-- `empty_reply`: handled, the agent answered with no text
-- `already_sent`: handled, the turn's final answer equals (stripped) a message the agent sent
-  with the send tool during the run, so it is not posted a second time
-- `pseudonym_disclosed`: failed, in a room with `anonymize_names` the turn's final answer
-  contained a pseudonym (`user-<sha>`, `admin-<sha>`): nothing is posted to the room and the
-  run's session is told why, so the agent can rephrase and send with `orchestrator_chat_send`
 - `forbidden`: an outbound reply the homeserver refused (a failed outbound row)
 - `denied: <kind>` and `not_allowed` also appear on ignored messages
 - `redacted`: ignored, the message was redacted (deleted) in Matrix; its text and attachment
@@ -181,14 +175,12 @@ events. A crawl ends `done` with reason `complete` (the start of the room was re
 (the event cap was reached) or `not_visible` (the homeserver refused to show the history), or
 `failed` with `matrix_error`; a rate limit postpones it.
 
-Only a delivered send suppresses the final answer: when a turn completes, the bot compares its
-final answer, stripped, with the stripped text of every message send of the same session
-created at or after the run started. A matching `sent` send closes the run `already_sent` and
-posts nothing. A matching send still `queued` or `sending` keeps the run in progress (the room's
-next batch waits) until it settles, bounded by `MATRIX_RUN_TIMEOUT_SECONDS` from the run's
-start; when the timeout passes first the final answer is posted. A matching send that ended
-`failed` or `refused` does not count, so the final answer is posted. Every other final answer
-is posted as usual.
+A completed turn closes its run `handled` with nothing posted: the connector never posts a
+turn's final text. The agent reaches the room only through `<chat-send>` and `<chat-react>`
+envelopes in its own assistant text, which the orchestrator relays through the agent listener
+API (`/chat/v1`); no envelope means silence. A failed or timed-out run still posts the fixed
+notice. Every first prompt carries a fixed reply rule describing the envelopes (a custom preamble
+cannot drop it) and every follow batch repeats it in one line.
 
 ### `GET /matrix/api/v1/meta`
 
@@ -924,9 +916,8 @@ never rewritten, and real names may be sent.
 
 A pseudonym must never reach the chat. In such a room `POST /chat/v1/messages` answers 422
 `pseudonym_disclosed` for a text containing `user-<12 hex>` or `admin-<12 hex>` as a whole word
-(any case), and a turn's final answer containing one is not posted: the run fails
-`pseudonym_disclosed` and its session gets a message naming the tokens, so the agent can
-rephrase and send the answer itself. The superleader admin routes (`/chat/v1/admin/rooms`,
+(any case); the orchestrator relays envelopes through the same route, so an envelope text
+with one is refused alike. The superleader admin routes (`/chat/v1/admin/rooms`,
 `/users`, room requests) and the UI keep real names.
 
     curl -s -X PUT -H 'content-type: application/json' -d '{"anonymize_names": true}' \

@@ -65,12 +65,9 @@ def test_follow_ups_during_running_run(stack: Stack) -> None:
     assert [r["status"] for r in stack.inbound(room_id)] == ["in-progress"]
 
     stack.complete_turn(prompt["id"], "All done")
-    wait_for(lambda: len(stack.sent(room_id)) == 3, "the final answer in the room")
-    assert stack.sent(room_id) == [
-        reply("Working on it"),
-        reply("Halfway there"),
-        reply("All done"),
-    ]
+    stack.wait_inbound(room_id, 1, status="handled")
+    # the final text is never posted: only the two sends are in the room
+    assert stack.sent(room_id) == [reply("Working on it"), reply("Halfway there")]
 
 
 def test_reply_and_reaction_relations(stack: Stack) -> None:
@@ -158,9 +155,8 @@ def test_initiation_binds_and_answer_reaches_session(stack: Stack) -> None:
     assert stack.sessions() == [agent]  # no mx- session was started
 
     stack.complete_turn(prompt["id"], "Thanks")
-    wait_for(lambda: len(stack.sent(room_id)) == 2, "the answer to the user's reply")
-    assert stack.sent(room_id) == [reply("Question for you"), reply("Thanks")]
     stack.wait_inbound(room_id, 1, status="handled")
+    assert stack.sent(room_id) == [reply("Question for you")]
     assert stack.room(room_id)["binding"]["session_id"] == agent["id"]
 
 
@@ -212,11 +208,11 @@ def test_release_on_session_delete(stack: Stack) -> None:
     answer = stack.wait_prompt(fresh["id"], 1)
     assert "is anyone there?" in answer["text"]
     stack.complete_turn(answer["id"], "Here now")
-    wait_for(lambda: len(stack.sent(room_id)) == 2, "the new session's answer")
-    assert stack.sent(room_id) == [reply("Question for you"), reply("Here now")]
+    stack.wait_inbound(room_id, 1, status="handled")
+    assert stack.sent(room_id) == [reply("Question for you")]
 
 
-def test_no_double_output(stack: Stack) -> None:
+def test_final_text_never_posted_after_a_send(stack: Stack) -> None:
     room_id = stack.portal("dm", {ALICE: "Alice"})
     stack.allow_room(room_id)
     stack.post(room_id, ALICE, text("tell me the result"))
@@ -228,7 +224,7 @@ def test_no_double_output(stack: Stack) -> None:
     stack.complete_turn(prompt["id"], "The result is 42")
 
     [row] = stack.wait_inbound(room_id, 1, status="handled")
-    assert row["reason"] == "already_sent"
+    assert row["reason"] is None
     assert stack.sent(room_id) == [reply("The result is 42")]
 
 

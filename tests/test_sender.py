@@ -751,7 +751,9 @@ async def test_sends_go_out_during_running_chat_run(sender, tracker, pool, hs, o
 
     orch.complete_turn(message.id, "done")
     await tracker.tick()
-    assert hs.sent(R1)[-1] == text_event("done")
+    assert hs.sent(R1) == [text_event("working on it"), text_event("still working")]
+    rows = await execute(pool, "SELECT status, reason FROM runs WHERE id = %s", ref.id)
+    assert rows == [("handled", None)]
 
 
 async def test_restart_exactly_once(
