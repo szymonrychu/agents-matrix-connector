@@ -234,16 +234,18 @@ def test_split_boundaries():
     assert "".join(chunks).replace("\n", "") == text.replace("\n", "")
 
 
-# Representative final texts of the T-556 leaks (the real texts are not in the repo): an operator
-# recap in English (o1985), Claude Code's "no visible output" re-prompt answer, a single emoji
-# (o1992), and a reply to a chat message typed into a turn started by something else (o1984).
+# Real final texts of the T-556 leaks: an operator recap in English (o1985), a single emoji
+# (o1992), a reply to a chat message typed into a turn started by something else (o1984), a
+# thumbs-up (o1994) and an empty final text.
 LEAKED_FINALS = {
     "o1985": (
-        "Recap for the operator: the deck list was checked against the format rules, two cards"
-        " are banned, and the proposed swaps are in the task notes."
+        "The Polish summary for Szymon is already in the room, and most of the Prison Tron map"
+        " is finished"
     ),
     "o1992": "\U0001f64f",
-    "o1984": "You approved proposal P-60 and the agent will start the work now.",
+    "o1984": "You approved proposal P-60",
+    "o1994": "\U0001f44d",
+    "empty": "",
 }
 
 
@@ -275,6 +277,38 @@ async def test_completed_turn_posts_nothing_even_in_anonymized_room(
     assert await run_state(pool, run_id) == ("handled", None)
     assert matrix.sends == []
     assert [m["text"] for m in orch.messages.values() if m["session_id"] == session] == ["prompt"]
+
+
+async def test_chat_message_typed_into_foreign_turn_posts_nothing(
+    tracker, pool, orch, orch_client, hs, matrix
+):
+    # The run's message was queued behind a turn something else started; that turn's final text
+    # arrives on the queued message and must not be posted.
+    run_id, message_id, _ = await seed(pool, orch, orch_client)
+    await tracker.tick()
+    assert orch.messages[message_id]["turn"] is None
+    orch.complete_turn(message_id, "Reply to a chat message typed into someone else's turn.")
+    await tracker.tick()
+    await tracker.tick()
+    assert await run_state(pool, run_id) == ("handled", None)
+    assert await outbound_rows(pool) == []
+    assert bodies(hs) == [] and matrix.sends == []
+
+
+async def test_anonymized_room_final_without_pseudonym_posts_nothing(
+    tracker, pool, orch, orch_client, hs, matrix
+):
+    async with pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO room_settings (room_id, anonymize_names) VALUES (%s, true)", (ROOM,)
+        )
+    run_id, message_id, _ = await seed(pool, orch, orch_client)
+    orch.complete_turn(message_id, "The deck list was checked and two cards are banned.")
+    await tracker.tick()
+    await tracker.tick()
+    assert await run_state(pool, run_id) == ("handled", None)
+    assert await outbound_rows(pool) == []
+    assert matrix.sends == []
 
 
 async def test_resend_is_idempotent(
