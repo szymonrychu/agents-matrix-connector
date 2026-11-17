@@ -23,7 +23,6 @@ TABLES = {
     "room_holds",
     "room_requests",
     "room_notes",
-    "room_skills",
     "send_files",
     "attachment_requests",
     "history_crawls",
@@ -44,6 +43,7 @@ MIGRATIONS = [
     "0010_attachments.sql",
     "0011_chat_history.sql",
     "0012_approvals.sql",
+    "0013_drop_room_skills.sql",
 ]
 
 
@@ -91,7 +91,6 @@ def test_writer_comments(db):
         "room_holds": "writer: bot worker",
         "room_requests": "queue: inserted by api; api confirms or rejects",
         "room_notes": "writer: api",
-        "room_skills": "writer: api",
         "send_files": "queue: inserted by api with its send, upload and clear by bot",
         "attachment_requests": "queue: inserted by api, transitions by bot attachment fetcher",
         "history_crawls": "queue: inserted and transitioned by bot history crawler",
@@ -595,14 +594,14 @@ def test_migration_0011_resets_sync_filter(pg_url):
     name, url = _empty_db(pg_url)
     try:
         with psycopg.connect(url, autocommit=True) as conn:
-            for migration in MIGRATIONS[:-2]:
+            for migration in MIGRATIONS[: MIGRATIONS.index("0011_chat_history.sql")]:
                 conn.execute(_migration(migration))
             conn.execute("UPDATE sync_state SET filter_id = 'f1'")
             conn.execute(
                 "INSERT INTO inbound (event_id, room_id, sender, status)"
                 " VALUES ('$old', '!r', '@u:x', 'handled')"
             )
-            conn.execute(_migration(MIGRATIONS[-2]))
+            conn.execute(_migration("0011_chat_history.sql"))
             filter_id = conn.execute("SELECT filter_id FROM sync_state").fetchone()[0]
             row = conn.execute(
                 "SELECT source, redacted, reply_to_event_id, edited_at FROM inbound"
@@ -686,3 +685,8 @@ def test_approval_tables(db):
             " WHERE i.indrelid = 'approval_answers'::regclass AND i.indisprimary"
         ).fetchall()
         assert primary == [("event_id",)]
+
+
+def test_migration_drops_room_skills(db):
+    with psycopg.connect(db) as conn:
+        assert "room_skills" not in _tables(conn)

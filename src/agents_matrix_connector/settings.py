@@ -50,10 +50,6 @@ class ConnectorSettings(BaseServiceSettings):
     room_requests_per_hour: int = Field(10, ge=1)
     room_notes_max_chars: int = Field(8000, ge=100, le=32000)
     """Max characters (code points) of one room's notes."""
-    room_skill_max_chars: int = Field(8000, ge=100, le=32000)
-    """Max characters (code points) of one room skill body."""
-    room_skills_max: int = Field(20, ge=1, le=100)
-    """Max skills per room."""
     room_memory_rule: str = ""
     """Replaces `prompt.MEMORY_RULE` in first prompts and the notes GET; empty keeps it."""
     inbound_media_max_bytes: int = Field(26214400, ge=1)

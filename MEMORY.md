@@ -587,3 +587,20 @@ Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
   batch. No prompt text names `orchestrator_chat_send/react/status`.
 - `api/agent.py` is unchanged: the orchestrator's envelope worker calls it with the same policy,
   caps and pseudonym check.
+
+## Room skill store removed (2026-11-17, S-68 step 24, T-532)
+
+- The `/chat/v1/skills` routes, `db/skills.py`, the `room_skills` table (migration
+  `0013_drop_room_skills.sql`, `DROP TABLE IF EXISTS`), the skill settings
+  (`MATRIX_ROOM_SKILL_MAX_CHARS`, `MATRIX_ROOM_SKILLS_MAX` and their chart values), the
+  `<room-skills>` index in the first prompt and the "write SKILL.md yourself" text are gone. Why:
+  skills now live in each session's skills directory and ride on the session backups
+  (`orchestrator_backup_save`), so every session of the project gets them (T-505).
+- `MEMORY_RULE` keeps the notes text and gains "Reusable workflows are written as skills in your
+  skills directory; call orchestrator_backup_save afterwards so every session of the project gets
+  them." The old "tell the user you saved it" sentence is dropped (F8). `memory_block` takes only
+  the rule and the notes.
+- Tests deleted as no longer accurate (the feature is removed): `tests/test_skills_repo.py`, the
+  skill route tests in `test_api_agent.py`, the skill cases in settings, chart, readme, prompt and
+  worker tests. Merge only after the room skills migration (T-530) is verified: rooms with stored
+  skills lose them at deploy.
