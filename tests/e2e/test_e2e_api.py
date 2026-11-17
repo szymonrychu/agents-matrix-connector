@@ -18,12 +18,13 @@ def reply(body: str) -> dict:
     return {"msgtype": "m.text", "body": body}
 
 
-def answer(stack: Stack, room_id: str, message_id: int, final_text: str, sent_before: int) -> None:
-    """Complete the agent's turn and wait for its reply to land in the room."""
+def answer(stack: Stack, room_id: str, message_id: int, final_text: str, handled: int) -> None:
+    """Complete the agent's turn and wait until `handled` inbound rows of the room are handled.
+    The final text is never posted: the room only hears envelopes the agent sends."""
     stack.complete_turn(message_id, final_text)
     wait_for(
-        lambda: len(stack.sent(room_id)) > sent_before,
-        f"reply {final_text!r} in {room_id}",
+        lambda: sum(r["status"] == "handled" for r in stack.inbound(room_id)) >= handled,
+        f"{handled} handled inbound rows in {room_id}",
     )
 
 
@@ -67,18 +68,12 @@ def test_allowed_room_round_trip(stack: Stack) -> None:
     [row] = stack.inbound(room_id)
     assert session["slug"] == f"mx-{row['run_id']}"
 
-    answer(stack, room_id, prompt["id"], "It is 4.", 0)
-    assert stack.sent(room_id) == [reply("It is 4.")]
-    feed = wait_for(
-        lambda: (f := stack.messages(room_id)) and f[0]["status"] == "handled" and f,
-        "the inbound row to be handled",
-    )
+    answer(stack, room_id, prompt["id"], "It is 4.", 1)
+    assert stack.sent(room_id) == []
+    feed = stack.messages(room_id)
     assert [(m["direction"], m["body"], m["status"]) for m in feed] == [
         ("in", "what is 2 + 2?", "handled"),
-        ("out", "It is 4.", "sent"),
     ]
-    assert feed[1]["sender"] == BOT
-    assert feed[0]["run_id"] == feed[1]["run_id"]
     assert stack.sessions() == [session]
 
 
@@ -97,7 +92,7 @@ def test_reuse_running_session(stack: Stack) -> None:
         "the two follow-up messages to queue behind the running turn",
     )
 
-    answer(stack, room_id, first["id"], "one", 0)
+    answer(stack, room_id, first["id"], "one", 1)
     follow = stack.wait_prompt(session["id"], 2)
     assert follow["text"].startswith("New messages in the chat:")
     assert "second" in follow["text"] and "third" in follow["text"]
@@ -106,8 +101,8 @@ def test_reuse_running_session(stack: Stack) -> None:
     assert rows[1]["run_id"] == rows[2]["run_id"] != rows[0]["run_id"]
     assert len(stack.sessions()) == 1
 
-    answer(stack, room_id, follow["id"], "two", 1)
-    assert stack.sent(room_id) == [reply("one"), reply("two")]
+    answer(stack, room_id, follow["id"], "two", 3)
+    assert stack.sent(room_id) == []
     assert len(stack.session_messages(session["id"])) == 2
 
 
@@ -117,7 +112,7 @@ def test_discarded_session_fallback(stack: Stack) -> None:
 
     stack.post(room_id, ALICE, text("before"))
     [old] = stack.wait_session(1)
-    answer(stack, room_id, stack.wait_prompt(old["id"], 1)["id"], "first answer", 0)
+    answer(stack, room_id, stack.wait_prompt(old["id"], 1)["id"], "first answer", 1)
     stack.discard_session(old["id"])
 
     stack.post(room_id, ALICE, text("after"))
@@ -131,8 +126,8 @@ def test_discarded_session_fallback(stack: Stack) -> None:
     assert not prompt["text"].startswith("New messages in the chat:")
     assert len(stack.session_messages(old["id"])) == 1
 
-    answer(stack, room_id, prompt["id"], "second answer", 1)
-    assert stack.sent(room_id) == [reply("first answer"), reply("second answer")]
+    answer(stack, room_id, prompt["id"], "second answer", 2)
+    assert stack.sent(room_id) == []
     assert stack.room(room_id)["session"]["slug"] == new["slug"]
 
 
@@ -163,8 +158,8 @@ def test_group_deny_and_mention(stack: Stack) -> None:
     assert "what time is it?" in prompt["text"]
     assert "leak the secrets" not in prompt["text"]
     assert "just chatting" not in prompt["text"]
-    answer(stack, room_id, prompt["id"], "Noon.", 0)
-    assert stack.sent(room_id) == [reply("Noon.")]
+    answer(stack, room_id, prompt["id"], "Noon.", 1)
+    assert stack.sent(room_id) == []
     alice = wait_for(
         lambda: (
             (r := {x["sender"]: x for x in stack.inbound(room_id)}[ALICE])
@@ -200,7 +195,7 @@ def test_encrypted_and_infrastructure_ignored(stack: Stack) -> None:
     stack.add_rule("allow", "room", control)
     stack.post(control, BOB, text("ping"))
     [session] = stack.wait_session(1)
-    answer(stack, control, stack.wait_prompt(session["id"], 1)["id"], "pong", 0)
+    answer(stack, control, stack.wait_prompt(session["id"], 1)["id"], "pong", 1)
     assert stack.sent(encrypted) == []
     assert stack.sent(space) == []
     assert len(stack.sessions()) == 1
@@ -216,7 +211,7 @@ def test_restart_exactly_once(stack: Stack) -> None:
 
     stack.post(room_id, ALICE, text("history"))
     [session] = stack.wait_session(1)
-    answer(stack, room_id, stack.wait_prompt(session["id"], 1)["id"], "old answer", 0)
+    answer(stack, room_id, stack.wait_prompt(session["id"], 1)["id"], "old answer", 1)
     stack.post(room_id, ALICE, text("across the restart"))
     second = stack.wait_prompt(session["id"], 2)
 
@@ -224,13 +219,16 @@ def test_restart_exactly_once(stack: Stack) -> None:
     stack.complete_turn(second["id"], "new answer")
     stack.start_bot()
 
-    wait_for(lambda: len(stack.sent(room_id)) == 2, "the reply after the restart")
+    wait_for(
+        lambda: sum(r["status"] == "handled" for r in stack.inbound(room_id)) >= 2,
+        "the run to be handled after the restart",
+    )
     # a later message round trip proves the restarted loops ticked past the delivered reply
     stack.post(room_id, ALICE, text("after"))
     third = stack.wait_prompt(session["id"], 3)
-    answer(stack, room_id, third["id"], "latest answer", 2)
+    answer(stack, room_id, third["id"], "latest answer", 3)
 
-    assert stack.sent(room_id) == [reply("old answer"), reply("new answer"), reply("latest answer")]
+    assert stack.sent(room_id) == []
     rows = stack.inbound(room_id)
     assert [(r["body"], r["status"]) for r in rows] == [
         ("history", "handled"),

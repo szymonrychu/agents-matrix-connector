@@ -208,11 +208,8 @@ Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
   names); bodies are never rewritten and there is no real-name check: the user wants real names
   usable and only the pseudonyms kept out of the chat. A pseudonym in outbound text is
   rejected, never redacted: the API answers 422 `pseudonym_disclosed` naming the tokens; the
-  tracker fails the run `pseudonym_disclosed` before `_send_match` (so it is never matched as
-  already sent), posts nothing to the room (no generic notice, the agent is expected to answer
-  itself) and posts a message into the run's session through the orchestrator naming the tokens
-  and asking for a rephrased `orchestrator_chat_send`; that post is best effort and logged on
-  failure. Matching folds NFKC/casefold and drops invisible characters so width or zero-width
+  agent send route enforces it (the tracker no longer posts final text, see 2026-11-17).
+  Matching folds NFKC/casefold and drops invisible characters so width or zero-width
   tricks do not slip a token past. Admin relays and the UI keep real names.
 - Room ids: the `room` rule format accepts `!opaque:server` and the server-less `!opaque` of
   Matrix room version 12 (`!` + 43-char url-safe base64 of the create event hash). Why: the
@@ -488,7 +485,7 @@ Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
   request per tick, claimed in its own committed transaction; the binding and row are re-checked
   on one connection, then no connection is held during the download and the post. The file is
   posted with `post_message` without `from_user`: it is system delivery, not a user message, so
-  the text tells the agent to reach the chat with `orchestrator_chat_send`.
+  the text tells the agent to reach the chat with a `<chat-send>` envelope (2026-11-17).
 - The sender role (`role="admin"`) is computed like the worker does, from `anonymize.is_admin`;
   anonymized rooms show the pseudonym and never the original file name.
 - Only fixed reasons and ids are logged (`attachment a<id>: <status> (<reason>)`).
@@ -575,3 +572,18 @@ Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
 - The writer name is the optional `X-Orch-Slug` header (the admin routes otherwise ignore session
   headers); the audit line is `admin notes update session=<slug> room=<id>` and never carries the
   body. The skill store stays in this release.
+
+## Envelope replies, no final text (2026-11-17, S-70 step 6, T-563)
+
+- Decision 793: the connector never posts a turn's final text. A completed turn closes the run
+  `handled` (reason None) with no outbound rows; failure paths (`turn_failed`, timeout, message
+  failed or cancelled) still post `NOTICE`. Why: posting final text was fail-open and leaked
+  operator recaps, "no visible output" emoji and foreign-turn answers into the room (T-556).
+  Removed: `_disclosure`, `_send_match`, `_tell`, `EMPTY_REPLY`, `ALREADY_SENT`,
+  `sends.message_sends_since`, the run reasons `pseudonym_disclosed` (tracker side only; the API
+  still answers 422) and the session "not sent" message.
+- Prompt: `REPLY_RULE` is fixed text after `ADMIN_TRUST_RULE` on every first prompt (a custom
+  preamble cannot drop it); `FOLLOW_REMINDER` follows "New messages in the chat:" in every follow
+  batch. No prompt text names `orchestrator_chat_send/react/status`.
+- `api/agent.py` is unchanged: the orchestrator's envelope worker calls it with the same policy,
+  caps and pseudonym check.
