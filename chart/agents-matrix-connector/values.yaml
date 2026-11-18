@@ -72,10 +72,6 @@ limits:
   roomRequestsPerHour: 10
   # MATRIX_ROOM_NOTES_MAX_CHARS: max characters of one room's notes (100 to 32000).
   roomNotesMaxChars: 8000
-  # MATRIX_ROOM_SKILL_MAX_CHARS: max characters of one room skill body (100 to 32000).
-  roomSkillMaxChars: 8000
-  # MATRIX_ROOM_SKILLS_MAX: max skills per room (1 to 100).
-  roomSkillsMax: 20
 
 roomMemory:
   # MATRIX_ROOM_MEMORY_RULE: replaces the built-in room memory rule in first prompts and the

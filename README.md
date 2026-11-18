@@ -72,8 +72,6 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_ANONYMIZE_ADMINS` | empty | api, bot | Matrix user ids or numeric Facebook ids, comma separated, shown as `admin-<sha>` instead of `user-<sha>` in rooms with `anonymize_names` |
 | `MATRIX_ROOM_REQUESTS_PER_HOUR` | 10 | api | max open and invite room requests created in the last hour, all sessions together (>= 1); more answer 429 `rate_limited` |
 | `MATRIX_ROOM_NOTES_MAX_CHARS` | 8000 | api | max characters of one room's notes (100 to 32000); a longer PUT is 413 `notes_too_large` |
-| `MATRIX_ROOM_SKILL_MAX_CHARS` | 8000 | api | max characters of one skill body (100 to 32000); longer is 413 `skill_too_large` |
-| `MATRIX_ROOM_SKILLS_MAX` | 20 | api | max skills per room (1 to 100); another create is 409 `skill_limit` |
 | `MATRIX_ROOM_MEMORY_RULE` | empty | worker and api | replaces the built-in room memory rule in first prompts and the notes GET; empty keeps the built-in |
 | `MATRIX_ACCESS_TOKEN` | none | bot | Matrix access token (required unless the file is set) |
 | `MATRIX_ACCESS_TOKEN_FILE` | empty | bot | file holding the Matrix access token; wins over the variable, stripped |
@@ -461,11 +459,8 @@ Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
 | `file_too_large` | 413 | a file is over `MATRIX_AGENT_IMAGE_MAX_BYTES` (images) or `MATRIX_AGENT_FILE_MAX_BYTES` (other files) |
 | `room_file_bytes_limit` | 429 | the send would take the room past `MATRIX_AGENT_ROOM_FILE_BYTES_PER_HOUR` file bytes in the last hour |
 | `pseudonym_disclosed` | 422 | the room has `anonymize_names` and the message `text` or a file name contains a pseudonym (`user-<sha>`, `admin-<sha>`); the message names the tokens found, refer to the person differently |
-| `room_unbound` | 409 | the notes or skills routes need the session to be bound to a chat room, and it is bound to none |
+| `room_unbound` | 409 | the notes routes need the session to be bound to a chat room, and it is bound to none |
 | `version_conflict` | 409 | `expected_version` is not the stored version: re-read and merge, then write again |
-| `skill_not_found` | 404 | the room has no skill of that name (also a PUT with `expected_version` above 0 on a missing one) |
-| `skill_too_large` | 413 | the skill `body` is over `MATRIX_ROOM_SKILL_MAX_CHARS` characters (counted in code points) |
-| `skill_limit` | 409 | creating the skill would pass `MATRIX_ROOM_SKILLS_MAX` skills in the room: delete one first |
 | `notes_too_large` | 413 | the notes `body` is over `MATRIX_ROOM_NOTES_MAX_CHARS` characters (counted in code points) |
 | `unavailable` | 503 | the database (or, for `files`, the orchestrator) is unavailable |
 
@@ -619,52 +614,6 @@ empty `body` forgets the notes. The body is capped at `MATRIX_ROOM_NOTES_MAX_CHA
       -H 'content-type: application/json' \
       -d '{"body": "## Requests\n- example", "expected_version": 0}' \
       http://localhost:8001/chat/v1/notes
-
-### `GET /chat/v1/skills`
-
-The skills of the session's bound room, without bodies. 200 `{"room_id", "skills": [{"name",
-"description", "version", "updated_at", "chars"}], "max_skills", "max_chars"}` ordered by name;
-401 `unauthorized`; 409 `room_unbound`; 503 `unavailable`.
-
-    curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
-      http://localhost:8001/chat/v1/skills
-
-### `GET /chat/v1/skills/{name}`
-
-One skill with its body: 200 `{"room_id", "name", "description", "body", "version",
-"updated_at", "chars", "max_chars"}`. `name` is 1 to 64 characters of lowercase letters, digits
-and hyphens, starting with a letter or digit (a valid SKILL.md directory name), else 422
-`invalid_request`. 404 `skill_not_found`; 401 `unauthorized`; 409 `room_unbound`; 503
-`unavailable`.
-
-    curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
-      http://localhost:8001/chat/v1/skills/deck-tune
-
-### `PUT /chat/v1/skills/{name}`
-
-Create or replace a skill of the session's bound room. Body `{"description": str, "body": str,
-"expected_version": int}`: `description` 1 to 1024 characters (when to use the skill), `body`
-at least 1 character and at most `MATRIX_ROOM_SKILL_MAX_CHARS` code points, `expected_version`
-0 to create or the version read to replace. 200 the same shape as the GET; 401 `unauthorized`;
-404 `skill_not_found` (`expected_version` above 0 and no such skill); 409 `room_unbound`,
-`version_conflict` or `skill_limit` (more than `MATRIX_ROOM_SKILLS_MAX` skills, checked under a
-per-room lock so concurrent creates cannot pass it; replacing an existing skill is always
-allowed); 413 `skill_too_large`; 422 `invalid_request`; 503 `unavailable`. Descriptions and
-bodies are never written to a log.
-
-    curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
-      -H 'content-type: application/json' \
-      -d '{"description": "when to use it", "body": "1. step", "expected_version": 0}' \
-      http://localhost:8001/chat/v1/skills/deck-tune
-
-### `DELETE /chat/v1/skills/{name}`
-
-Delete a skill of the session's bound room: 200 `{"room_id", "name", "deleted": true}`; 404
-`skill_not_found`; 401 `unauthorized`; 409 `room_unbound`; 422 `invalid_request`; 503
-`unavailable`.
-
-    curl -s -X DELETE -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
-      http://localhost:8001/chat/v1/skills/deck-tune
 
 ### Admin routes (`/chat/v1/admin`)
 

@@ -74,7 +74,6 @@ from agents_matrix_connector.db import (
     notes,
     rules,
     runs,
-    skills,
 )
 from agents_matrix_connector.db.bindings import BindingRow
 from agents_matrix_connector.db.inbound import InboundRow
@@ -541,15 +540,13 @@ class Worker:
         )
 
     async def _memory(self, room_id: str) -> str:
-        """The room memory block of a first prompt: the rule, the room's notes and the index of
-        its skills. Only this room's rows are read; bodies are never logged."""
+        """The room memory block of a first prompt: the rule and the room's notes. Only this
+        room's row is read; the body is never logged."""
         async with self._pool.connection() as conn:
             row = await notes.get(conn, room_id)
-            room_skills = await skills.list_for_room(conn, room_id)
         return prompt.memory_block(
             prompt.memory_rule(self._settings),
             row.body if row else "",
-            [(skill.name, skill.description) for skill in room_skills],
         )
 
     def _is_admin(self, row: InboundRow) -> bool:

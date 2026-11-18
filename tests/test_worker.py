@@ -15,7 +15,7 @@ from agents_common.orchestrator import (
 from PIL import Image
 
 from agents_matrix_connector.anonymize import pseudonym
-from agents_matrix_connector.db import bindings, holds, inbound, notes, runs, skills
+from agents_matrix_connector.db import bindings, holds, inbound, notes, runs
 from agents_matrix_connector.db.bindings import BindingRow
 from agents_matrix_connector.discovery import Media
 from agents_matrix_connector.fake_homeserver import FakeHomeserver
@@ -1286,12 +1286,9 @@ async def _memory_text(conn, fake, make_worker, room=DM, **overrides) -> str:
 
 async def test_first_prompt_includes_memory(conn, fake, make_worker):
     await notes.put(conn, DM, "## Requests\n- fix deck", 0, "hive-1")
-    await skills.put(conn, DM, "deck-tune", "tune a deck", "steps", 0, "hive-1")
     text = await _memory_text(conn, fake, make_worker)
     assert MEMORY_RULE in text
     assert "<room-notes>\n## Requests\n- fix deck\n</room-notes>" in text
-    assert '<skill name="deck-tune">tune a deck</skill>' in text
-    assert "steps" not in text.replace(MEMORY_RULE, "")
     assert text.index(ADMIN_TRUST_RULE) < text.index(MEMORY_RULE) < text.index("<chat ")
 
 
@@ -1322,12 +1319,11 @@ async def test_followup_prompt_has_no_memory(conn, fake, make_worker):
 
 async def test_first_prompt_memory_only_own_room(conn, fake, make_worker):
     await notes.put(conn, OTHER, "other room notes", 0, None)
-    await skills.put(conn, OTHER, "other-skill", "other desc", "b", 0, None)
     text = await _memory_text(conn, fake, make_worker)
     assert MEMORY_RULE in text
     body = text.replace(MEMORY_RULE, "")
     assert "<room-notes>" not in body and "<room-skills>" not in body
-    assert "other room notes" not in text and "other-skill" not in text
+    assert "other room notes" not in text
 
 
 async def test_bound_session_new_to_room_gets_memory(conn, fake, make_worker):
