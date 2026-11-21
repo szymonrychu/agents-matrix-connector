@@ -70,8 +70,12 @@ limits:
   agentRatePerMinute: 20
   # MATRIX_ROOM_REQUESTS_PER_HOUR: open and invite room requests accepted per hour, all agents.
   roomRequestsPerHour: 10
-  # MATRIX_ROOM_NOTES_MAX_CHARS: max characters of one room's notes (100 to 32000).
-  roomNotesMaxChars: 8000
+  # MATRIX_ROOM_NOTES_MAX_CHARS: max characters of all note sections of one room together
+  # (100 to 32000).
+  roomNotesMaxChars: 20000
+  # MATRIX_ROOM_NOTES_SECTION_MAX_CHARS: max characters of one note section (100 to 32000, at
+  # most roomNotesMaxChars).
+  roomNotesSectionMaxChars: 4000
 
 roomMemory:
   # MATRIX_ROOM_MEMORY_RULE: replaces the built-in room memory rule in first prompts and the

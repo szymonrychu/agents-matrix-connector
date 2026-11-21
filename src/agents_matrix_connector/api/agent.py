@@ -9,7 +9,7 @@ token and its hash never reach a log line or an error body. Probes stay open.
 The `/chat/v1` routes (design D2, D4, D5, D6) act for the session named by `X-Orch-Session`.
 They list the rooms the session may post to, queue messages and reactions as `sends` rows and
 read a send's status. One predicate, `may_post`, decides every room for the send routes and the
-listing. The api inserts `sends` rows and writes `room_notes`, but never
+listing. The api inserts `sends` rows and writes `room_note_sections`, but never
 `room_bindings`: the bot's claim of a send re-checks the room and is the binding step (D9).
 The notes routes never take a room: it is the caller session's active binding.
 """
@@ -65,7 +65,7 @@ from agents_matrix_connector.db import (
     send_files,
     sends,
 )
-from agents_matrix_connector.prompt import memory_rule
+from agents_matrix_connector.prompt import memory_rule, render_sections
 from agents_matrix_connector.settings import ApiSettings, ConnectorSettings
 
 log = logging.getLogger(__name__)
@@ -88,7 +88,7 @@ _ADMIN_ROUTES = frozenset(
         ("/room-requests", "POST"),
         ("/room-requests/{request_id}", "GET"),
         ("/rooms/{room_id}/notes", "GET"),
-        ("/rooms/{room_id}/notes", "PUT"),
+        ("/rooms/{room_id}/notes/sections/{section}", "PUT"),
     }
 )
 HEALTH_METHODS = frozenset({"GET", "HEAD"})
@@ -300,20 +300,38 @@ class AttachmentStatus(BaseModel):
     done_at: datetime | None
 
 
-class NotesIn(_Body):
+class NoteSectionIn(_Body):
     body: str
-    """The whole notes body; empty forgets the notes."""
+    """The whole body of this section; empty forgets the section."""
     expected_version: int = Field(ge=0)
-    """The version read before (0 when none exists yet); a stale one is 409 version_conflict."""
+    """This section's version read before (0 when it was never written); a stale one is 409
+    version_conflict."""
+
+
+class NoteSection(BaseModel):
+    key: notes.SectionKey
+    title: str
+    body: str
+    version: int
+    """0 when the section was never written."""
+    chars: int
+    inject: bool
+    """Shown in the first prompt of a session; the others are only listed there by size."""
+    updated_at: datetime | None
 
 
 class RoomNotes(BaseModel):
     room_id: str
     body: str
-    version: int
-    updated_at: datetime | None
+    """The non-empty listed sections rendered as `## <Title>` plus body, in fixed order."""
     chars: int
+    """Characters of all sections of the room together."""
     max_chars: int
+    """The cap of all sections of the room together."""
+    section_max_chars: int
+    """The cap of one section."""
+    sections: list[NoteSection]
+    """All five sections in fixed order, or only the one asked for with `section`."""
     rule: str
     """The room memory rule: how to keep notes and skills."""
 
@@ -1022,80 +1040,119 @@ def build_chat_router(
             done_at=row.done_at,
         )
 
-    notes_errors = _errors(400, 401, 409, 413, 422, 503)
-
-    def room_notes(room_id: str, row: notes.NotesRow | None) -> RoomNotes:
-        return _room_notes(settings, room_id, row)
-
-    @router.get("/notes", response_model=RoomNotes, responses=_errors(400, 401, 409, 503))
-    async def get_notes(who: Annotated[Caller, Depends(caller)]) -> RoomNotes:
-        """The notes of the room this session is bound to (empty, version 0, when none), with
-        the room memory rule."""
+    @router.get("/notes", response_model=RoomNotes, responses=_errors(400, 401, 409, 422, 503))
+    async def get_notes(
+        who: Annotated[Caller, Depends(caller)],
+        section: Annotated[notes.SectionKey | None, Query()] = None,
+    ) -> RoomNotes:
+        """The note sections of the room this session is bound to (never written ones empty,
+        version 0), with the room memory rule; `section` narrows `sections` and `body` to one
+        section, the totals stay room-wide."""
         async with pool.connection() as conn:
             room_id = await _own_room(conn, who)
-            row = await notes.get(conn, room_id)
-        log.info(
-            "notes read session=%s room=%s version=%s",
-            who.session_id,
-            room_id,
-            row.version if row else 0,
-        )
-        return room_notes(room_id, row)
+            rows = await notes.get_all(conn, room_id)
+        log.info("notes read session=%s room=%s section=%s", who.session_id, room_id, section)
+        return _room_notes(settings, room_id, rows, section)
 
-    @router.put("/notes", response_model=RoomNotes, responses=notes_errors)
-    async def put_notes(who: Annotated[Caller, Depends(caller)], body: NotesIn) -> RoomNotes:
-        """Replace the notes of the room this session is bound to, guarded by the version read
-        before (0 creates); an empty body forgets them. Over the cap is 413."""
-        _check_notes_cap(settings, body)
+    @router.put(
+        "/notes/sections/{section}",
+        response_model=RoomNotes,
+        responses=_errors(400, 401, 409, 413, 422, 503),
+    )
+    async def put_note_section(
+        who: Annotated[Caller, Depends(caller)], section: notes.SectionKey, body: NoteSectionIn
+    ) -> RoomNotes:
+        """Replace one section of the room this session is bound to, guarded by that
+        section's version read before (0 creates); an empty body forgets the section. Over
+        the section cap or the room total is 413."""
         async with pool.connection() as conn, conn.transaction():
             room_id = await _own_room(conn, who)
-            row = await _store_notes(conn, room_id, body, who.slug)
+            row = await _store_section(conn, settings, room_id, section, body, who.slug)
+            rows = await notes.get_all(conn, room_id)
         log.info(
-            "notes write session=%s room=%s version=%s chars=%s",
+            "notes write session=%s room=%s section=%s version=%s chars=%s",
             who.session_id,
             room_id,
+            section,
             row.version,
             len(row.body),
         )
-        return room_notes(room_id, row)
+        return _room_notes(settings, room_id, rows)
 
     return router
 
 
-def _room_notes(settings: ApiSettings, room_id: str, row: notes.NotesRow | None) -> RoomNotes:
-    body = row.body if row else ""
+def _room_notes(
+    settings: ApiSettings,
+    room_id: str,
+    rows: list[notes.SectionRow],
+    only: notes.SectionKey | None = None,
+) -> RoomNotes:
+    stored = {row.section: row for row in rows}
+    listed = []
+    for spec in notes.SECTIONS:
+        if only is not None and spec.key != only:
+            continue
+        row = stored.get(spec.key)
+        body = row.body if row else ""
+        listed.append(
+            NoteSection(
+                key=spec.key,
+                title=spec.title,
+                body=body,
+                version=row.version if row else 0,
+                chars=len(body),
+                inject=spec.inject,
+                updated_at=row.updated_at if row else None,
+            )
+        )
     return RoomNotes(
         room_id=room_id,
-        body=body,
-        version=row.version if row else 0,
-        updated_at=row.updated_at if row else None,
-        chars=len(body),
+        body=render_sections([row for row in rows if only is None or row.section == only]),
+        chars=sum(len(row.body) for row in rows),
         max_chars=settings.room_notes_max_chars,
+        section_max_chars=settings.room_notes_section_max_chars,
+        sections=listed,
         rule=memory_rule(settings),
     )
 
 
-def _check_notes_cap(settings: ApiSettings, body: NotesIn) -> None:
-    cap = settings.room_notes_max_chars
-    if len(body.body) > cap:
-        raise ApiError(
-            413, "notes_too_large", f"body: at most {cap} characters, got {len(body.body)}"
+async def _store_section(
+    conn: psycopg.AsyncConnection,
+    settings: ApiSettings,
+    room_id: str,
+    section: notes.SectionKey,
+    body: NoteSectionIn,
+    slug: str | None,
+) -> notes.SectionRow:
+    try:
+        return await notes.put_section(
+            conn,
+            room_id,
+            section,
+            body.body,
+            body.expected_version,
+            slug,
+            section_cap=settings.room_notes_section_max_chars,
+            total_cap=settings.room_notes_max_chars,
         )
-
-
-async def _store_notes(
-    conn: psycopg.AsyncConnection, room_id: str, body: NotesIn, slug: str | None
-) -> notes.NotesRow:
-    row = await notes.put(conn, room_id, body.body, body.expected_version, slug)
-    if row is None:
-        current = await notes.get(conn, room_id)
-        raise _version_conflict(body.expected_version, current.version if current else 0)
-    return row
+    except notes.SectionTooLarge as exc:
+        raise ApiError(
+            413,
+            "section_too_large",
+            f"section {exc.section}: at most {exc.cap} characters, got {exc.got}",
+        ) from None
+    except notes.NotesTooLarge as exc:
+        raise ApiError(
+            413, "notes_too_large", f"all sections: at most {exc.cap} characters, got {exc.got}"
+        ) from None
+    except notes.VersionConflict as exc:
+        raise _version_conflict(exc.expected, exc.current) from None
 
 
 def build_admin_notes_router(pool: AsyncConnectionPool, settings: ApiSettings) -> APIRouter:
-    """The notes of any known room by id for the superleader and cron sessions, which are
-    room-unbound. The same item-level body and version guard as the bound-session routes."""
+    """The note sections of any known room by id for the superleader and cron sessions, which
+    are room-unbound. The same section caps and version guard as the bound-session routes."""
     router = APIRouter()
 
     async def require_room(room_id: str) -> None:
@@ -1105,32 +1162,36 @@ def build_admin_notes_router(pool: AsyncConnectionPool, settings: ApiSettings) -
     @router.get(
         "/rooms/{room_id}/notes",
         response_model=RoomNotes,
-        responses=_errors(401, 404, 503),
+        responses=_errors(401, 404, 422, 503),
     )
-    async def get_admin_notes(room_id: str) -> RoomNotes:
-        """The notes of any known room (empty, version 0, when none); needs no binding."""
+    async def get_admin_notes(
+        room_id: str, section: Annotated[notes.SectionKey | None, Query()] = None
+    ) -> RoomNotes:
+        """The note sections of any known room (never written ones empty, version 0); needs
+        no binding. `section` narrows like `GET /chat/v1/notes`."""
         await require_room(room_id)
         async with pool.connection() as conn:
-            row = await notes.get(conn, room_id)
-        return _room_notes(settings, room_id, row)
+            rows = await notes.get_all(conn, room_id)
+        return _room_notes(settings, room_id, rows, section)
 
     @router.put(
-        "/rooms/{room_id}/notes",
+        "/rooms/{room_id}/notes/sections/{section}",
         response_model=RoomNotes,
         responses=_errors(401, 404, 409, 413, 422, 503),
     )
-    async def put_admin_notes(
+    async def put_admin_note_section(
         room_id: str,
-        body: NotesIn,
+        section: notes.SectionKey,
+        body: NoteSectionIn,
         slug: Annotated[str | None, Header(alias="X-Orch-Slug")] = None,
     ) -> RoomNotes:
-        """Replace the notes of any known room, guarded by the version read before."""
-        _check_notes_cap(settings, body)
+        """Replace one section of any known room, guarded by that section's version."""
         await require_room(room_id)
         async with pool.connection() as conn, conn.transaction():
-            row = await _store_notes(conn, room_id, body, slug)
-        log.info("admin notes update session=%s room=%s", slug, room_id)
-        return _room_notes(settings, room_id, row)
+            await _store_section(conn, settings, room_id, section, body, slug)
+            rows = await notes.get_all(conn, room_id)
+        log.info("admin notes update session=%s room=%s section=%s", slug, room_id, section)
+        return _room_notes(settings, room_id, rows)
 
     return router
 

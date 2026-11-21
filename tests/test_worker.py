@@ -1284,11 +1284,29 @@ async def _memory_text(conn, fake, make_worker, room=DM, **overrides) -> str:
     return message["text"]
 
 
-async def test_first_prompt_includes_memory(conn, fake, make_worker):
-    await notes.put(conn, DM, "## Requests\n- fix deck", 0, "hive-1")
+async def put_note(conn, room_id, section, body):
+    async with conn.transaction():
+        await notes.put_section(
+            conn, room_id, section, body, 0, None, section_cap=32000, total_cap=32000
+        )
+
+
+async def test_first_prompt_injects_flagged_sections_and_index(conn, fake, make_worker):
+    await put_note(conn, DM, "work-in-progress", "- building deck")
+    await put_note(conn, DM, "preferences", "- tea")
+    await put_note(conn, DM, "provided-information", "DECKLIST-BODY " + "x" * 86)
+    await put_note(conn, DM, "repeatable-workflows", "")
     text = await _memory_text(conn, fake, make_worker)
     assert MEMORY_RULE in text
-    assert "<room-notes>\n## Requests\n- fix deck\n</room-notes>" in text
+    assert (
+        "<room-notes>\n## Preferences\n- tea\n\n## Work in progress\n- building deck\n</room-notes>"
+    ) in text
+    assert "DECKLIST-BODY" not in text
+    assert (
+        "Provided information - 100 chars, read with "
+        'orchestrator_chat_notes_get(section="provided-information")'
+    ) in text
+    assert "Repeatable workflows -" not in text
     assert text.index(ADMIN_TRUST_RULE) < text.index(MEMORY_RULE) < text.index("<chat ")
 
 
@@ -1300,7 +1318,7 @@ async def test_first_prompt_rule_without_notes(conn, fake, make_worker):
 
 
 async def test_followup_prompt_has_no_memory(conn, fake, make_worker):
-    await notes.put(conn, DM, "remember this", 0, None)
+    await put_note(conn, DM, "requests", "remember this")
     await add_room(conn, DM)
     leader = add_session(fake, "hive-lead")
     await bind_agent(conn, DM, leader)
@@ -1318,7 +1336,7 @@ async def test_followup_prompt_has_no_memory(conn, fake, make_worker):
 
 
 async def test_first_prompt_memory_only_own_room(conn, fake, make_worker):
-    await notes.put(conn, OTHER, "other room notes", 0, None)
+    await put_note(conn, OTHER, "requests", "other room notes")
     text = await _memory_text(conn, fake, make_worker)
     assert MEMORY_RULE in text
     body = text.replace(MEMORY_RULE, "")
@@ -1328,7 +1346,7 @@ async def test_first_prompt_memory_only_own_room(conn, fake, make_worker):
 
 async def test_bound_session_new_to_room_gets_memory(conn, fake, make_worker):
     """A scheduled session bound by an agent send gets the block on its first inbound batch."""
-    await notes.put(conn, THIRD, "third notes", 0, None)
+    await put_note(conn, THIRD, "requests", "third notes")
     await add_room(conn, OTHER, name="Other")
     await add_room(conn, THIRD, name="Third")
     other = add_session(fake, "hive-other")

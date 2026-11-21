@@ -770,7 +770,65 @@
         "title": "MessageIn",
         "type": "object"
       },
-      "NotesIn": {
+      "NoteSection": {
+        "properties": {
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "chars": {
+            "title": "Chars",
+            "type": "integer"
+          },
+          "inject": {
+            "title": "Inject",
+            "type": "boolean"
+          },
+          "key": {
+            "enum": [
+              "preferences",
+              "requests",
+              "work-in-progress",
+              "provided-information",
+              "repeatable-workflows"
+            ],
+            "title": "Key",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "key",
+          "title",
+          "body",
+          "version",
+          "chars",
+          "inject",
+          "updated_at"
+        ],
+        "title": "NoteSection",
+        "type": "object"
+      },
+      "NoteSectionIn": {
         "additionalProperties": false,
         "properties": {
           "body": {
@@ -787,7 +845,7 @@
           "body",
           "expected_version"
         ],
-        "title": "NotesIn",
+        "title": "NoteSectionIn",
         "type": "object"
       },
       "PendingView": {
@@ -1367,30 +1425,25 @@
             "title": "Rule",
             "type": "string"
           },
-          "updated_at": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Updated At"
-          },
-          "version": {
-            "title": "Version",
+          "section_max_chars": {
+            "title": "Section Max Chars",
             "type": "integer"
+          },
+          "sections": {
+            "items": {
+              "$ref": "#/components/schemas/NoteSection"
+            },
+            "title": "Sections",
+            "type": "array"
           }
         },
         "required": [
           "room_id",
           "body",
-          "version",
-          "updated_at",
           "chars",
           "max_chars",
+          "section_max_chars",
+          "sections",
           "rule"
         ],
         "title": "RoomNotes",
@@ -2610,7 +2663,7 @@
     },
     "/chat/v1/admin/rooms/{room_id}/notes": {
       "get": {
-        "description": "The notes of any known room (empty, version 0, when none); needs no binding.",
+        "description": "The note sections of any known room (never written ones empty, version 0); needs\nno binding. `section` narrows like `GET /chat/v1/notes`.",
         "operationId": "get_admin_notes_chat_v1_admin_rooms__room_id__notes_get",
         "parameters": [
           {
@@ -2620,6 +2673,29 @@
             "schema": {
               "title": "Room Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "section",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "preferences",
+                    "requests",
+                    "work-in-progress",
+                    "provided-information",
+                    "repeatable-workflows"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Section"
             }
           }
         ],
@@ -2658,11 +2734,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Unprocessable Entity"
           },
           "503": {
             "content": {
@@ -2676,10 +2752,12 @@
           }
         },
         "summary": "Get Admin Notes"
-      },
+      }
+    },
+    "/chat/v1/admin/rooms/{room_id}/notes/sections/{section}": {
       "put": {
-        "description": "Replace the notes of any known room, guarded by the version read before.",
-        "operationId": "put_admin_notes_chat_v1_admin_rooms__room_id__notes_put",
+        "description": "Replace one section of any known room, guarded by that section's version.",
+        "operationId": "put_admin_note_section_chat_v1_admin_rooms__room_id__notes_sections__section__put",
         "parameters": [
           {
             "in": "path",
@@ -2687,6 +2765,22 @@
             "required": true,
             "schema": {
               "title": "Room Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "section",
+            "required": true,
+            "schema": {
+              "enum": [
+                "preferences",
+                "requests",
+                "work-in-progress",
+                "provided-information",
+                "repeatable-workflows"
+              ],
+              "title": "Section",
               "type": "string"
             }
           },
@@ -2711,7 +2805,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/NotesIn"
+                "$ref": "#/components/schemas/NoteSectionIn"
               }
             }
           },
@@ -2789,7 +2883,7 @@
             "description": "Service Unavailable"
           }
         },
-        "summary": "Put Admin Notes"
+        "summary": "Put Admin Note Section"
       }
     },
     "/chat/v1/admin/rooms/{room_id}/settings": {
@@ -3799,9 +3893,32 @@
     },
     "/chat/v1/notes": {
       "get": {
-        "description": "The notes of the room this session is bound to (empty, version 0, when none), with\nthe room memory rule.",
+        "description": "The note sections of the room this session is bound to (never written ones empty,\nversion 0), with the room memory rule; `section` narrows `sections` and `body` to one\nsection, the totals stay room-wide.",
         "operationId": "get_notes_chat_v1_notes_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "section",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "preferences",
+                    "requests",
+                    "work-in-progress",
+                    "provided-information",
+                    "repeatable-workflows"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Section"
+            }
+          },
           {
             "description": "the calling session's uuid; missing or malformed is 401 unauthorized",
             "in": "header",
@@ -3884,11 +4001,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Unprocessable Entity"
           },
           "503": {
             "content": {
@@ -3902,11 +4019,29 @@
           }
         },
         "summary": "Get Notes"
-      },
+      }
+    },
+    "/chat/v1/notes/sections/{section}": {
       "put": {
-        "description": "Replace the notes of the room this session is bound to, guarded by the version read\nbefore (0 creates); an empty body forgets them. Over the cap is 413.",
-        "operationId": "put_notes_chat_v1_notes_put",
+        "description": "Replace one section of the room this session is bound to, guarded by that\nsection's version read before (0 creates); an empty body forgets the section. Over\nthe section cap or the room total is 413.",
+        "operationId": "put_note_section_chat_v1_notes_sections__section__put",
         "parameters": [
+          {
+            "in": "path",
+            "name": "section",
+            "required": true,
+            "schema": {
+              "enum": [
+                "preferences",
+                "requests",
+                "work-in-progress",
+                "provided-information",
+                "repeatable-workflows"
+              ],
+              "title": "Section",
+              "type": "string"
+            }
+          },
           {
             "description": "the calling session's uuid; missing or malformed is 401 unauthorized",
             "in": "header",
@@ -3948,7 +4083,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/NotesIn"
+                "$ref": "#/components/schemas/NoteSectionIn"
               }
             }
           },
@@ -4026,7 +4161,7 @@
             "description": "Service Unavailable"
           }
         },
-        "summary": "Put Notes"
+        "summary": "Put Note Section"
       }
     },
     "/chat/v1/reactions": {

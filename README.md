@@ -71,7 +71,8 @@ All variables use the `MATRIX_` prefix. Subcommands: migrate, api, bot.
 | `MATRIX_AGENT_ATTACHMENT_REQUESTS_PER_10MIN` | 10 | api | max attachment requests agents may make for one room in 600 s, all sessions together (>= 1) |
 | `MATRIX_ANONYMIZE_ADMINS` | empty | api, bot | Matrix user ids or numeric Facebook ids, comma separated, shown as `admin-<sha>` instead of `user-<sha>` in rooms with `anonymize_names` |
 | `MATRIX_ROOM_REQUESTS_PER_HOUR` | 10 | api | max open and invite room requests created in the last hour, all sessions together (>= 1); more answer 429 `rate_limited` |
-| `MATRIX_ROOM_NOTES_MAX_CHARS` | 8000 | api | max characters of one room's notes (100 to 32000); a longer PUT is 413 `notes_too_large` |
+| `MATRIX_ROOM_NOTES_MAX_CHARS` | 20000 | api | max characters of all note sections of one room together (100 to 32000); a section PUT that takes the room past it is 413 `notes_too_large` |
+| `MATRIX_ROOM_NOTES_SECTION_MAX_CHARS` | 4000 | api | max characters of one note section (100 to 32000, at most `MATRIX_ROOM_NOTES_MAX_CHARS`); a longer section PUT is 413 `section_too_large` |
 | `MATRIX_ROOM_MEMORY_RULE` | empty | worker and api | replaces the built-in room memory rule in first prompts and the notes GET; empty keeps the built-in |
 | `MATRIX_ACCESS_TOKEN` | none | bot | Matrix access token (required unless the file is set) |
 | `MATRIX_ACCESS_TOKEN_FILE` | empty | bot | file holding the Matrix access token; wins over the variable, stripped |
@@ -460,8 +461,9 @@ Errors are `{"error": {"code": "...", "message": "..."}}`. Codes:
 | `room_file_bytes_limit` | 429 | the send would take the room past `MATRIX_AGENT_ROOM_FILE_BYTES_PER_HOUR` file bytes in the last hour |
 | `pseudonym_disclosed` | 422 | the room has `anonymize_names` and the message `text` or a file name contains a pseudonym (`user-<sha>`, `admin-<sha>`); the message names the tokens found, refer to the person differently |
 | `room_unbound` | 409 | the notes routes need the session to be bound to a chat room, and it is bound to none |
-| `version_conflict` | 409 | `expected_version` is not the stored version: re-read and merge, then write again |
-| `notes_too_large` | 413 | the notes `body` is over `MATRIX_ROOM_NOTES_MAX_CHARS` characters (counted in code points) |
+| `version_conflict` | 409 | `expected_version` is not the stored version (of that note section): re-read and merge, then write again |
+| `section_too_large` | 413 | the note section `body` is over `MATRIX_ROOM_NOTES_SECTION_MAX_CHARS` characters (counted in code points) |
+| `notes_too_large` | 413 | the section `body` would take all sections of the room past `MATRIX_ROOM_NOTES_MAX_CHARS` characters |
 | `unavailable` | 503 | the database (or, for `files`, the orchestrator) is unavailable |
 
 Send statuses: `queued` (accepted, waiting for the bot), `sending` (claimed by the bot, being
@@ -592,28 +594,43 @@ not an `a<n>` of the calling session is 404 `not_found` (the id is never echoed)
 
 The notes of the room this session is bound to; the room is never a parameter, it is the
 session's active binding, so a session reaches only its own room's notes and a rebound room
-keeps them. 200 `{"room_id", "body", "version", "updated_at", "chars", "max_chars", "rule"}`
-(no notes yet: `body` empty, `version` 0, `updated_at` null); `rule` is the room memory rule
-(`MATRIX_ROOM_MEMORY_RULE`, else the built-in). 401 `unauthorized`; 409 `room_unbound`; 503
-`unavailable`.
+keeps them. Notes are five fixed sections, in this order (key, title, shown in the first prompt):
+`preferences` Preferences (yes), `requests` Requests (yes), `work-in-progress` Work in progress
+(yes), `provided-information` Provided information (no), `repeatable-workflows` Repeatable
+workflows (no). A section not shown in the first prompt is listed there by size only, with the
+hint to read it with `orchestrator_chat_notes_get(section="<key>")`.
+
+200 `RoomNotes` `{"room_id", "body", "chars", "max_chars", "section_max_chars", "sections",
+"rule"}`: `sections` lists all five as `{"key", "title", "body", "version", "chars", "inject",
+"updated_at"}` (a never written section: `body` empty, `version` 0, `updated_at` null); `body`
+is the non-empty sections rendered as `## <Title>` plus body in that order; `chars` and
+`max_chars` are the room totals, `section_max_chars` the cap of one section; `rule` is the room
+memory rule (`MATRIX_ROOM_MEMORY_RULE`, else the built-in). The optional query `section=<key>`
+narrows `sections` and `body` to that section; the totals stay room-wide. 401 `unauthorized`;
+409 `room_unbound`; 422 `invalid_request` (unknown section); 503 `unavailable`.
 
     curl -s -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
-      http://localhost:8001/chat/v1/notes
+      'http://localhost:8001/chat/v1/notes?section=requests'
 
-### `PUT /chat/v1/notes`
+### `PUT /chat/v1/notes/sections/{section}`
 
-Replace the whole notes body of the session's bound room. Body `{"body": str,
-"expected_version": int}`: `expected_version` is the version read (0 when none exists yet); an
-empty `body` forgets the notes. The body is capped at `MATRIX_ROOM_NOTES_MAX_CHARS` characters
-(code points). 200 the same shape as the GET with the new version; 401 `unauthorized`; 409
-`room_unbound` or `version_conflict` (the stored body is unchanged); 413 `notes_too_large`; 422
-`invalid_request` (a missing or negative `expected_version`, an unknown field such as `room`);
-503 `unavailable`. Notes are never written to a log.
+Replace one section of the session's bound room. Body `{"body": str, "expected_version": int}`:
+`expected_version` is that section's version read (0 when it was never written); an empty
+`body` forgets the section. Each section is capped at `MATRIX_ROOM_NOTES_SECTION_MAX_CHARS`
+characters and all sections of the room together at `MATRIX_ROOM_NOTES_MAX_CHARS` (code
+points); writes to one room are serialised, so two concurrent writes cannot together pass the
+total. Sections migrated from the old single body may start over a cap; they are readable and
+must fit on their next write. 200 `RoomNotes` of the whole room; 401 `unauthorized`; 409
+`room_unbound` or `version_conflict` (the stored section is unchanged); 413 `section_too_large`
+("section <key>: at most N characters, got M") or `notes_too_large` ("all sections: at most N
+characters, got M"); 422 `invalid_request` (unknown section, a missing or negative
+`expected_version`, an unknown field such as `room`); 503 `unavailable`. Notes are never written
+to a log. There is no whole-body PUT.
 
     curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "X-Orch-Session: $SESSION" \
       -H 'content-type: application/json' \
-      -d '{"body": "## Requests\n- example", "expected_version": 0}' \
-      http://localhost:8001/chat/v1/notes
+      -d '{"body": "- example", "expected_version": 0}' \
+      http://localhost:8001/chat/v1/notes/sections/requests
 
 ### Admin routes (`/chat/v1/admin`)
 
@@ -649,16 +666,17 @@ leaves the stored value unchanged.
 ### `GET /chat/v1/admin/rooms/{room_id}/notes`
 
 The notes of any known room by id, for the superleader and cron sessions (which are room-unbound,
-so no binding is needed). 200 the same `RoomNotes` shape as `GET /chat/v1/notes`; 401
-`unauthorized`; 404 `not_found` for an unknown room; 503 `unavailable`.
+so no binding is needed), with the same optional `section` query. 200 the same `RoomNotes` shape
+as `GET /chat/v1/notes`; 401 `unauthorized`; 404 `not_found` for an unknown room; 422
+`invalid_request` (unknown section); 503 `unavailable`.
 
-### `PUT /chat/v1/admin/rooms/{room_id}/notes`
+### `PUT /chat/v1/admin/rooms/{room_id}/notes/sections/{section}`
 
-Replace the notes of any known room, with the same body (`{"body", "expected_version"}`), size
-cap and errors as `PUT /chat/v1/notes` (409 `version_conflict`, 413 `notes_too_large`, 422
-`invalid_request`) plus 404 `not_found` for an unknown room. 200 `RoomNotes`. The optional
-`X-Orch-Slug` header names the writer; each update logs `admin notes update session=<slug>
-room=<id>` (never the body).
+Replace one section of any known room, with the same body (`{"body", "expected_version"}`),
+caps and errors as `PUT /chat/v1/notes/sections/{section}` (409 `version_conflict`, 413
+`section_too_large` or `notes_too_large`, 422 `invalid_request`) plus 404 `not_found` for an
+unknown room. 200 `RoomNotes`. The optional `X-Orch-Slug` header names the writer; each update
+logs `admin notes update session=<slug> room=<id> section=<key>` (never the body).
 
 ### `GET /chat/v1/admin/users`
 

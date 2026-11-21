@@ -540,14 +540,11 @@ class Worker:
         )
 
     async def _memory(self, room_id: str) -> str:
-        """The room memory block of a first prompt: the rule and the room's notes. Only this
-        room's row is read; the body is never logged."""
+        """The room memory block of a first prompt: the rule and the room's note sections.
+        Only this room's rows are read; bodies are never logged."""
         async with self._pool.connection() as conn:
-            row = await notes.get(conn, room_id)
-        return prompt.memory_block(
-            prompt.memory_rule(self._settings),
-            row.body if row else "",
-        )
+            sections = await notes.get_all(conn, room_id)
+        return prompt.memory_block(prompt.memory_rule(self._settings), sections)
 
     def _is_admin(self, row: InboundRow) -> bool:
         return anonymize.is_admin(

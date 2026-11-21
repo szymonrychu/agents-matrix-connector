@@ -1259,15 +1259,25 @@ async def test_anonymized_room_names_listed_as_pseudonyms(agent, conn):
 # --- room notes --------------------------------------------------------------------------------
 
 NOTES_CANARY = "CANARY-NOTES-7f3a"
+SECTION_KEYS = [
+    "preferences",
+    "requests",
+    "work-in-progress",
+    "provided-information",
+    "repeatable-workflows",
+]
 
 
-async def notes_get(agent, session_id) -> httpx.Response:
-    return await agent.get("/notes", headers=as_(session_id))
+async def notes_get(agent, session_id, section=None) -> httpx.Response:
+    params = {"section": section} if section else None
+    return await agent.get("/notes", params=params, headers=as_(session_id))
 
 
-async def notes_put(agent, session_id, body, version) -> httpx.Response:
+async def notes_put(agent, session_id, section, body, version) -> httpx.Response:
     return await agent.put(
-        "/notes", json={"body": body, "expected_version": version}, headers=as_(session_id)
+        f"/notes/sections/{section}",
+        json={"body": body, "expected_version": version},
+        headers=as_(session_id),
     )
 
 
@@ -1277,42 +1287,64 @@ async def bound_session(conn, room=DM, slug="hive-1") -> uuid.UUID:
     return session
 
 
+def versions(notes_json) -> dict[str, int]:
+    return {s["key"]: s["version"] for s in notes_json["sections"]}
+
+
 async def test_notes_unbound_session_refused(agent, conn):
     session = uuid.uuid4()
     refused(await notes_get(agent, session), 409, "room_unbound")
-    r = await notes_put(agent, session, "x", 0)
+    r = await notes_put(agent, session, "requests", "x", 0)
     refused(r, 409, "room_unbound")
     assert r.json()["error"]["message"] == "this session is not bound to a chat room"
-    assert (await (await conn.execute("SELECT count(*) FROM room_notes")).fetchone())[0] == 0
+    count = await (await conn.execute("SELECT count(*) FROM room_note_sections")).fetchone()
+    assert count[0] == 0
 
 
-async def test_notes_round_trip(agent, conn):
+async def test_get_notes_whole_and_by_section(agent, conn):
     session = await bound_session(conn)
-    r = await notes_get(agent, session)
-    assert r.status_code == 200, r.text
-    assert r.json() == {
+    empty = (await notes_get(agent, session)).json()
+    assert {k: v for k, v in empty.items() if k != "sections"} == {
         "room_id": DM,
         "body": "",
-        "version": 0,
-        "updated_at": None,
         "chars": 0,
-        "max_chars": 8000,
+        "max_chars": 20000,
+        "section_max_chars": 4000,
         "rule": MEMORY_RULE,
     }
-    r = await notes_put(agent, session, "## Requests\n- fix deck", 0)
-    assert r.status_code == 200, r.text
-    put = r.json()
-    assert (put["room_id"], put["body"], put["version"], put["chars"]) == (
-        DM,
-        "## Requests\n- fix deck",
-        1,
-        len("## Requests\n- fix deck"),
-    )
-    assert put["updated_at"] is not None
-    got = (await notes_get(agent, session)).json()
-    assert got == put
-    cleared = (await notes_put(agent, session, "", 1)).json()
-    assert (cleared["body"], cleared["version"], cleared["chars"]) == ("", 2, 0)
+    assert [
+        (s["key"], s["title"], s["body"], s["version"], s["chars"], s["inject"])
+        for s in empty["sections"]
+    ] == [
+        ("preferences", "Preferences", "", 0, 0, True),
+        ("requests", "Requests", "", 0, 0, True),
+        ("work-in-progress", "Work in progress", "", 0, 0, True),
+        ("provided-information", "Provided information", "", 0, 0, False),
+        ("repeatable-workflows", "Repeatable workflows", "", 0, 0, False),
+    ]
+    assert all(s["updated_at"] is None for s in empty["sections"])
+    for key, body in (("provided-information", "deck A"), ("preferences", "- tea")):
+        assert (await notes_put(agent, session, key, body, 0)).status_code == 200
+    put = await notes_put(agent, session, "requests", "", 0)
+    whole = (await notes_get(agent, session)).json()
+    assert put.json() == whole
+    assert whole["body"] == "## Preferences\n- tea\n\n## Provided information\ndeck A"
+    assert whole["chars"] == len("- tea") + len("deck A")
+    assert [s["key"] for s in whole["sections"]] == SECTION_KEYS
+    assert versions(whole) == {
+        "preferences": 1,
+        "requests": 1,
+        "work-in-progress": 0,
+        "provided-information": 1,
+        "repeatable-workflows": 0,
+    }
+    one = (await notes_get(agent, session, "provided-information")).json()
+    assert one["body"] == "## Provided information\ndeck A"
+    assert [(s["key"], s["body"], s["chars"]) for s in one["sections"]] == [
+        ("provided-information", "deck A", 6)
+    ]
+    assert (one["chars"], one["max_chars"]) == (whole["chars"], 20000)
+    refused(await notes_get(agent, session, "decks"), 422, "invalid_request")
 
 
 async def test_notes_rule_override(agent_for, conn):
@@ -1323,19 +1355,21 @@ async def test_notes_rule_override(agent_for, conn):
 
 async def test_notes_isolated_between_rooms(agent, conn):
     a, b = await bound_session(conn, DM), await bound_session(conn, GRP, "hive-2")
-    await notes_put(agent, a, "secret of A", 0)
+    await notes_put(agent, a, "requests", "secret of A", 0)
     got = (await notes_get(agent, b)).json()
-    assert (got["room_id"], got["body"], got["version"]) == (GRP, "", 0)
-    r = await notes_put(agent, b, "B writes", 0)
+    assert (got["room_id"], got["body"], versions(got)["requests"]) == (GRP, "", 0)
+    r = await notes_put(agent, b, "requests", "B writes", 0)
     assert r.json()["room_id"] == GRP
-    assert (await notes_get(agent, a)).json()["body"] == "secret of A"
-    rows = await (await conn.execute("SELECT room_id, body FROM room_notes ORDER BY 1")).fetchall()
+    assert (await notes_get(agent, a)).json()["body"] == "## Requests\nsecret of A"
+    rows = await (
+        await conn.execute("SELECT room_id, body FROM room_note_sections ORDER BY 1")
+    ).fetchall()
     assert rows == [(DM, "secret of A"), (GRP, "B writes")]
 
 
 async def test_notes_follow_rebinding(agent, conn):
     a = await bound_session(conn, DM)
-    await notes_put(agent, a, "room one notes", 0)
+    await notes_put(agent, a, "requests", "room one notes", 0)
     await conn.execute(
         "UPDATE room_bindings SET released_at = now(), release_reason = 'test'"
         " WHERE session_id = %s",
@@ -1343,54 +1377,107 @@ async def test_notes_follow_rebinding(agent, conn):
     )
     c = await bound_session(conn, DM, "hive-3")
     got = (await notes_get(agent, c)).json()
-    assert (got["body"], got["version"]) == ("room one notes", 1)
+    assert (got["body"], versions(got)["requests"]) == ("## Requests\nroom one notes", 1)
     refused(await notes_get(agent, a), 409, "room_unbound")
-    refused(await notes_put(agent, a, "stale", 1), 409, "room_unbound")
-    assert (await notes_get(agent, c)).json()["body"] == "room one notes"
+    refused(await notes_put(agent, a, "requests", "stale", 1), 409, "room_unbound")
 
 
-async def test_notes_stale_version_conflict(agent, conn):
+async def test_section_put_bumps_only_that_section(agent, conn):
     session = await bound_session(conn)
-    await notes_put(agent, session, "one", 0)
-    assert (await notes_put(agent, session, "two", 1)).status_code == 200
-    r = await notes_put(agent, session, "three", 1)
+    await notes_put(agent, session, "preferences", "- tea", 0)
+    r = await notes_put(agent, session, "requests", "- fix deck", 0)
+    assert r.status_code == 200, r.text
+    r = await notes_put(agent, session, "requests", "- fix deck\n- buy sleeves", 1)
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert versions(got) == {
+        "preferences": 1,
+        "requests": 2,
+        "work-in-progress": 0,
+        "provided-information": 0,
+        "repeatable-workflows": 0,
+    }
+    by_key = {s["key"]: s for s in got["sections"]}
+    assert by_key["preferences"]["body"] == "- tea"
+    assert by_key["requests"]["body"] == "- fix deck\n- buy sleeves"
+    assert by_key["requests"]["updated_at"] is not None
+
+
+@pytest.mark.parametrize(
+    ("section_body", "error", "message"),
+    [
+        ("x" * 101, "section_too_large", "section requests: at most 100 characters, got 101"),
+        ("x" * 100, "notes_too_large", "all sections: at most 150 characters, got 190"),
+    ],
+)
+async def test_section_put_caps(agent_for, conn, section_body, error, message):
+    small = agent_for(room_notes_max_chars=150, room_notes_section_max_chars=100)
+    session = await bound_session(conn)
+    assert (await notes_put(small, session, "preferences", "p" * 90, 0)).status_code == 200
+    r = await notes_put(small, session, "requests", section_body, 0)
+    refused(r, 413, error)
+    assert r.json()["error"]["message"] == message
+    assert versions((await notes_get(small, session)).json())["requests"] == 0
+
+
+async def test_section_cap_counts_code_points(agent_for, conn):
+    small = agent_for(room_notes_max_chars=150, room_notes_section_max_chars=100)
+    session = await bound_session(conn)
+    r = await notes_put(small, session, "requests", "\U0001f600" * 100, 0)
+    assert r.status_code == 200, r.text
+    assert r.json()["chars"] == 100
+
+
+async def test_stale_section_version_conflicts_independently(agent, conn):
+    session = await bound_session(conn)
+    await notes_put(agent, session, "requests", "one", 0)
+    await notes_put(agent, session, "requests", "two", 1)
+    await notes_put(agent, session, "preferences", "tea", 0)
+    r = await notes_put(agent, session, "requests", "three", 1)
     refused(r, 409, "version_conflict")
     assert r.json()["error"]["message"] == (
         "changed since version 1; current version is 2: re-read and merge"
     )
-    r = await notes_put(agent, session, "again", 0)
-    refused(r, 409, "version_conflict")
+    refused(await notes_put(agent, session, "requests", "again", 0), 409, "version_conflict")
+    assert (await notes_put(agent, session, "preferences", "coffee", 1)).status_code == 200
     got = (await notes_get(agent, session)).json()
-    assert (got["body"], got["version"]) == ("two", 2)
+    assert got["body"] == "## Preferences\ncoffee\n\n## Requests\ntwo"
+    assert versions(got)["requests"] == 2 and versions(got)["preferences"] == 2
 
 
-async def test_notes_cap_counts_code_points(agent, agent_for, conn):
+async def test_concurrent_section_puts_respect_total_cap(agent_for, conn):
+    small = agent_for(room_notes_max_chars=150, room_notes_section_max_chars=100)
     session = await bound_session(conn)
-    emoji = "\U0001f600"
-    r = await notes_put(agent, session, emoji * 8000, 0)
-    assert r.status_code == 200, r.text
-    assert r.json()["chars"] == 8000
-    r = await notes_put(agent, session, emoji * 8001, 1)
-    refused(r, 413, "notes_too_large")
-    message = r.json()["error"]["message"]
-    assert "8000" in message and "8001" in message
-    small = agent_for(room_notes_max_chars=100)
-    assert (await notes_put(small, session, "x" * 100, 1)).status_code == 200
-    refused(await notes_put(small, session, "x" * 101, 2), 413, "notes_too_large")
-    assert (await notes_get(small, session)).json()["max_chars"] == 100
+    results = await asyncio.gather(
+        notes_put(small, session, "preferences", "p" * 100, 0),
+        notes_put(small, session, "requests", "r" * 100, 0),
+    )
+    assert sorted(r.status_code for r in results) == [200, 413]
+    [too_large] = [r for r in results if r.status_code == 413]
+    refused(too_large, 413, "notes_too_large")
+    assert (await notes_get(small, session)).json()["chars"] == 100
+
+
+@pytest.mark.parametrize("path", ["/notes", f"/admin/rooms/{DM}/notes"])
+async def test_whole_body_put_is_gone(agent, conn, path):
+    session = await bound_session(conn)
+    r = await agent.put(path, json={"body": "x", "expected_version": 0}, headers=as_(session))
+    assert r.status_code in (404, 405), r.text
 
 
 async def test_notes_body_never_logged(agent, conn, caplog):
     caplog.set_level("DEBUG")
     session = await bound_session(conn)
     body = f"{NOTES_CANARY} " + "y" * 20
-    r = await notes_put(agent, session, body, 0)
+    r = await notes_put(agent, session, "requests", body, 0)
     assert r.status_code == 200
     await notes_get(agent, session)
-    stale = await notes_put(agent, session, body, 0)
-    big = await notes_put(agent, session, NOTES_CANARY * 2000, 1)
+    stale = await notes_put(agent, session, "requests", body, 0)
+    big = await notes_put(agent, session, "requests", NOTES_CANARY * 2000, 1)
     bad = await agent.put(
-        "/notes", json={"body": NOTES_CANARY, "expected_version": -1}, headers=as_(session)
+        "/notes/sections/requests",
+        json={"body": NOTES_CANARY, "expected_version": -1},
+        headers=as_(session),
     )
     assert bad.status_code == 422
     for response in (stale, big, bad):
@@ -1400,16 +1487,17 @@ async def test_notes_body_never_logged(agent, conn, caplog):
 
 async def test_notes_validation(agent, conn):
     session = await bound_session(conn)
-    for payload in (
-        {"body": "x"},
-        {"expected_version": 0},
-        {"body": "x", "expected_version": -1},
-        {"body": "x", "expected_version": 0, "room": DM},
-        {"body": 5, "expected_version": 0},
+    for section, payload in (
+        ("requests", {"body": "x"}),
+        ("requests", {"expected_version": 0}),
+        ("requests", {"body": "x", "expected_version": -1}),
+        ("requests", {"body": "x", "expected_version": 0, "room": DM}),
+        ("requests", {"body": 5, "expected_version": 0}),
+        ("decks", {"body": "x", "expected_version": 0}),
     ):
-        r = await agent.put("/notes", json=payload, headers=as_(session))
+        r = await agent.put(f"/notes/sections/{section}", json=payload, headers=as_(session))
         refused(r, 422, "invalid_request")
-    assert (await notes_get(agent, session)).json()["version"] == 0
+    assert (await notes_get(agent, session)).json()["chars"] == 0
 
 
 # --- removed room skills ----------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import uuid
+from datetime import UTC, datetime
 from importlib import resources
 
 import psycopg
@@ -22,7 +23,8 @@ TABLES = {
     "room_bindings",
     "room_holds",
     "room_requests",
-    "room_notes",
+    "room_note_sections",
+    "room_notes_migration_log",
     "send_files",
     "attachment_requests",
     "history_crawls",
@@ -44,6 +46,7 @@ MIGRATIONS = [
     "0011_chat_history.sql",
     "0012_approvals.sql",
     "0013_drop_room_skills.sql",
+    "0014_room_note_sections.sql",
 ]
 
 
@@ -90,7 +93,8 @@ def test_writer_comments(db):
         "room_bindings": "writer: bot worker",
         "room_holds": "writer: bot worker",
         "room_requests": "queue: inserted by api; api confirms or rejects",
-        "room_notes": "writer: api",
+        "room_note_sections": "writer: api",
+        "room_notes_migration_log": "writer: api",
         "send_files": "queue: inserted by api with its send, upload and clear by bot",
         "attachment_requests": "queue: inserted by api, transitions by bot attachment fetcher",
         "history_crawls": "queue: inserted and transitioned by bot history crawler",
@@ -690,3 +694,53 @@ def test_approval_tables(db):
 def test_migration_drops_room_skills(db):
     with psycopg.connect(db) as conn:
         assert "room_skills" not in _tables(conn)
+
+
+def _migration(name):
+    return (resources.files(PACKAGE) / "migrations" / name).read_text()
+
+
+def test_migration_splits_bodies_on_headings(db):
+    provided = "p" * 6000
+    body = (
+        "intro line\n"
+        "## preferences\n- tea\n\n"
+        "## Decks\ndeck A\n"
+        "##  REQUESTS  \n- r1\n"
+        "## Work in progress\n- building\n"
+        "## Requests\n- r2\n"
+        f"## Provided Information\n{provided}\n"
+    )
+    with psycopg.connect(db, autocommit=True) as conn:
+        conn.execute("DROP TABLE room_note_sections, room_notes_migration_log")
+        conn.execute(_migration("0007_room_notes.sql"))
+        conn.execute(
+            "INSERT INTO room_notes (room_id, body, version, updated_at, updated_by_slug) VALUES"
+            " ('!a:x', %s, 7, '2026-01-02T03:04:05Z', 'hive-1'),"
+            " ('!b:x', '  \n ', 2, '2026-01-02T03:04:05Z', NULL)",
+            (body,),
+        )
+        conn.execute(_migration("0014_room_note_sections.sql"))
+        sections = conn.execute(
+            "SELECT room_id, section, body, version, updated_at, updated_by_slug"
+            " FROM room_note_sections ORDER BY room_id, section"
+        ).fetchall()
+        log = conn.execute(
+            "SELECT room_id, body, version FROM room_notes_migration_log ORDER BY room_id"
+        ).fetchall()
+        assert "room_notes" not in _tables(conn)
+    stamp = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    assert sections == [
+        ("!a:x", "preferences", "- tea", 1, stamp, "hive-1"),
+        ("!a:x", "provided-information", provided, 1, stamp, "hive-1"),
+        ("!a:x", "requests", "- r1\n- r2", 1, stamp, "hive-1"),
+        (
+            "!a:x",
+            "work-in-progress",
+            "intro line\n## Decks\ndeck A\n- building",
+            1,
+            stamp,
+            "hive-1",
+        ),
+    ]
+    assert log == [("!a:x", body, 7), ("!b:x", "  \n ", 2)]

@@ -221,16 +221,26 @@ def test_anonymize_admins(monkeypatch):
 
 def test_room_memory_settings_defaults_and_bounds(monkeypatch):
     s = load_settings(ApiSettings)
-    assert s.room_notes_max_chars == 8000
+    assert (s.room_notes_max_chars, s.room_notes_section_max_chars) == (20000, 4000)
     assert s.room_memory_rule == ""
     name = "MATRIX_ROOM_NOTES_MAX_CHARS"
     for bad in ("99", "32001"):
         monkeypatch.setenv(name, bad)
         assert name in problems(ApiSettings), bad
     monkeypatch.setenv(name, "100")
+    monkeypatch.setenv("MATRIX_ROOM_NOTES_SECTION_MAX_CHARS", "100")
     monkeypatch.setenv("MATRIX_ROOM_MEMORY_RULE", "R")
     s = load_settings(ApiSettings)
     assert (s.room_notes_max_chars, s.room_memory_rule) == (100, "R")
+
+
+def test_section_cap_not_above_total(monkeypatch):
+    name = "MATRIX_ROOM_NOTES_SECTION_MAX_CHARS"
+    monkeypatch.setenv("MATRIX_ROOM_NOTES_MAX_CHARS", "1000")
+    monkeypatch.setenv(name, "1000")
+    assert load_settings(ApiSettings).room_notes_section_max_chars == 1000
+    monkeypatch.setenv(name, "1001")
+    assert name in problems(ApiSettings)
 
 
 MEDIA_DEFAULTS = {
