@@ -604,3 +604,26 @@ Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
   skill route tests in `test_api_agent.py`, the skill cases in settings, chart, readme, prompt and
   worker tests. Merge only after the room skills migration (T-530) is verified: rooms with stored
   skills lose them at deploy.
+
+## Room notes in named sections (2026-11-21, S-79 step 5, T-634)
+
+- Section model: five fixed sections, one constant table `db/notes.SECTIONS` (key, title,
+  inject): preferences, requests, work-in-progress are injected into the first prompt;
+  provided-information and repeatable-workflows are not (they can be large, e.g. decklists) and
+  appear there only as an index line `<Title> - <N> chars, read with
+  orchestrator_chat_notes_get(section="<key>")`. Why: first prompts stay small while bulk data
+  stays reachable on demand.
+- Caps (decision 9): `MATRIX_ROOM_NOTES_MAX_CHARS` is now the room total (default 20000),
+  `MATRIX_ROOM_NOTES_SECTION_MAX_CHARS` one section (default 4000); a settings validator refuses
+  a section cap above the total. 413 `section_too_large` / `notes_too_large`.
+- `put_section` takes `pg_advisory_xact_lock` keyed on sha256("room_note_sections:<room>") before
+  summing the other sections, so two concurrent writes to different sections cannot together pass
+  the total (the per-row version guard alone would not catch that).
+- Migration 0014 copies every `room_notes` row verbatim into `room_notes_migration_log` (the
+  exact pre-migration body, for recovery), splits bodies on `## <Title>` headings in PL/pgSQL
+  (unknown headings and leading text go to work-in-progress), then drops `room_notes`. Caps are
+  not enforced on migrated data: an over-cap section is readable and must fit on its next write.
+- Decision 7: the whole-body `PUT /chat/v1/notes` and the admin whole PUT are removed with no
+  backward compatibility; `NotesIn` and the top-level `version`/`updated_at` are gone.
+- GET keeps `body` (the non-empty sections rendered `## <Title>` plus body in fixed order) so the
+  orchestrator handoff package, which reads `body`, needs no change.

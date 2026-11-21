@@ -1,45 +1,46 @@
+import pytest
+
 from agents_matrix_connector.db import notes
 
 ROOM = "!a:x"
+CAPS = {"section_cap": 1000, "total_cap": 1000}
 
 
-async def test_get_missing_is_none(conn):
-    assert await notes.get(conn, ROOM) is None
+async def put(conn, section, body, version, slug=None, room=ROOM):
+    async with conn.transaction():
+        return await notes.put_section(conn, room, section, body, version, slug, **CAPS)
 
 
-async def test_put_creates_with_version_zero(conn):
-    row = await notes.put(conn, ROOM, "## Requests\n- x", 0, "hive-1")
-    assert (row.room_id, row.body, row.version, row.updated_by_slug) == (
+async def test_get_all_missing_is_empty(conn):
+    assert await notes.get_all(conn, ROOM) == []
+
+
+async def test_put_section_creates_then_updates(conn):
+    row = await put(conn, "requests", "- x", 0, "hive-1")
+    assert (row.room_id, row.section, row.body, row.version, row.updated_by_slug) == (
         ROOM,
-        "## Requests\n- x",
+        "requests",
+        "- x",
         1,
         "hive-1",
     )
-    assert await notes.get(conn, ROOM) == row
+    row = await put(conn, "requests", "- y", 1, "hive-2")
+    assert (row.body, row.version, row.updated_by_slug) == ("- y", 2, "hive-2")
+    assert await notes.get_all(conn, ROOM) == [row]
 
 
-async def test_put_updates_matching_version(conn):
-    await notes.put(conn, ROOM, "one", 0, "hive-1")
-    row = await notes.put(conn, ROOM, "two", 1, "hive-2")
-    assert (row.body, row.version, row.updated_by_slug) == ("two", 2, "hive-2")
+@pytest.mark.parametrize(("expected", "current"), [(0, 1), (2, 1)])
+async def test_put_section_conflict_names_current_version(conn, expected, current):
+    await put(conn, "requests", "one", 0)
+    with pytest.raises(notes.VersionConflict) as exc:
+        await put(conn, "requests", "other", expected)
+    assert (exc.value.expected, exc.value.current) == (expected, current)
+    [row] = await notes.get_all(conn, ROOM)
+    assert (row.body, row.version) == ("one", 1)
 
 
-async def test_put_stale_version_returns_none_and_keeps_body(conn):
-    await notes.put(conn, ROOM, "one", 0, None)
-    await notes.put(conn, ROOM, "two", 1, None)
-    assert await notes.put(conn, ROOM, "three", 1, None) is None
-    row = await notes.get(conn, ROOM)
-    assert (row.body, row.version) == ("two", 2)
-
-
-async def test_put_zero_on_existing_returns_none(conn):
-    await notes.put(conn, ROOM, "one", 0, None)
-    assert await notes.put(conn, ROOM, "other", 0, None) is None
-    assert (await notes.get(conn, ROOM)).body == "one"
-
-
-async def test_rooms_are_separate_rows(conn):
-    await notes.put(conn, ROOM, "a", 0, None)
-    await notes.put(conn, "!b:x", "b", 0, None)
-    assert (await notes.get(conn, ROOM)).body == "a"
-    assert (await notes.get(conn, "!b:x")).body == "b"
+async def test_rooms_are_separate(conn):
+    await put(conn, "requests", "a", 0)
+    await put(conn, "requests", "b", 0, room="!b:x")
+    assert [r.body for r in await notes.get_all(conn, ROOM)] == ["a"]
+    assert [r.body for r in await notes.get_all(conn, "!b:x")] == ["b"]

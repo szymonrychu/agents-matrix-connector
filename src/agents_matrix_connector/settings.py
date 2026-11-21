@@ -48,8 +48,10 @@ class ConnectorSettings(BaseServiceSettings):
     agent_rate_per_minute: int = Field(20, ge=1)
     agent_room_chunks_per_hour: int = Field(60, ge=1)
     room_requests_per_hour: int = Field(10, ge=1)
-    room_notes_max_chars: int = Field(8000, ge=100, le=32000)
-    """Max characters (code points) of one room's notes."""
+    room_notes_max_chars: int = Field(20000, ge=100, le=32000)
+    """Max characters (code points) of all note sections of one room together."""
+    room_notes_section_max_chars: int = Field(4000, ge=100, le=32000)
+    """Max characters (code points) of one note section; at most `room_notes_max_chars`."""
     room_memory_rule: str = ""
     """Replaces `prompt.MEMORY_RULE` in first prompts and the notes GET; empty keeps it."""
     inbound_media_max_bytes: int = Field(26214400, ge=1)
@@ -145,6 +147,14 @@ class ConnectorSettings(BaseServiceSettings):
     def _agent_port_differs(self):
         if self.agent_port == self.http_port:
             raise ValueError("MATRIX_AGENT_PORT::must differ from MATRIX_HTTP_PORT")
+        return self
+
+    @model_validator(mode="after")
+    def _section_cap_within_total(self):
+        if self.room_notes_section_max_chars > self.room_notes_max_chars:
+            raise ValueError(
+                "MATRIX_ROOM_NOTES_SECTION_MAX_CHARS::must not exceed MATRIX_ROOM_NOTES_MAX_CHARS"
+            )
         return self
 
     def self_ids(self) -> frozenset[str]:

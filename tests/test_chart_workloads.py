@@ -354,11 +354,14 @@ def test_config_room_requests_per_hour():
 
 def test_config_room_memory():
     data = _config()
-    assert data["MATRIX_ROOM_NOTES_MAX_CHARS"] == "8000"
+    assert data["MATRIX_ROOM_NOTES_MAX_CHARS"] == "20000"
+    assert data["MATRIX_ROOM_NOTES_SECTION_MAX_CHARS"] == "4000"
     assert "MATRIX_ROOM_SKILL_MAX_CHARS" not in data and "MATRIX_ROOM_SKILLS_MAX" not in data
     assert "MATRIX_ROOM_MEMORY_RULE" not in data
     assert _config({"roomMemory": {"rule": "x"}})["MATRIX_ROOM_MEMORY_RULE"] == "x"
     assert _config({"limits": {"roomNotesMaxChars": 100}})["MATRIX_ROOM_NOTES_MAX_CHARS"] == "100"
+    section = _config({"limits": {"roomNotesSectionMaxChars": 300}})
+    assert section["MATRIX_ROOM_NOTES_SECTION_MAX_CHARS"] == "300"
 
 
 def test_config_anonymize_admins():
