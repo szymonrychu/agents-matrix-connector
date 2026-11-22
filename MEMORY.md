@@ -627,3 +627,5 @@ Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
   backward compatibility; `NotesIn` and the top-level `version`/`updated_at` are gone.
 - GET keeps `body` (the non-empty sections rendered `## <Title>` plus body in fixed order) so the
   orchestrator handoff package, which reads `body`, needs no change.
+
+- 2026-11-22 (S-83 step 18): the entries above naming `orchestrator_backup_save` are superseded; that tool was removed and `MEMORY_RULE` now names `orchestrator_volume_save`.

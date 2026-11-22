@@ -76,7 +76,7 @@ MEMORY_RULE = (
     "information and Repeatable workflows are only listed there with their size: read one "
     'with orchestrator_chat_notes_get(section="<key>") when you need it. '
     "Reusable workflows are written as skills in your skills directory; call "
-    "orchestrator_backup_save afterwards so every session of the project gets them. "
+    "orchestrator_volume_save afterwards so every session of the project gets them. "
     "Never store secrets, tokens, passwords or other people's private data in notes or "
     "skills. If the user asks to see or forget the notes or a skill, show it in the chat or "
     "clear it (an empty body forgets one section)."

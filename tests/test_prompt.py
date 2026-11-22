@@ -194,11 +194,12 @@ def test_memory_block_with_notes():
     assert out == f"RULE\n\n{NOTES_HEADER}\n<room-notes>\n## Requests\n- fix deck\n</room-notes>"
 
 
-def test_prompt_has_backup_save_sentence():
+def test_prompt_names_volume_save():
     assert (
         "Reusable workflows are written as skills in your skills directory; call "
-        "orchestrator_backup_save afterwards so every session of the project gets them."
+        "orchestrator_volume_save afterwards so every session of the project gets them."
     ) in MEMORY_RULE
+    assert "orchestrator_backup_save" not in MEMORY_RULE
     assert "tell the user in the chat that you saved it" not in MEMORY_RULE
 
 
