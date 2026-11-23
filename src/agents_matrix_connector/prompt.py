@@ -75,8 +75,10 @@ MEMORY_RULE = (
     "The first prompt of a session shows Preferences, Requests and Work in progress; Provided "
     "information and Repeatable workflows are only listed there with their size: read one "
     'with orchestrator_chat_notes_get(section="<key>") when you need it. '
-    "Reusable workflows are written as skills in your skills directory; call "
-    "orchestrator_volume_save afterwards so every session of the project gets them. "
+    "Reusable workflows are written as skills in your skills directory; when that directory is on "
+    "a volume mounted with backup_restore, call orchestrator_volume_save with the volume name "
+    "afterwards (orchestrator_volumes_status lists your volumes) so every session of the "
+    "project gets them. "
     "Never store secrets, tokens, passwords or other people's private data in notes or "
     "skills. If the user asks to see or forget the notes or a skill, show it in the chat or "
     "clear it (an empty body forgets one section)."

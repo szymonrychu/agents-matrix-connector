@@ -195,10 +195,9 @@ def test_memory_block_with_notes():
 
 
 def test_prompt_names_volume_save():
-    assert (
-        "Reusable workflows are written as skills in your skills directory; call "
-        "orchestrator_volume_save afterwards so every session of the project gets them."
-    ) in MEMORY_RULE
+    assert "orchestrator_volume_save with the volume name" in MEMORY_RULE
+    assert "orchestrator_volumes_status lists your volumes" in MEMORY_RULE
+    assert "backup_restore" in MEMORY_RULE
     assert "orchestrator_backup_save" not in MEMORY_RULE
     assert "tell the user in the chat that you saved it" not in MEMORY_RULE
 

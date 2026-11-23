@@ -629,3 +629,4 @@ Chat history and attachment fetch (T-420, release v0.16.0). Why each choice:
   orchestrator handoff package, which reads `body`, needs no change.
 
 - 2026-11-22 (S-83 step 18): the entries above naming `orchestrator_backup_save` are superseded; that tool was removed and `MEMORY_RULE` now names `orchestrator_volume_save`.
+- 2026-11-23 (S-83 final review): `MEMORY_RULE` now tells the agent how orchestrator_volume_save works in v0.62.0: it takes the volume name (POST /agent/v1/volumes/{name}/save), works only for a volume attached with `backup_restore` (else 403 backup_not_enabled, 404 for an unmounted name, 409 volume_busy) and `orchestrator_volumes_status` lists the session's volumes. The old wording named no volume, so calls failed with 422/403.
